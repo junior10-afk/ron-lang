@@ -1,5 +1,7 @@
 #include "gltf.hpp"
 
+#include "jpeg.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -379,8 +381,8 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
             }
             png::Image decoded;
             std::string pngError;
-            if (bytes.empty() || !png::decode(bytes.data(), bytes.size(), decoded, pngError)) {
-                // Unsupported image (e.g. JPEG): fall back to a white pixel.
+            if (bytes.empty() || !decodeImage(bytes.data(), bytes.size(), decoded, pngError)) {
+                // Undecodable image: fall back to a white pixel.
                 decoded.width = decoded.height = 1;
                 decoded.rgba = {255, 255, 255, 255};
             }
@@ -388,22 +390,45 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
         }
     }
 
-    // Materials (base color texture via textures[] -> images[])
+    // Materials (texture infos -> textures[] -> images[])
     if (const Json* materials = doc.get("materials")) {
         const Json* textures = doc.get("textures");
+        auto imageOf = [&](const Json* info) -> int {
+            if (!info || !textures) return -1;
+            int t = info->integer("index", -1);
+            if (t < 0 || static_cast<size_t>(t) >= textures->size()) return -1;
+            int img = (*textures)[static_cast<size_t>(t)].integer("source", -1);
+            return img >= 0 && static_cast<size_t>(img) < out.images.size() ? img : -1;
+        };
         for (size_t i = 0; i < materials->size(); ++i) {
+            const Json& mj = (*materials)[i];
             Material m;
-            if (const Json* pbr = (*materials)[i].get("pbrMetallicRoughness")) {
+            m.name = mj.str("name");
+            if (const Json* pbr = mj.get("pbrMetallicRoughness")) {
                 if (const Json* f = pbr->get("baseColorFactor"))
                     for (size_t c = 0; c < 4 && c < f->size(); ++c) m.baseColor[c] = static_cast<float>((*f)[c].number);
                 m.roughness = static_cast<float>(pbr->num("roughnessFactor", 1.0));
                 m.metallic = static_cast<float>(pbr->num("metallicFactor", 1.0));
-                if (const Json* tex = pbr->get("baseColorTexture")) {
-                    int t = tex->integer("index", -1);
-                    if (textures && t >= 0 && static_cast<size_t>(t) < textures->size())
-                        m.image = (*textures)[static_cast<size_t>(t)].integer("source", -1);
-                }
+                m.image = imageOf(pbr->get("baseColorTexture"));
+                m.metallicRoughnessImage = imageOf(pbr->get("metallicRoughnessTexture"));
+            } else {
+                m.metallic = 0.0f;   // no PBR block: a plain dielectric
             }
+            if (const Json* n = mj.get("normalTexture")) {
+                m.normalImage = imageOf(n);
+                m.normalScale = static_cast<float>(n->num("scale", 1.0));
+            }
+            m.occlusionImage = imageOf(mj.get("occlusionTexture"));
+            m.emissiveImage = imageOf(mj.get("emissiveTexture"));
+            if (const Json* e = mj.get("emissiveFactor"))
+                for (size_t c = 0; c < 3 && c < e->size(); ++c) m.emissive[c] = static_cast<float>((*e)[c].number);
+            if (const Json* ext = mj.get("extensions"))
+                if (const Json* es = ext->get("KHR_materials_emissive_strength"))
+                    for (float& c : m.emissive) c *= static_cast<float>(es->num("emissiveStrength", 1.0));
+            std::string alpha = mj.str("alphaMode");
+            m.alphaMode = alpha == "MASK" ? AlphaMode::Mask : alpha == "BLEND" ? AlphaMode::Blend : AlphaMode::Opaque;
+            m.alphaCutoff = static_cast<float>(mj.num("alphaCutoff", 0.5));
+            m.doubleSided = mj.get("doubleSided") && mj.get("doubleSided")->boolean;
             out.materials.push_back(m);
         }
     }
@@ -412,15 +437,21 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
     if (const Json* meshes = doc.get("meshes")) {
         for (size_t mi = 0; mi < meshes->size(); ++mi) {
             Mesh mesh;
-            const Json* prims = (*meshes)[mi].get("primitives");
+            const Json& mj = (*meshes)[mi];
+            if (const Json* w = mj.get("weights"))
+                for (size_t k = 0; k < w->size(); ++k) mesh.weights.push_back(static_cast<float>((*w)[k].number));
+            if (const Json* extras = mj.get("extras"))
+                if (const Json* names = extras->get("targetNames"))
+                    for (size_t k = 0; k < names->size(); ++k) mesh.targetNames.push_back((*names)[k].string);
+            const Json* prims = mj.get("primitives");
             for (size_t pi = 0; prims && pi < prims->size(); ++pi) {
                 const Json& prim = (*prims)[pi];
                 if (prim.integer("mode", 4) != 4) continue;   // triangles only
                 const Json* attrs = prim.get("attributes");
                 if (!attrs || !attrs->get("POSITION")) continue;
-                std::vector<float> pos, nrm, uv, wts;
+                std::vector<float> pos, nrm, uv, wts, tan;
                 std::vector<uint32_t> jts;
-                int pc = 0, nc = 0, uc = 0, wc = 0, jc = 0;
+                int pc = 0, nc = 0, uc = 0, wc = 0, jc = 0, tc = 0;
                 if (!L.floats(attrs->integer("POSITION", -1), pos, pc) || pc != 3) {
                     error = L.error.empty() ? "invalid POSITION accessor" : L.error;
                     return false;
@@ -428,6 +459,8 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
                 size_t count = pos.size() / 3;
                 bool hasNormals = attrs->get("NORMAL") && L.floats(attrs->integer("NORMAL", -1), nrm, nc) && nc == 3;
                 bool hasUv = attrs->get("TEXCOORD_0") && L.floats(attrs->integer("TEXCOORD_0", -1), uv, uc) && uc == 2;
+                bool hasTangents = hasNormals && attrs->get("TANGENT") &&
+                                   L.floats(attrs->integer("TANGENT", -1), tan, tc) && tc == 4;
                 bool hasSkin = attrs->get("JOINTS_0") && attrs->get("WEIGHTS_0") &&
                                L.ints(attrs->integer("JOINTS_0", -1), jts, jc) && jc == 4 &&
                                L.floats(attrs->integer("WEIGHTS_0", -1), wts, wc) && wc == 4;
@@ -440,8 +473,8 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
                     std::memset(&vx, 0, sizeof(vx));
                     std::memcpy(vx.position, &pos[v * 3], 12);
                     if (hasNormals) std::memcpy(vx.normal, &nrm[v * 3], 12);
-                    else vx.normal[1] = 1;
                     if (hasUv) std::memcpy(vx.uv, &uv[v * 2], 8);
+                    if (hasTangents) std::memcpy(vx.tangent, &tan[v * 4], 16);
                     if (hasSkin) {
                         float total = 0;
                         for (int k = 0; k < 4; ++k) {
@@ -466,6 +499,24 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
                 }
                 for (uint32_t& idx : p.indices)
                     if (idx >= count) idx = 0;
+                p.indices.resize(p.indices.size() / 3 * 3);
+                if (!hasNormals) computeNormals(p.vertices, p.indices);
+                if (!hasTangents) computeTangents(p.vertices, p.indices);
+                // Morph targets (POSITION / NORMAL deltas)
+                if (const Json* targets = prim.get("targets")) {
+                    for (size_t ti = 0; ti < targets->size(); ++ti) {
+                        const Json& t = (*targets)[ti];
+                        MorphTarget mt;
+                        int c = 0;
+                        if (!t.get("POSITION") || !L.floats(t.integer("POSITION", -1), mt.positions, c) || c != 3 ||
+                            mt.positions.size() != count * 3)
+                            mt.positions.assign(count * 3, 0.0f);
+                        if (t.get("NORMAL") && !(L.floats(t.integer("NORMAL", -1), mt.normals, c) && c == 3 &&
+                                                 mt.normals.size() == count * 3))
+                            mt.normals.clear();
+                        p.targets.push_back(std::move(mt));
+                    }
+                }
                 mesh.primitives.push_back(std::move(p));
             }
             out.meshes.push_back(std::move(mesh));
@@ -493,6 +544,8 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
             }
             if (const Json* ch = n.get("children"))
                 for (size_t c = 0; c < ch->size(); ++c) node.children.push_back(static_cast<int>((*ch)[c].number));
+            if (const Json* w = n.get("weights"))
+                for (size_t c = 0; c < w->size(); ++c) node.weights.push_back(static_cast<float>((*w)[c].number));
         }
         for (size_t i = 0; i < out.nodes.size(); ++i)
             for (int c : out.nodes[i].children)
@@ -534,17 +587,24 @@ bool loadFromMemory(const uint8_t* data, size_t size, const std::string& baseDir
                 int si = ch.integer("sampler", -1);
                 if (!target || si < 0 || static_cast<size_t>(si) >= samplers->size()) continue;
                 std::string path = target->str("path");
-                if (path != "translation" && path != "rotation" && path != "scale") continue;   // no morph weights
+                if (path != "translation" && path != "rotation" && path != "scale" && path != "weights") continue;
                 const Json& sampler = (*samplers)[static_cast<size_t>(si)];
                 Channel channel;
                 channel.node = target->integer("node", -1);
-                channel.path = path == "translation" ? Path::Translation : path == "rotation" ? Path::Rotation : Path::Scale;
+                channel.path = path == "translation" ? Path::Translation
+                             : path == "rotation"    ? Path::Rotation
+                             : path == "scale"       ? Path::Scale
+                                                     : Path::Weights;
                 std::string interp = sampler.str("interpolation");
                 channel.step = interp == "STEP";
                 int ic = 0, oc = 0;
                 if (!L.floats(sampler.integer("input", -1), channel.times, ic) ||
                     !L.floats(sampler.integer("output", -1), channel.values, oc))
                     continue;
+                if (channel.times.empty()) continue;
+                // Elements per key: 3/4 for TRS, the morph target count for weights.
+                oc = static_cast<int>(channel.values.size() / channel.times.size() / (interp == "CUBICSPLINE" ? 3 : 1));
+                if (oc <= 0) continue;
                 if (interp == "CUBICSPLINE") {
                     // Keep only the value of each (in-tangent, value, out-tangent) triple.
                     std::vector<float> v;
@@ -584,6 +644,7 @@ void sampleInto(const Model& m, int anim, float time, std::vector<TRS>& pose) {
     if (a.duration > 0) time = std::fmod(std::max(time, 0.0f), a.duration);
     for (const Channel& ch : a.channels) {
         if (ch.node < 0 || static_cast<size_t>(ch.node) >= pose.size() || ch.times.empty()) continue;
+        if (ch.path == Path::Weights) continue;   // see sampleWeights
         int n = ch.path == Path::Rotation ? 4 : 3;
         size_t keys = ch.times.size();
         size_t k1 = 0;
@@ -607,6 +668,143 @@ void sampleInto(const Model& m, int anim, float time, std::vector<TRS>& pose) {
 }
 
 } // namespace
+
+namespace {
+
+// Overwrites `w` with the weights channel of `anim` targeting `node`, if any.
+void sampleWeightsInto(const Model& m, int node, int anim, float time, std::vector<float>& w) {
+    if (anim < 0 || static_cast<size_t>(anim) >= m.animations.size()) return;
+    const Animation& a = m.animations[anim];
+    if (a.duration > 0) time = std::fmod(std::max(time, 0.0f), a.duration);
+    for (const Channel& ch : a.channels) {
+        if (ch.node != node || ch.path != Path::Weights || ch.times.empty()) continue;
+        size_t keys = ch.times.size();
+        size_t n = ch.values.size() / keys;
+        size_t k1 = 0;
+        while (k1 < keys && ch.times[k1] < time) ++k1;
+        size_t k0 = k1 == 0 ? 0 : k1 - 1;
+        if (k1 >= keys) k1 = keys - 1;
+        float t = 0;
+        if (k1 != k0 && !ch.step) t = std::clamp((time - ch.times[k0]) / std::max(ch.times[k1] - ch.times[k0], 1e-6f), 0.0f, 1.0f);
+        for (size_t i = 0; i < n && i < w.size(); ++i)
+            w[i] = ch.values[k0 * n + i] + (ch.values[k1 * n + i] - ch.values[k0 * n + i]) * t;
+    }
+}
+
+} // namespace
+
+std::vector<float> sampleWeights(const Model& m, int node, int anim, float time, int animB, float timeB, float weight) {
+    std::vector<float> base;
+    if (node < 0 || static_cast<size_t>(node) >= m.nodes.size()) return base;
+    const Node& n = m.nodes[node];
+    if (n.mesh < 0 || static_cast<size_t>(n.mesh) >= m.meshes.size()) return base;
+    const Mesh& mesh = m.meshes[n.mesh];
+    size_t targets = 0;
+    for (const Primitive& p : mesh.primitives) targets = std::max(targets, p.targets.size());
+    base.assign(targets, 0.0f);
+    const std::vector<float>& defaults = !n.weights.empty() ? n.weights : mesh.weights;
+    for (size_t i = 0; i < targets && i < defaults.size(); ++i) base[i] = defaults[i];
+    std::vector<float> a = base;
+    sampleWeightsInto(m, node, anim, time, a);
+    if (animB >= 0 && weight > 0) {
+        std::vector<float> b = base;
+        sampleWeightsInto(m, node, animB, timeB, b);
+        float w = std::clamp(weight, 0.0f, 1.0f);
+        for (size_t i = 0; i < a.size(); ++i) a[i] += (b[i] - a[i]) * w;
+    }
+    return a;
+}
+
+void computeNormals(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices) {
+    // Area-weighted face normals accumulated on vertices sharing a position, so
+    // UV seams (duplicated vertices) do not show as creases.
+    for (Vertex& v : vertices) v.normal[0] = v.normal[1] = v.normal[2] = 0;
+    std::vector<float> acc(vertices.size() * 3, 0.0f);
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const float* a = vertices[indices[i]].position;
+        const float* b = vertices[indices[i + 1]].position;
+        const float* c = vertices[indices[i + 2]].position;
+        float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        for (int k = 0; k < 3; ++k)
+            for (int j = 0; j < 3; ++j) acc[indices[i + k] * 3 + j] += n[j];
+    }
+    // Merge vertices with identical positions (sort by position).
+    std::vector<uint32_t> order(vertices.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    auto less = [&](uint32_t x, uint32_t y) {
+        return std::lexicographical_compare(vertices[x].position, vertices[x].position + 3,
+                                            vertices[y].position, vertices[y].position + 3);
+    };
+    std::sort(order.begin(), order.end(), less);
+    for (size_t s = 0; s < order.size();) {
+        size_t e = s + 1;
+        while (e < order.size() && !less(order[s], order[e])) ++e;
+        float sum[3] = {0, 0, 0};
+        for (size_t k = s; k < e; ++k)
+            for (int j = 0; j < 3; ++j) sum[j] += acc[order[k] * 3 + j];
+        float len = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
+        for (size_t k = s; k < e; ++k) {
+            Vertex& v = vertices[order[k]];
+            if (len > 1e-20f)
+                for (int j = 0; j < 3; ++j) v.normal[j] = sum[j] / len;
+            else
+                v.normal[1] = 1;
+        }
+        s = e;
+    }
+}
+
+void computeTangents(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices) {
+    // Per-triangle tangents from UV derivatives (Lengyel), accumulated per vertex,
+    // then Gram-Schmidt orthogonalized against the normal.
+    std::vector<float> tan(vertices.size() * 3, 0.0f), bit(vertices.size() * 3, 0.0f);
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const Vertex& a = vertices[indices[i]];
+        const Vertex& b = vertices[indices[i + 1]];
+        const Vertex& c = vertices[indices[i + 2]];
+        float e1[3] = {b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]};
+        float e2[3] = {c.position[0] - a.position[0], c.position[1] - a.position[1], c.position[2] - a.position[2]};
+        float du1 = b.uv[0] - a.uv[0], dv1 = b.uv[1] - a.uv[1];
+        float du2 = c.uv[0] - a.uv[0], dv2 = c.uv[1] - a.uv[1];
+        float det = du1 * dv2 - du2 * dv1;
+        if (std::fabs(det) < 1e-12f) continue;
+        float r = 1.0f / det;
+        float t[3], bt[3];
+        for (int j = 0; j < 3; ++j) {
+            t[j] = (e1[j] * dv2 - e2[j] * dv1) * r;
+            bt[j] = (e2[j] * du1 - e1[j] * du2) * r;
+        }
+        for (int k = 0; k < 3; ++k)
+            for (int j = 0; j < 3; ++j) {
+                tan[indices[i + k] * 3 + j] += t[j];
+                bit[indices[i + k] * 3 + j] += bt[j];
+            }
+    }
+    for (size_t v = 0; v < vertices.size(); ++v) {
+        Vertex& vx = vertices[v];
+        const float* n = vx.normal;
+        float* t = &tan[v * 3];
+        float d = n[0] * t[0] + n[1] * t[1] + n[2] * t[2];
+        float o[3] = {t[0] - n[0] * d, t[1] - n[1] * d, t[2] - n[2] * d};
+        float len = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
+        if (len < 1e-12f) {
+            // No usable UVs: any vector perpendicular to the normal.
+            float ref[3] = {std::fabs(n[0]) < 0.9f ? 1.0f : 0.0f, std::fabs(n[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
+            o[0] = ref[1] * n[2] - ref[2] * n[1];
+            o[1] = ref[2] * n[0] - ref[0] * n[2];
+            o[2] = ref[0] * n[1] - ref[1] * n[0];
+            len = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
+            if (len < 1e-12f) { o[0] = 1; o[1] = o[2] = 0; len = 1; }
+        }
+        for (int j = 0; j < 3; ++j) vx.tangent[j] = o[j] / len;
+        // Handedness: does cross(n, t) point along the accumulated bitangent?
+        float c[3] = {n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]};
+        const float* b = &bit[v * 3];
+        vx.tangent[3] = c[0] * b[0] + c[1] * b[1] + c[2] * b[2] < 0 ? -1.0f : 1.0f;
+    }
+}
 
 void samplePose(const Model& m, int anim, float time, int animB, float timeB, float weight, std::vector<Mat4>& localOut) {
     std::vector<TRS> base(m.nodes.size());

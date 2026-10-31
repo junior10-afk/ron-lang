@@ -66,7 +66,30 @@ RE_API float engine_model_animation_duration(int32_t model, int32_t anim);
 RE_API int32_t engine_model_find_animation(int32_t model, const char* name);
 RE_API void engine_draw_model(int32_t model, const float* transform16, int32_t anim, float time);
 RE_API void engine_draw_model_blend(int32_t model, const float* transform16, int32_t animA, float timeA,
-                                    int32_t animB, float timeB, float weight);
+                                    int32_t animB, float timeB, float weight);// Bind-pose bounding box of a model (model space)
+RE_API void engine_model_bounds(int32_t model, float* min3, float* max3);
+
+// Materials of a model: flags 16 = skin (subsurface scattering), 64 = hair (anisotropic highlight)
+RE_API int32_t engine_model_material_count(int32_t model);
+RE_API const char* engine_model_material_name(int32_t model, int32_t material);
+RE_API int32_t engine_model_find_material(int32_t model, const char* name);
+RE_API void engine_model_set_material_flags(int32_t model, int32_t material, int32_t flags);
+RE_API void engine_model_set_material_color(int32_t model, int32_t material, float r, float g, float b, float a);
+RE_API void engine_model_set_material_pbr(int32_t model, int32_t material, float roughness, float metallic);
+
+// Morph targets (blend shapes), shared by name across the meshes of a model.
+// set_morph overrides the animated weight until clear_morphs.
+RE_API int32_t engine_model_morph_count(int32_t model);
+RE_API const char* engine_model_morph_name(int32_t model, int32_t morph);
+RE_API int32_t engine_model_find_morph(int32_t model, const char* name);
+RE_API void engine_model_set_morph(int32_t model, int32_t morph, float weight);
+RE_API void engine_model_clear_morphs(int32_t model);
+
+// Image-based lighting from an equirectangular environment (.hdr, .png or .jpg)
+RE_API bool engine_environment_load(const char* path);
+RE_API void engine_environment_intensity(float intensity);
+RE_API void engine_environment_background(bool show);
+RE_API void engine_environment_clear();
 
 // Input (key codes are Windows virtual-key codes)
 RE_API bool engine_key_down(int32_t key);

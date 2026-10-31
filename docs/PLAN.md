@@ -36,6 +36,7 @@ source.ron ─► Lexer ─► Parser ─► AST ─► Sema (types) ─► x86-
 | 18 | Runtime | Stack traces, `panic`, `assert`, bounds checks, warnings | done |
 | 19 | System library | Files, directories, args, env, threads, mutexes, atomics | done |
 | 20 | Tooling | `test` blocks, `ronc test/new/--version`, VS Code highlighting, docs, release 0.1.0 | done |
+| 21 | Realistic characters | JPEG + HDR decoders, full PBR texture set, normal maps (tangents), image-based lighting, morph targets, alpha mask/blend, skin and hair shading | done |
 
 ## Further work (0.2 and later)
 
@@ -43,8 +44,9 @@ source.ron ─► Lexer ─► Parser ─► AST ─► Sema (types) ─► x86-
   generation for vector math, inlining, a language server for editors.
 - **Language**: closures capturing variables, traits/interfaces, `match` as an expression,
   compile-time evaluation.
-- **Engine**: normal maps, image-based lighting, instanced rendering, post-processing (bloom,
-  SSAO), cascaded shadows, a UI layer, state-preserving hot reload.
+- **Engine**: instanced rendering, post-processing (bloom, SSAO, depth of field), cascaded
+  shadows, screen-space subsurface scattering and strand-based hair, KTX2/Basis textures and
+  meshopt compression, a UI layer, state-preserving hot reload.
 
 ## Key design decisions
 

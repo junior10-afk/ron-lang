@@ -6,7 +6,7 @@ set(SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT})
 
 set(SHADER_INCLUDES)
-foreach(shader mesh.vert mesh.frag shadow.vert)
+foreach(shader mesh.vert mesh.frag shadow.vert shadow.frag sky.vert sky.frag)
     set(src ${SHADER_DIR}/${shader})
     set(out ${SHADER_OUT}/${shader}.inc)
     add_custom_command(
@@ -18,7 +18,7 @@ foreach(shader mesh.vert mesh.frag shadow.vert)
 endforeach()
 
 # Asset loaders (no Vulkan dependency, also used by the tests and tools)
-add_library(ron_assets STATIC png.cpp gltf.cpp)
+add_library(ron_assets STATIC png.cpp jpeg.cpp gltf.cpp ibl.cpp)
 target_include_directories(ron_assets PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_library(ron_engine SHARED
@@ -44,3 +44,8 @@ add_test(NAME asset_tests COMMAND asset_tests)
 
 add_executable(make_character ${CMAKE_SOURCE_DIR}/tools/make_character.cpp)
 target_link_libraries(make_character PRIVATE ron_assets)
+
+# image_convert <in.jpg|png> <out.png>: decodes with Ron's decoders (used to check them)
+add_executable(image_convert ${CMAKE_SOURCE_DIR}/tools/image_convert.cpp)
+target_link_libraries(image_convert PRIVATE ron_assets)
+

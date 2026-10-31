@@ -49,6 +49,25 @@ extern "ron_engine.dll" {
     fn engine_model_find_animation(int model, u8* name) -> int;
     fn engine_draw_model(int model, Mat4* transform, int anim, float time);
     fn engine_draw_model_blend(int model, Mat4* transform, int anim_a, float time_a, int anim_b, float time_b, float weight);
+    fn engine_model_bounds(int model, Vec3* min, Vec3* max);
+
+    fn engine_model_material_count(int model) -> int;
+    fn engine_model_material_name(int model, int material) -> u8*;
+    fn engine_model_find_material(int model, u8* name) -> int;
+    fn engine_model_set_material_flags(int model, int material, int flags);
+    fn engine_model_set_material_color(int model, int material, float r, float g, float b, float a);
+    fn engine_model_set_material_pbr(int model, int material, float roughness, float metallic);
+
+    fn engine_model_morph_count(int model) -> int;
+    fn engine_model_morph_name(int model, int morph) -> u8*;
+    fn engine_model_find_morph(int model, u8* name) -> int;
+    fn engine_model_set_morph(int model, int morph, float weight);
+    fn engine_model_clear_morphs(int model);
+
+    fn engine_environment_load(u8* path) -> bool;
+    fn engine_environment_intensity(float intensity);
+    fn engine_environment_background(bool show);
+    fn engine_environment_clear();
 
     fn engine_key_down(int key) -> bool;
     fn engine_key_pressed(int key) -> bool;
@@ -87,6 +106,11 @@ const int KEY_R = 82;
 const int KEY_S = 83;
 const int KEY_W = 87;
 
+// Material shading models for engine_model_set_material_flags
+const int SHADING_DEFAULT = 0;
+const int SHADING_SKIN = 16;   // subsurface scattering approximation
+const int SHADING_HAIR = 64;   // anisotropic strand highlight
+
 const int MOUSE_LEFT = 0;
 const int MOUSE_RIGHT = 1;
 const int MOUSE_MIDDLE = 2;
@@ -124,7 +148,7 @@ fn update(OrbitCamera* cam) {
         cam.pitch += engine_mouse_dy() * 0.005;
     }
     cam.pitch = clamp(cam.pitch, -1.2, 1.45);
-    cam.distance = clamp(cam.distance * (1.0 - engine_mouse_wheel() * 0.1), 2.0, 200.0);
+    cam.distance = clamp(cam.distance * (1.0 - engine_mouse_wheel() * 0.1), 0.25, 200.0);
 }
 
 fn apply(OrbitCamera* cam) {
@@ -199,6 +223,42 @@ fn draw(Animator* a, Mat4 transform) {
         engine_draw_model_blend(a.model, &transform, a.previous, a.previous_time, a.current, a.time, a.fade);
     else
         engine_draw_model(a.model, &transform, a.current, a.time);
+}
+
+// Gives every material of `model` whose name contains one of `keys` the given shading.
+// Returns how many materials matched. Example: set_shading(model, ["skin", "face", "body"], SHADING_SKIN)
+fn set_shading(int model, u8*[] keys, int shading) -> int {
+    int matched = 0;
+    for (int m = 0; m < engine_model_material_count(model); m++) {
+        u8* name = engine_model_material_name(model, m);
+        for (var key in keys) {
+            if (__contains_ignore_case(name, key)) {
+                engine_model_set_material_flags(model, m, shading);
+                matched++;
+                break;
+            }
+        }
+    }
+    return matched;
+}
+
+fn __lower(u8 c) -> u8 { return c >= 65 && c <= 90 ? (c + 32) as u8 : c; }
+
+fn __contains_ignore_case(u8* text, u8* key) -> bool {
+    for (int i = 0; text[i] != 0; i++) {
+        int k = 0;
+        while (key[k] != 0 && text[i + k] != 0 && __lower(text[i + k]) == __lower(key[k])) k++;
+        if (key[k] == 0) return true;
+    }
+    return false;
+}
+
+// Sets a morph target (blend shape) by name; returns false if the model has none with that name.
+fn set_morph(int model, u8* name, float weight) -> bool {
+    int m = engine_model_find_morph(model, name);
+    if (m < 0) return false;
+    engine_model_set_morph(model, m, weight);
+    return true;
 }
 
 // ───────────── Procedural textures ─────────────

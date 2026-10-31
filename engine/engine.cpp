@@ -1,12 +1,17 @@
 // ron_engine: window, input and a forward Vulkan renderer.
 //
 // Rendering: 4x MSAA, depth, directional shadow map with PCF, physically based
-// materials (GGX), textures with mipmaps (bindless-style array), GPU skinning,
-// glTF models with keyframe animation and blending, fog, ACES tone mapping.
+// materials (GGX, metallic-roughness / normal / occlusion / emissive maps),
+// image-based lighting from HDR environments, textures with mipmaps
+// (bindless-style array), GPU skinning and morph targets, alpha-to-coverage and
+// blended transparency, skin and hair shading, glTF models with keyframe
+// animation and blending, fog, ACES tone mapping.
 
 #include "ron_engine.h"
 
 #include "gltf.hpp"
+#include "ibl.hpp"
+#include "jpeg.hpp"
 #include "png.hpp"
 
 #include <windows.h>
@@ -35,14 +40,30 @@ const uint32_t kFragSpv[] = {
 const uint32_t kShadowVertSpv[] = {
 #include "shadow.vert.inc"
 };
+const uint32_t kShadowFragSpv[] = {
+#include "shadow.frag.inc"
+};
+const uint32_t kSkyVertSpv[] = {
+#include "sky.vert.inc"
+};
+const uint32_t kSkyFragSpv[] = {
+#include "sky.frag.inc"
+};
 
 constexpr int kFramesInFlight = 2;
 constexpr uint32_t kShadowMapSize = 2048;
 constexpr float kShadowExtent = 18.0f;    // half-size of the light's orthographic box
 constexpr uint32_t kMaxTextures = 256;    // must match textures[] in mesh.frag
 constexpr uint32_t kMaxJoints = 4096;     // joint matrices per frame
+constexpr uint32_t kMaxMorphFloats = 65536;   // morph headers + weights per frame
+// Flags shared with common.glsl
 constexpr int kFlagChecker = 1;
 constexpr int kFlagSkinned = 2;
+constexpr int kFlagAlphaMask = 4;
+constexpr int kFlagAlphaBlend = 8;
+constexpr int kFlagSkin = 16;
+constexpr int kFlagHair = 64;
+constexpr int kMaterialFlagsMask = kFlagSkin | kFlagHair;   // flags a program may set on a material
 
 using Vertex = ron::gltf::Vertex;
 
@@ -69,34 +90,60 @@ struct SceneUniforms {
     float groundColor[4];
     float cameraPos[4];
     float fog[4];
+    float invViewProj[16];
+    float env[4];        // loaded, intensity, max mip level, background
+    float sh[9][4];      // irradiance SH (rgb + padding)
 };
 
 struct PushConstants {
     float model0[4];
     float model1[4];
     float model2[4];
-    float color[4];
-    float material[4];   // roughness, metallic, emissive, unused
-    int32_t info[4];     // texture, flags, first joint, unused
+    float color[4];      // base color, a = alpha
+    float material[4];   // roughness, metallic, alpha cutoff, world UV scale
+    float emissive[4];   // emissive rgb, normal map scale
+    int32_t info[4];     // base texture, flags, first joint, morph header (-1 = none)
+    int32_t maps[4];     // normal (-1 = none), metallic-roughness, occlusion, emissive textures
 };
-static_assert(sizeof(PushConstants) == 96, "push constants must stay within the guaranteed 128 bytes");
+static_assert(sizeof(PushConstants) == 128, "push constants must stay within the guaranteed 128 bytes");
 
 // Draws are queued during the frame and recorded at the end, so the shadow pass
 // can render every object before the main pass.
 struct DrawCommand {
     int32_t mesh;
-    float model[16];
-    float color[4];
-    float material[4];
-    int32_t texture;
-    int32_t flags;
-    int32_t jointBase;
+    PushConstants pc;
+    float depth;   // distance to the camera, to sort blended draws back to front
+};
+
+// Material as drawn by the engine (glTF material + texture ids + program overrides).
+struct ModelMaterial {
+    float color[4] = {1, 1, 1, 1};
+    float roughness = 0.8f;
+    float metallic = 0.0f;
+    float emissive[3] = {0, 0, 0};
+    float normalScale = 1.0f;
+    float alphaCutoff = 0.5f;
+    int32_t baseTexture = 0;
+    int32_t normalTexture = -1;
+    int32_t mrTexture = 0;
+    int32_t occlusionTexture = 0;
+    int32_t emissiveTexture = 0;
+    int32_t flags = 0;   // alpha mode + skin / hair
+};
+
+// A model-level morph target: every (mesh, target) pair sharing a name.
+struct ModelMorph {
+    std::string name;
+    std::vector<std::pair<int, int>> targets;   // (mesh, target index)
 };
 
 struct Model {
     ron::gltf::Model data;
     std::vector<std::vector<int32_t>> primitiveMeshes;   // [mesh][primitive] -> engine mesh id
-    std::vector<int32_t> imageTextures;                   // [image] -> engine texture id
+    std::vector<std::vector<int32_t>> primitiveMorphs;   // [mesh][primitive] -> first delta (vec4 index) or -1
+    std::vector<ModelMaterial> materials;
+    std::vector<ModelMorph> morphs;
+    std::vector<float> morphOverride;                     // [morph] -> weight, NaN = animated / default
 };
 
 struct Engine {
@@ -158,8 +205,25 @@ struct Engine {
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;        // opaque
+    VkPipeline maskPipeline = VK_NULL_HANDLE;    // alpha-to-coverage (alpha MASK)
+    VkPipeline blendPipeline = VK_NULL_HANDLE;   // alpha blending, no depth writes (alpha BLEND)
+    VkPipeline skyPipeline = VK_NULL_HANDLE;     // environment background
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+
+    // Image-based lighting
+    Texture envTexture;
+    VkSampler envSampler = VK_NULL_HANDLE;
+
+    // Morph targets: all deltas (device buffer, rebuilt when a model is loaded)
+    // and per-frame headers + weights.
+    std::vector<float> morphData;   // CPU copy, 4 floats per delta
+    VkBuffer morphDeltaBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory morphDeltaMemory = VK_NULL_HANDLE;
+    VkBuffer morphFrameBuffers[kFramesInFlight] = {};
+    VkDeviceMemory morphFrameMemory[kFramesInFlight] = {};
+    float* morphFrameMapped[kFramesInFlight] = {};
+    uint32_t morphCursor = 0;
 
     // Shadow mapping
     VkImage shadowImage = VK_NULL_HANDLE;
@@ -615,13 +679,16 @@ bool createRenderPass() {
 }
 
 bool createLayout() {
-    VkDescriptorSetLayoutBinding b[4] = {};
+    VkDescriptorSetLayoutBinding b[7] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextures, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    b[4] = {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    b[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sl.bindingCount = 4;
+    sl.bindingCount = 7;
     sl.pBindings = b;
     if (!check(vkCreateDescriptorSetLayout(g.device, &sl, nullptr, &g.setLayout), "vkCreateDescriptorSetLayout"))
         return false;
@@ -639,17 +706,19 @@ void vertexInput(VkVertexInputBindingDescription& binding, std::vector<VkVertexI
                  bool shadow) {
     binding = {0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
     attrs.push_back({0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)});
-    if (!shadow) {
-        attrs.push_back({1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)});
-        attrs.push_back({2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)});
-    }
+    if (!shadow) attrs.push_back({1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)});
+    attrs.push_back({2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)});
     attrs.push_back({3, 0, VK_FORMAT_R8G8B8A8_UINT, offsetof(Vertex, joints)});
     attrs.push_back({4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, weights)});
+    if (!shadow) attrs.push_back({5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, tangent)});
 }
 
-bool createPipeline() {
-    VkShaderModule vert = shaderModule(kVertSpv, sizeof(kVertSpv));
-    VkShaderModule frag = shaderModule(kFragSpv, sizeof(kFragSpv));
+enum class PipelineKind { Opaque, Mask, Blend, Sky };
+
+bool createPipeline(PipelineKind kind, VkPipeline& out) {
+    bool sky = kind == PipelineKind::Sky;
+    VkShaderModule vert = sky ? shaderModule(kSkyVertSpv, sizeof(kSkyVertSpv)) : shaderModule(kVertSpv, sizeof(kVertSpv));
+    VkShaderModule frag = sky ? shaderModule(kSkyFragSpv, sizeof(kSkyFragSpv)) : shaderModule(kFragSpv, sizeof(kFragSpv));
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr},
@@ -659,10 +728,12 @@ bool createPipeline() {
     std::vector<VkVertexInputAttributeDescription> attrs;
     vertexInput(vb, attrs, false);
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = &vb;
-    vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
-    vi.pVertexAttributeDescriptions = attrs.data();
+    if (!sky) {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &vb;
+        vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
+        vi.pVertexAttributeDescriptions = attrs.data();
+    }
 
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -676,13 +747,23 @@ bool createPipeline() {
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = g.samples;
+    ms.alphaToCoverageEnable = kind == PipelineKind::Mask ? VK_TRUE : VK_FALSE;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    ds.depthWriteEnable = kind == PipelineKind::Opaque || kind == PipelineKind::Mask ? VK_TRUE : VK_FALSE;
+    ds.depthCompareOp = sky ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS;
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
                            VK_COLOR_COMPONENT_A_BIT;
+    if (kind == PipelineKind::Blend) {
+        blend.blendEnable = VK_TRUE;
+        blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend.colorBlendOp = VK_BLEND_OP_ADD;
+        blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1;
     cb.pAttachments = &blend;
@@ -704,11 +785,16 @@ bool createPipeline() {
     pi.pDynamicState = &dy;
     pi.layout = g.pipelineLayout;
     pi.renderPass = g.renderPass;
-    bool ok = check(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &pi, nullptr, &g.pipeline),
+    bool ok = check(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &pi, nullptr, &out),
                     "vkCreateGraphicsPipelines");
     vkDestroyShaderModule(g.device, vert, nullptr);
     vkDestroyShaderModule(g.device, frag, nullptr);
     return ok;
+}
+
+bool createPipelines() {
+    return createPipeline(PipelineKind::Opaque, g.pipeline) && createPipeline(PipelineKind::Mask, g.maskPipeline) &&
+           createPipeline(PipelineKind::Blend, g.blendPipeline) && createPipeline(PipelineKind::Sky, g.skyPipeline);
 }
 
 bool createShadowResources() {
@@ -774,8 +860,11 @@ bool createShadowResources() {
         return false;
 
     VkShaderModule vert = shaderModule(kShadowVertSpv, sizeof(kShadowVertSpv));
-    VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-                                          VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
+    VkShaderModule frag = shaderModule(kShadowFragSpv, sizeof(kShadowFragSpv));
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr},
+    };
     VkVertexInputBindingDescription vb;
     std::vector<VkVertexInputAttributeDescription> attrs;
     vertexInput(vb, attrs, true);
@@ -808,8 +897,8 @@ bool createShadowResources() {
     ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pi.stageCount = 1;
-    pi.pStages = &stage;
+    pi.stageCount = 2;
+    pi.pStages = stages;
     pi.pVertexInputState = &vi;
     pi.pInputAssemblyState = &ia;
     pi.pViewportState = &vp;
@@ -822,6 +911,7 @@ bool createShadowResources() {
     bool ok = check(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadowPipeline),
                     "vkCreateGraphicsPipelines (shadow)");
     vkDestroyShaderModule(g.device, vert, nullptr);
+    vkDestroyShaderModule(g.device, frag, nullptr);
     return ok;
 }
 
@@ -840,8 +930,9 @@ void writeTextureSlot(uint32_t slot, int32_t textureId) {
     }
 }
 
-// Uploads RGBA8 pixels as an sRGB texture with a full mip chain; returns its id or -1.
-int32_t createTexture(uint32_t w, uint32_t h, const uint8_t* rgba) {
+// Uploads RGBA8 pixels with a full mip chain; returns its id or -1. Colors are
+// sRGB; data maps (normals, roughness, occlusion) must be sampled linearly.
+int32_t createTexture(uint32_t w, uint32_t h, const uint8_t* rgba, bool srgb = true) {
     if (g.textures.size() >= kMaxTextures || w == 0 || h == 0) return -1;
     uint32_t mips = 1;
     while ((std::max(w, h) >> mips) > 0) ++mips;
@@ -858,7 +949,7 @@ int32_t createTexture(uint32_t w, uint32_t h, const uint8_t* rgba) {
     vkUnmapMemory(g.device, stagingMemory);
 
     Texture t;
-    if (!createImage(w, h, mips, VK_FORMAT_R8G8B8A8_SRGB,
+    if (!createImage(w, h, mips, srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                      VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT, t.image, t.memory, t.view))
         return -1;
@@ -907,6 +998,135 @@ int32_t createTexture(uint32_t w, uint32_t h, const uint8_t* rgba) {
     return id;
 }
 
+uint16_t floatToHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (((x >> 23) & 0xFF) == 0xFF) return static_cast<uint16_t>(sign | 0x7C00u | (mant ? 0x200u : 0));   // inf / nan
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu);   // clamp to the largest half
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        mant |= 0x800000u;
+        uint32_t shift = static_cast<uint32_t>(14 - exp);
+        uint32_t half = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) ++half;   // round
+        return static_cast<uint16_t>(sign | half);
+    }
+    uint32_t half = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+    if (mant & 0x1000u) ++half;   // round to nearest (may carry into the exponent, which is correct)
+    return static_cast<uint16_t>(half);
+}
+
+// Uploads an environment mip chain as RGBA16F (every level given by the CPU).
+bool createEnvTexture(const std::vector<ron::ibl::FloatImage>& levels, Texture& t) {
+    if (levels.empty()) return false;
+    auto mips = static_cast<uint32_t>(levels.size());
+    VkDeviceSize bytes = 0;
+    for (const auto& l : levels) bytes += static_cast<VkDeviceSize>(l.width) * l.height * 8;
+    VkBuffer staging;
+    VkDeviceMemory stagingMemory;
+    if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory))
+        return false;
+    void* p;
+    vkMapMemory(g.device, stagingMemory, 0, bytes, 0, &p);
+    auto* dst = static_cast<uint16_t*>(p);
+    std::vector<VkBufferImageCopy> regions;
+    VkDeviceSize offset = 0;
+    for (uint32_t i = 0; i < mips; ++i) {
+        const auto& l = levels[i];
+        size_t count = static_cast<size_t>(l.width) * l.height;
+        for (size_t k = 0; k < count; ++k) {
+            for (int c = 0; c < 3; ++c) dst[k * 4 + c] = floatToHalf(l.rgb[k * 3 + c]);
+            dst[k * 4 + 3] = 0x3C00;   // 1.0
+        }
+        VkBufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        region.imageExtent = {static_cast<uint32_t>(l.width), static_cast<uint32_t>(l.height), 1};
+        regions.push_back(region);
+        offset += count * 8;
+        dst += count * 4;
+    }
+    vkUnmapMemory(g.device, stagingMemory);
+    if (!createImage(static_cast<uint32_t>(levels[0].width), static_cast<uint32_t>(levels[0].height), mips,
+                     VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT, t.image, t.memory, t.view))
+        return false;
+    VkCommandBuffer cmd = beginOneShot();
+    imageBarrier(cmd, t.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, mips);
+    vkCmdCopyBufferToImage(cmd, staging, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           static_cast<uint32_t>(regions.size()), regions.data());
+    imageBarrier(cmd, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, mips);
+    endOneShot(cmd);
+    vkDestroyBuffer(g.device, staging, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+    return true;
+}
+
+void writeEnvDescriptor() {
+    VkDescriptorImageInfo info{g.envSampler, g.envTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    for (int f = 0; f < kFramesInFlight; ++f) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = g.descriptorSets[f];
+        w.dstBinding = 4;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &info;
+        vkUpdateDescriptorSets(g.device, 1, &w, 0, nullptr);
+    }
+}
+
+// (Re)creates the device buffer holding every morph delta and points binding 5 at it.
+bool uploadMorphDeltas() {
+    if (g.morphData.empty()) g.morphData.assign(4, 0.0f);   // descriptors need a non-empty buffer
+    VkDeviceSize bytes = g.morphData.size() * sizeof(float);
+    VkBuffer staging;
+    VkDeviceMemory stagingMemory;
+    if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory))
+        return false;
+    void* p;
+    vkMapMemory(g.device, stagingMemory, 0, bytes, 0, &p);
+    std::memcpy(p, g.morphData.data(), bytes);
+    vkUnmapMemory(g.device, stagingMemory);
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    if (!createBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory))
+        return false;
+    VkCommandBuffer cmd = beginOneShot();
+    VkBufferCopy copy{0, 0, bytes};
+    vkCmdCopyBuffer(cmd, staging, buffer, 1, &copy);
+    endOneShot(cmd);
+    vkDestroyBuffer(g.device, staging, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+
+    vkDeviceWaitIdle(g.device);   // descriptor sets may be in use by frames in flight
+    if (g.morphDeltaBuffer) {
+        vkDestroyBuffer(g.device, g.morphDeltaBuffer, nullptr);
+        vkFreeMemory(g.device, g.morphDeltaMemory, nullptr);
+    }
+    g.morphDeltaBuffer = buffer;
+    g.morphDeltaMemory = memory;
+    VkDescriptorBufferInfo info{buffer, 0, bytes};
+    for (int f = 0; f < kFramesInFlight; ++f) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = g.descriptorSets[f];
+        w.dstBinding = 5;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &info;
+        vkUpdateDescriptorSets(g.device, 1, &w, 0, nullptr);
+    }
+    return true;
+}
+
 bool createFrameResources() {
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -931,9 +1151,23 @@ bool createFrameResources() {
     const uint8_t white[4] = {255, 255, 255, 255};
     if (createTexture(1, 1, white) != 0) return false;
 
+    // Environment sampler: wraps around horizontally, clamps at the poles, trilinear across roughness levels.
+    VkSamplerCreateInfo es{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    es.magFilter = VK_FILTER_LINEAR;
+    es.minFilter = VK_FILTER_LINEAR;
+    es.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    es.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    es.addressModeV = es.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    es.maxLod = VK_LOD_CLAMP_NONE;
+    if (!check(vkCreateSampler(g.device, &es, nullptr, &g.envSampler), "vkCreateSampler (environment)")) return false;
+    ron::ibl::FloatImage black;
+    black.width = black.height = 1;
+    black.rgb = {0, 0, 0};
+    if (!createEnvTexture({black}, g.envTexture)) return false;
+
     VkDescriptorPoolSize poolSizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * (1 + kMaxTextures)},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight}};
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * (2 + kMaxTextures)},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight * 3}};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = kFramesInFlight;
     dp.poolSizeCount = 3;
@@ -952,8 +1186,13 @@ bool createFrameResources() {
     for (int i = 0; i < kFramesInFlight; ++i) {
         if (!createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, host, g.uniformBuffers[i],
                           g.uniformMemory[i]) ||
-            !createBuffer(kMaxJoints * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.jointBuffers[i], g.jointMemory[i]))
+            !createBuffer(kMaxJoints * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.jointBuffers[i], g.jointMemory[i]) ||
+            !createBuffer(kMaxMorphFloats * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.morphFrameBuffers[i],
+                          g.morphFrameMemory[i]))
             return false;
+        void* mm;
+        vkMapMemory(g.device, g.morphFrameMemory[i], 0, kMaxMorphFloats * 4, 0, &mm);
+        g.morphFrameMapped[i] = static_cast<float*>(mm);
         vkMapMemory(g.device, g.uniformMemory[i], 0, sizeof(SceneUniforms), 0, &g.uniformMapped[i]);
         void* jm;
         vkMapMemory(g.device, g.jointMemory[i], 0, kMaxJoints * 64, 0, &jm);
@@ -967,7 +1206,8 @@ bool createFrameResources() {
         VkDescriptorImageInfo shadow{g.shadowSampler, g.shadowView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
         std::vector<VkDescriptorImageInfo> texInfos(kMaxTextures,
                                                     {g.textureSampler, g.textures[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
-        VkWriteDescriptorSet w[4] = {};
+        VkDescriptorBufferInfo mf{g.morphFrameBuffers[i], 0, kMaxMorphFloats * 4};
+        VkWriteDescriptorSet w[5] = {};
         for (auto& x : w) {
             x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             x.dstSet = g.descriptorSets[i];
@@ -986,7 +1226,10 @@ bool createFrameResources() {
         w[3].dstBinding = 3;
         w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         w[3].pBufferInfo = &jb;
-        vkUpdateDescriptorSets(g.device, 4, w, 0, nullptr);
+        w[4].dstBinding = 6;
+        w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[4].pBufferInfo = &mf;
+        vkUpdateDescriptorSets(g.device, 5, w, 0, nullptr);
 
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -995,7 +1238,8 @@ bool createFrameResources() {
             !check(vkCreateFence(g.device, &fi, nullptr, &g.inFlight[i]), "vkCreateFence"))
             return false;
     }
-    return true;
+    writeEnvDescriptor();
+    return uploadMorphDeltas();
 }
 
 void destroySwapchain() {
@@ -1159,25 +1403,74 @@ int32_t pushJoints(const float* matrices, int32_t count) {
     return base;
 }
 
-void queueDraw(int32_t mesh, const float* model, int32_t texture, float r, float g2, float b, float roughness,
-               float metallic, float emissive, int32_t flags, int32_t jointBase, float uvScale = 0.0f) {
+// Copies a morph header and weights into this frame's buffer; returns the header index or -1.
+int32_t pushMorphs(int32_t firstDelta, int32_t vertexCount, bool hasNormals, const std::vector<float>& weights) {
+    uint32_t need = 4 + static_cast<uint32_t>(weights.size());
+    if (firstDelta < 0 || weights.empty() || g.morphCursor + need > kMaxMorphFloats) return -1;
+    bool any = false;
+    for (float w : weights) any = any || w != 0.0f;
+    if (!any) return -1;   // nothing to add: draw the base mesh
+    float* dst = g.morphFrameMapped[g.frame] + g.morphCursor;
+    int32_t header[4] = {firstDelta, static_cast<int32_t>(weights.size()), vertexCount, hasNormals ? 1 : 0};
+    std::memcpy(dst, header, 16);
+    std::memcpy(dst + 4, weights.data(), weights.size() * sizeof(float));
+    auto base = static_cast<int32_t>(g.morphCursor);
+    g.morphCursor += need;
+    return base;
+}
+
+int32_t validTexture(int32_t t, int32_t fallback) {
+    return t >= 0 && t < static_cast<int32_t>(g.textures.size()) ? t : fallback;
+}
+
+void submitDraw(int32_t mesh, const float* model, const ModelMaterial& mat, int32_t flags, int32_t jointBase,
+                int32_t morphHeader, float uvScale) {
     if (!g.frameActive || mesh < 0 || mesh >= static_cast<int32_t>(g.meshes.size())) return;
-    if (texture < 0 || texture >= static_cast<int32_t>(g.textures.size())) texture = 0;
     DrawCommand d;
     d.mesh = mesh;
-    std::memcpy(d.model, model, sizeof(d.model));
-    d.color[0] = r;
-    d.color[1] = g2;
-    d.color[2] = b;
-    d.color[3] = 1.0f;
-    d.material[0] = roughness;
-    d.material[1] = metallic;
-    d.material[2] = emissive;
-    d.material[3] = uvScale;
-    d.texture = texture;
-    d.flags = flags;
-    d.jointBase = jointBase;
+    PushConstants& pc = d.pc;
+    for (int row = 0; row < 3; ++row) {
+        float* dst = row == 0 ? pc.model0 : row == 1 ? pc.model1 : pc.model2;
+        for (int col = 0; col < 4; ++col) dst[col] = model[col * 4 + row];
+    }
+    std::memcpy(pc.color, mat.color, sizeof(pc.color));
+    pc.material[0] = mat.roughness;
+    pc.material[1] = mat.metallic;
+    pc.material[2] = mat.alphaCutoff;
+    pc.material[3] = uvScale;
+    pc.emissive[0] = mat.emissive[0];
+    pc.emissive[1] = mat.emissive[1];
+    pc.emissive[2] = mat.emissive[2];
+    pc.emissive[3] = mat.normalScale;
+    pc.info[0] = validTexture(mat.baseTexture, 0);
+    pc.info[1] = flags | mat.flags;
+    pc.info[2] = jointBase;
+    pc.info[3] = morphHeader;
+    pc.maps[0] = validTexture(mat.normalTexture, -1);
+    pc.maps[1] = validTexture(mat.mrTexture, 0);
+    pc.maps[2] = validTexture(mat.occlusionTexture, 0);
+    pc.maps[3] = validTexture(mat.emissiveTexture, 0);
+    float dx = model[12] - g.scene.cameraPos[0], dy = model[13] - g.scene.cameraPos[1], dz = model[14] - g.scene.cameraPos[2];
+    d.depth = dx * dx + dy * dy + dz * dz;
     g.draws.push_back(d);
+}
+
+// Simple draws from the immediate API: one color, one texture, the current material settings.
+void queueDraw(int32_t mesh, const float* model, int32_t texture, float r, float g2, float b, float roughness,
+               float metallic, float emissive, int32_t flags, int32_t jointBase, float uvScale = 0.0f) {
+    ModelMaterial mat;
+    mat.color[0] = r;
+    mat.color[1] = g2;
+    mat.color[2] = b;
+    mat.roughness = roughness;
+    mat.metallic = metallic;
+    mat.baseTexture = validTexture(texture, 0);
+    // Legacy scalar emissive: the surface glows with its own (textured) color.
+    mat.emissive[0] = r * emissive;
+    mat.emissive[1] = g2 * emissive;
+    mat.emissive[2] = b * emissive;
+    mat.emissiveTexture = mat.baseTexture;
+    submitDraw(mesh, model, mat, flags, jointBase, -1, uvScale);
 }
 
 void bindMesh(VkCommandBuffer cmd, const Mesh& m) {
@@ -1186,17 +1479,32 @@ void bindMesh(VkCommandBuffer cmd, const Mesh& m) {
     vkCmdBindIndexBuffer(cmd, m.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 }
 
-void pushConstantsFor(const DrawCommand& d, PushConstants& pc) {
-    for (int row = 0; row < 3; ++row) {
-        float* dst = row == 0 ? pc.model0 : row == 1 ? pc.model1 : pc.model2;
-        for (int col = 0; col < 4; ++col) dst[col] = d.model[col * 4 + row];
+// Inverse of a 4x4 matrix (cofactor expansion); identity if singular.
+void mat4Inverse(const float* m, float* out) {
+    float inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (std::fabs(det) < 1e-30f) {
+        static const float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        std::memcpy(out, id, sizeof(id));
+        return;
     }
-    std::memcpy(pc.color, d.color, sizeof(pc.color));
-    std::memcpy(pc.material, d.material, sizeof(pc.material));
-    pc.info[0] = d.texture;
-    pc.info[1] = d.flags;
-    pc.info[2] = d.jointBase;
-    pc.info[3] = 0;
+    for (int i = 0; i < 16; ++i) out[i] = inv[i] / det;
 }
 
 // Orthographic light camera covering a box around the point the camera looks at.
@@ -1253,15 +1561,22 @@ void recordFrame(VkCommandBuffer cmd) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipelineLayout, 0, 1, &g.descriptorSets[g.frame],
                             0, nullptr);
     for (const DrawCommand& d : g.draws) {
-        if (d.flags & kFlagChecker) continue;   // ground planes do not cast shadows
-        PushConstants pc;
-        pushConstantsFor(d, pc);
+        if (d.pc.info[1] & kFlagChecker) continue;   // ground planes do not cast shadows
         const Mesh& m = g.meshes[d.mesh];
         bindMesh(cmd, m);
-        vkCmdPushConstants(cmd, g.pipelineLayout, stages, 0, sizeof(pc), &pc);
+        vkCmdPushConstants(cmd, g.pipelineLayout, stages, 0, sizeof(d.pc), &d.pc);
         vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
     }
     vkCmdEndRenderPass(cmd);
+
+    // Opaque first, then alpha-tested, then blended surfaces back to front.
+    std::vector<const DrawCommand*> opaque, masked, blended;
+    for (const DrawCommand& d : g.draws) {
+        int f = d.pc.info[1];
+        (f & kFlagAlphaBlend ? blended : f & kFlagAlphaMask ? masked : opaque).push_back(&d);
+    }
+    std::stable_sort(blended.begin(), blended.end(),
+                     [](const DrawCommand* a, const DrawCommand* b) { return a->depth > b->depth; });
 
     // 2) Main pass
     VkClearValue clears[3];
@@ -1279,17 +1594,26 @@ void recordFrame(VkCommandBuffer cmd) {
     VkRect2D scissor{{0, 0}, g.extent};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipelineLayout, 0, 1, &g.descriptorSets[g.frame],
                             0, nullptr);
-    for (const DrawCommand& d : g.draws) {
-        PushConstants pc;
-        pushConstantsFor(d, pc);
-        const Mesh& m = g.meshes[d.mesh];
-        bindMesh(cmd, m);
-        vkCmdPushConstants(cmd, g.pipelineLayout, stages, 0, sizeof(pc), &pc);
-        vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
+    auto drawList = [&](VkPipeline pipeline, const std::vector<const DrawCommand*>& list) {
+        if (list.empty()) return;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        for (const DrawCommand* d : list) {
+            const Mesh& m = g.meshes[d->mesh];
+            bindMesh(cmd, m);
+            vkCmdPushConstants(cmd, g.pipelineLayout, stages, 0, sizeof(d->pc), &d->pc);
+            vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
+        }
+    };
+    drawList(g.pipeline, opaque);
+    drawList(g.maskPipeline, masked);
+    if (g.scene.env[0] > 0.5f && g.scene.env[3] > 0.5f) {
+        // Background after the opaque geometry: only uncovered pixels (depth = 1) run the shader.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.skyPipeline);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
     }
+    drawList(g.blendPipeline, blended);
     vkCmdEndRenderPass(cmd);
 }
 
@@ -1374,24 +1698,124 @@ void drawModel(int32_t id, const float* transform, int32_t anim, float time, int
         }
         ron::gltf::Mat4 world = jointBase >= 0 ? user : ron::gltf::multiply(user, global[n]);
         const auto& prims = m.meshes[node.mesh].primitives;
+
+        // Morph weights: animation / defaults, then the program's overrides.
+        std::vector<float> weights;
+        bool morphing = false;
+        for (const auto& prim : prims) morphing = morphing || !prim.targets.empty();
+        if (morphing) {
+            weights = ron::gltf::sampleWeights(m, static_cast<int>(n), anim, time, animB, timeB, weight);
+            for (size_t i = 0; i < model.morphs.size(); ++i) {
+                if (std::isnan(model.morphOverride[i])) continue;
+                for (const auto& [meshIndex, target] : model.morphs[i].targets)
+                    if (meshIndex == node.mesh && static_cast<size_t>(target) < weights.size())
+                        weights[target] = model.morphOverride[i];
+            }
+        }
+
+        static const ModelMaterial kDefault;
         for (size_t p = 0; p < prims.size(); ++p) {
             int32_t mesh = model.primitiveMeshes[node.mesh][p];
-            float color[4] = {1, 1, 1, 1};
-            int32_t texture = 0;
-            float roughness = 0.8f, metallic = 0.0f;
-            if (prims[p].material >= 0 && static_cast<size_t>(prims[p].material) < m.materials.size()) {
-                const auto& mat = m.materials[prims[p].material];
-                std::memcpy(color, mat.baseColor, 16);
-                roughness = mat.roughness;
-                metallic = mat.metallic;
-                if (mat.image >= 0 && static_cast<size_t>(mat.image) < model.imageTextures.size())
-                    texture = model.imageTextures[mat.image];
-            }
+            int matIndex = prims[p].material;
+            const ModelMaterial& mat = matIndex >= 0 && static_cast<size_t>(matIndex) < model.materials.size()
+                                           ? model.materials[matIndex]
+                                           : kDefault;
             bool skinned = jointBase >= 0 && prims[p].skinned;
-            queueDraw(mesh, world.data(), texture, color[0], color[1], color[2], roughness, metallic, 0.0f,
-                      skinned ? kFlagSkinned : 0, skinned ? jointBase : 0);
+            int32_t morphHeader = -1;
+            if (morphing && !prims[p].targets.empty()) {
+                std::vector<float> w(weights.begin(), weights.begin() + std::min(weights.size(), prims[p].targets.size()));
+                morphHeader = pushMorphs(model.primitiveMorphs[node.mesh][p], static_cast<int32_t>(prims[p].vertices.size()),
+                                         !prims[p].targets[0].normals.empty(), w);
+            }
+            submitDraw(mesh, world.data(), mat, skinned ? kFlagSkinned : 0, skinned ? jointBase : 0, morphHeader, 0.0f);
         }
     }
+}
+
+// Engine materials from glTF materials, creating each texture with the color
+// space its role needs (sRGB for colors, linear for data).
+void buildModelMaterials(Model& model) {
+    const ron::gltf::Model& m = model.data;
+    std::vector<int32_t> srgbTex(m.images.size(), -2), linearTex(m.images.size(), -2);   // -2 = not created yet
+    auto texture = [&](int image, bool srgb) -> int32_t {
+        if (image < 0 || static_cast<size_t>(image) >= m.images.size()) return -1;
+        int32_t& slot = srgb ? srgbTex[image] : linearTex[image];
+        if (slot == -2) {
+            const auto& img = m.images[image];
+            slot = createTexture(img.width, img.height, img.rgba.data(), srgb);
+            if (slot < 0) std::fprintf(stderr, "ron_engine: texture limit reached, image %d skipped\n", image);
+        }
+        return slot;
+    };
+    for (const auto& gm : m.materials) {
+        ModelMaterial mat;
+        std::memcpy(mat.color, gm.baseColor, 16);
+        mat.roughness = gm.roughness;
+        mat.metallic = gm.metallic;
+        std::memcpy(mat.emissive, gm.emissive, 12);
+        mat.normalScale = gm.normalScale;
+        mat.alphaCutoff = gm.alphaCutoff;
+        int32_t t;
+        if ((t = texture(gm.image, true)) >= 0) mat.baseTexture = t;
+        mat.normalTexture = texture(gm.normalImage, false);
+        if ((t = texture(gm.metallicRoughnessImage, false)) >= 0) mat.mrTexture = t;
+        if ((t = texture(gm.occlusionImage, false)) >= 0) mat.occlusionTexture = t;
+        if ((t = texture(gm.emissiveImage, true)) >= 0) mat.emissiveTexture = t;
+        if (gm.alphaMode == ron::gltf::AlphaMode::Mask) mat.flags |= kFlagAlphaMask;
+        if (gm.alphaMode == ron::gltf::AlphaMode::Blend) mat.flags |= kFlagAlphaBlend;
+        model.materials.push_back(mat);
+    }
+}
+
+// Appends the morph deltas of every primitive to the shared buffer and builds
+// the model's named morph table.
+void buildModelMorphs(Model& model) {
+    const ron::gltf::Model& m = model.data;
+    bool any = false;
+    model.primitiveMorphs.clear();
+    for (size_t mi = 0; mi < m.meshes.size(); ++mi) {
+        std::vector<int32_t> firsts;
+        for (const auto& prim : m.meshes[mi].primitives) {
+            if (prim.targets.empty()) {
+                firsts.push_back(-1);
+                continue;
+            }
+            any = true;
+            firsts.push_back(static_cast<int32_t>(g.morphData.size() / 4));
+            size_t count = prim.vertices.size();
+            bool normals = !prim.targets[0].normals.empty();
+            for (const auto& t : prim.targets) {
+                for (int part = 0; part < (normals ? 2 : 1); ++part) {
+                    const std::vector<float>& src = part == 0 ? t.positions : t.normals;
+                    for (size_t v = 0; v < count; ++v) {
+                        bool ok = src.size() == count * 3;
+                        g.morphData.push_back(ok ? src[v * 3] : 0.0f);
+                        g.morphData.push_back(ok ? src[v * 3 + 1] : 0.0f);
+                        g.morphData.push_back(ok ? src[v * 3 + 2] : 0.0f);
+                        g.morphData.push_back(0.0f);
+                    }
+                }
+            }
+        }
+        model.primitiveMorphs.push_back(std::move(firsts));
+
+        // Named morphs (shared by name across meshes, e.g. face + eyelashes + teeth)
+        size_t targets = 0;
+        for (const auto& prim : m.meshes[mi].primitives) targets = std::max(targets, prim.targets.size());
+        for (size_t t = 0; t < targets; ++t) {
+            const auto& names = m.meshes[mi].targetNames;
+            std::string name = t < names.size() && !names[t].empty() ? names[t]
+                                                                     : "mesh" + std::to_string(mi) + "_" + std::to_string(t);
+            auto it = std::find_if(model.morphs.begin(), model.morphs.end(), [&](const ModelMorph& x) { return x.name == name; });
+            if (it == model.morphs.end()) {
+                model.morphs.push_back({name, {}});
+                it = model.morphs.end() - 1;
+            }
+            it->targets.push_back({static_cast<int>(mi), static_cast<int>(t)});
+        }
+    }
+    model.morphOverride.assign(model.morphs.size(), std::nanf(""));
+    if (any) uploadMorphDeltas();
 }
 
 } // namespace
@@ -1412,7 +1836,7 @@ RE_API bool engine_init(int32_t width, int32_t height, const char* title) {
     if (!check(vkCreateWin32SurfaceKHR(g.instance, &si, nullptr, &g.surface), "vkCreateWin32SurfaceKHR")) return false;
 
     if (!pickDevice() || !createDevice() || !createRenderPass() || !createLayout() || !createShadowResources() ||
-        !createPipeline() || !createFrameResources())
+        !createPipelines() || !createFrameResources())
         return false;
     createSwapchain();
     setDefaultScene();
@@ -1451,7 +1875,15 @@ RE_API void engine_shutdown() {
         vkFreeMemory(g.device, g.uniformMemory[i], nullptr);
         vkDestroyBuffer(g.device, g.jointBuffers[i], nullptr);
         vkFreeMemory(g.device, g.jointMemory[i], nullptr);
+        vkDestroyBuffer(g.device, g.morphFrameBuffers[i], nullptr);
+        vkFreeMemory(g.device, g.morphFrameMemory[i], nullptr);
     }
+    vkDestroyBuffer(g.device, g.morphDeltaBuffer, nullptr);
+    vkFreeMemory(g.device, g.morphDeltaMemory, nullptr);
+    g.morphDeltaBuffer = VK_NULL_HANDLE;
+    g.morphData.clear();
+    destroyImage(g.envTexture.image, g.envTexture.memory, g.envTexture.view);
+    vkDestroySampler(g.device, g.envSampler, nullptr);
     vkDestroyPipeline(g.device, g.shadowPipeline, nullptr);
     vkDestroyFramebuffer(g.device, g.shadowFramebuffer, nullptr);
     vkDestroyRenderPass(g.device, g.shadowPass, nullptr);
@@ -1461,6 +1893,9 @@ RE_API void engine_shutdown() {
     vkDestroyCommandPool(g.device, g.commandPool, nullptr);
     vkDestroyDescriptorPool(g.device, g.descriptorPool, nullptr);
     vkDestroyPipeline(g.device, g.pipeline, nullptr);
+    vkDestroyPipeline(g.device, g.maskPipeline, nullptr);
+    vkDestroyPipeline(g.device, g.blendPipeline, nullptr);
+    vkDestroyPipeline(g.device, g.skyPipeline, nullptr);
     vkDestroyPipelineLayout(g.device, g.pipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(g.device, g.setLayout, nullptr);
     vkDestroyRenderPass(g.device, g.renderPass, nullptr);
@@ -1533,6 +1968,7 @@ RE_API bool engine_begin_frame(float r, float gg, float b) {
     g.clearColor[2] = aces(b);
     g.draws.clear();
     g.jointCursor = 1;   // joint 0 stays the identity
+    g.morphCursor = 0;
     g.frameActive = true;
     return true;
 }
@@ -1542,6 +1978,7 @@ RE_API void engine_end_frame() {
     g.frameActive = false;
     VkCommandBuffer cmd = g.commands[g.frame];
     mat4Mul(g.proj, g.view, g.scene.viewProj);
+    mat4Inverse(g.scene.viewProj, g.scene.invViewProj);
     computeLightViewProj(g.scene.lightViewProj);
     std::memcpy(g.uniformMapped[g.frame], &g.scene, sizeof(g.scene));
     vkResetCommandBuffer(cmd, 0);
@@ -1753,7 +2190,7 @@ RE_API int32_t engine_texture_create(int32_t width, int32_t height, const uint8_
 RE_API int32_t engine_texture_load(const char* path) {
     ron::png::Image img;
     std::string error;
-    if (!path || !ron::png::load(path, img, error)) {
+    if (!path || !ron::loadImage(path, img, error)) {
         std::fprintf(stderr, "ron_engine: texture '%s': %s\n", path ? path : "(null)", error.c_str());
         return -1;
     }
@@ -1792,15 +2229,171 @@ RE_API int32_t engine_model_load(const char* path) {
         std::fprintf(stderr, "ron_engine: model '%s': %s\n", path, error.c_str());
         return -1;
     }
-    for (const auto& img : model->data.images) model->imageTextures.push_back(createTexture(img.width, img.height, img.rgba.data()));
+    buildModelMaterials(*model);
     for (const auto& mesh : model->data.meshes) {
         std::vector<int32_t> ids;
         for (const auto& prim : mesh.primitives) ids.push_back(uploadMesh(prim.vertices, prim.indices));
         model->primitiveMeshes.push_back(std::move(ids));
     }
+    buildModelMorphs(*model);
+    // The pixels now live on the GPU.
+    for (auto& img : model->data.images) {
+        img.rgba.clear();
+        img.rgba.shrink_to_fit();
+    }
     g.models.push_back(std::move(model));
     return static_cast<int32_t>(g.models.size() - 1);
 }
+
+Model* findModel(int32_t model) {
+    return model >= 0 && model < static_cast<int32_t>(g.models.size()) ? g.models[model].get() : nullptr;
+}
+
+RE_API int32_t engine_model_material_count(int32_t model) {
+    Model* m = findModel(model);
+    return m ? static_cast<int32_t>(m->materials.size()) : 0;
+}
+
+RE_API const char* engine_model_material_name(int32_t model, int32_t material) {
+    Model* m = findModel(model);
+    if (!m || material < 0 || material >= static_cast<int32_t>(m->data.materials.size())) return "";
+    return m->data.materials[material].name.c_str();
+}
+
+RE_API int32_t engine_model_find_material(int32_t model, const char* name) {
+    Model* m = findModel(model);
+    if (!m || !name) return -1;
+    for (size_t i = 0; i < m->data.materials.size(); ++i)
+        if (m->data.materials[i].name == name) return static_cast<int32_t>(i);
+    return -1;
+}
+
+RE_API void engine_model_set_material_flags(int32_t model, int32_t material, int32_t flags) {
+    Model* m = findModel(model);
+    if (!m || material < 0 || material >= static_cast<int32_t>(m->materials.size())) return;
+    int32_t& f = m->materials[material].flags;
+    f = (f & ~kMaterialFlagsMask) | (flags & kMaterialFlagsMask);
+}
+
+RE_API void engine_model_set_material_color(int32_t model, int32_t material, float r, float gg, float b, float a) {
+    Model* m = findModel(model);
+    if (!m || material < 0 || material >= static_cast<int32_t>(m->materials.size())) return;
+    float* c = m->materials[material].color;
+    c[0] = r;
+    c[1] = gg;
+    c[2] = b;
+    c[3] = a;
+}
+
+RE_API void engine_model_set_material_pbr(int32_t model, int32_t material, float roughness, float metallic) {
+    Model* m = findModel(model);
+    if (!m || material < 0 || material >= static_cast<int32_t>(m->materials.size())) return;
+    m->materials[material].roughness = roughness;
+    m->materials[material].metallic = metallic;
+}
+
+RE_API int32_t engine_model_morph_count(int32_t model) {
+    Model* m = findModel(model);
+    return m ? static_cast<int32_t>(m->morphs.size()) : 0;
+}
+
+RE_API const char* engine_model_morph_name(int32_t model, int32_t morph) {
+    Model* m = findModel(model);
+    if (!m || morph < 0 || morph >= static_cast<int32_t>(m->morphs.size())) return "";
+    return m->morphs[morph].name.c_str();
+}
+
+RE_API int32_t engine_model_find_morph(int32_t model, const char* name) {
+    Model* m = findModel(model);
+    if (!m || !name) return -1;
+    for (size_t i = 0; i < m->morphs.size(); ++i)
+        if (m->morphs[i].name == name) return static_cast<int32_t>(i);
+    return -1;
+}
+
+RE_API void engine_model_set_morph(int32_t model, int32_t morph, float weight) {
+    Model* m = findModel(model);
+    if (m && morph >= 0 && morph < static_cast<int32_t>(m->morphs.size())) m->morphOverride[morph] = weight;
+}
+
+RE_API void engine_model_clear_morphs(int32_t model) {
+    Model* m = findModel(model);
+    if (m) std::fill(m->morphOverride.begin(), m->morphOverride.end(), std::nanf(""));
+}
+
+RE_API void engine_model_bounds(int32_t model, float* min3, float* max3) {
+    Model* m = findModel(model);
+    if (!min3 || !max3) return;
+    for (int c = 0; c < 3; ++c) min3[c] = max3[c] = 0.0f;
+    if (!m) return;
+    const ron::gltf::Model& d = m->data;
+    std::vector<ron::gltf::Mat4> local, global;
+    ron::gltf::samplePose(d, -1, 0.0f, -1, 0.0f, 0.0f, local);
+    ron::gltf::globalTransforms(d, local, global);
+    bool first = true;
+    for (size_t n = 0; n < d.nodes.size(); ++n) {
+        const auto& node = d.nodes[n];
+        if (node.mesh < 0 || static_cast<size_t>(node.mesh) >= d.meshes.size()) continue;
+        // Skinned meshes: vertices placed by their joints at rest (like the vertex shader).
+        std::vector<ron::gltf::Mat4> palette;
+        if (node.skin >= 0 && static_cast<size_t>(node.skin) < d.skins.size()) {
+            const auto& skin = d.skins[node.skin];
+            for (size_t j = 0; j < skin.joints.size(); ++j)
+                palette.push_back(ron::gltf::multiply(global[skin.joints[j]], skin.inverseBind[j]));
+        }
+        for (const auto& prim : d.meshes[node.mesh].primitives)
+            for (const auto& v : prim.vertices) {
+                ron::gltf::Mat4 w{};
+                if (!palette.empty() && prim.skinned) {
+                    for (int k = 0; k < 4; ++k) {
+                        const auto& jm = palette[std::min<size_t>(v.joints[k], palette.size() - 1)];
+                        for (int e = 0; e < 16; ++e) w[e] += jm[e] * v.weights[k];
+                    }
+                } else {
+                    w = global[n];
+                }
+                float p[3];
+                for (int r = 0; r < 3; ++r)
+                    p[r] = w[r] * v.position[0] + w[4 + r] * v.position[1] + w[8 + r] * v.position[2] + w[12 + r];
+                for (int c = 0; c < 3; ++c) {
+                    min3[c] = first ? p[c] : std::min(min3[c], p[c]);
+                    max3[c] = first ? p[c] : std::max(max3[c], p[c]);
+                }
+                first = false;
+            }
+    }
+}
+
+// ───────────── Environment (image-based lighting) ─────────────
+
+RE_API bool engine_environment_load(const char* path) {
+    if (!g.initialized || !path) return false;
+    ron::ibl::FloatImage src;
+    std::string error;
+    if (!ron::ibl::loadEnvironmentImage(path, src, error)) {
+        std::fprintf(stderr, "ron_engine: environment '%s': %s\n", path, error.c_str());
+        return false;
+    }
+    ron::ibl::Environment env;
+    ron::ibl::build(src, env);
+    Texture t;
+    if (!createEnvTexture(env.levels, t)) return false;
+    vkDeviceWaitIdle(g.device);
+    destroyImage(g.envTexture.image, g.envTexture.memory, g.envTexture.view);
+    g.envTexture = t;
+    writeEnvDescriptor();
+    for (int i = 0; i < 9; ++i)
+        for (int c = 0; c < 3; ++c) g.scene.sh[i][c] = env.sh[i][c];
+    g.scene.env[0] = 1.0f;
+    if (g.scene.env[1] <= 0.0f) g.scene.env[1] = 1.0f;
+    g.scene.env[2] = static_cast<float>(env.levels.size() - 1);
+    g.scene.env[3] = 1.0f;
+    return true;
+}
+
+RE_API void engine_environment_intensity(float intensity) { g.scene.env[1] = std::max(intensity, 0.0f); }
+RE_API void engine_environment_background(bool show) { g.scene.env[3] = show ? 1.0f : 0.0f; }
+RE_API void engine_environment_clear() { g.scene.env[0] = 0.0f; }
 
 RE_API int32_t engine_model_animation_count(int32_t model) {
     if (model < 0 || model >= static_cast<int32_t>(g.models.size())) return 0;

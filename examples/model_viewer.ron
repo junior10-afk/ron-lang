@@ -1,0 +1,103 @@
+// Views any glTF 2.0 model with physically based materials, image-based
+// lighting, skeletal animation and morph targets (blend shapes).
+//
+//   ronc run examples/model_viewer.ron -- <model.glb> [environment.hdr]
+//
+// Controls: right mouse drag = orbit, wheel = zoom, Space = next animation,
+//           M = next morph target, K = toggle skin shading on all materials,
+//           B = toggle the environment background.
+
+import "std/engine.ron";
+import "std/io.ron";
+import "std/os.ron";
+
+fn main() -> int {
+    String[] a = args();
+    String model_path = a.len > 1 ? a[1] : string("assets/character.glb");
+    if (!engine_init(1280, 720, "Ron - model viewer")) return 1;
+
+    int model = -1;
+    if (file_exists(model_path.c_str())) model = engine_model_load(model_path.c_str());
+    for (var path in ["assets/character.glb", "../assets/character.glb"])
+        if (model < 0 && a.len <= 1 && file_exists(path)) model = engine_model_load(path);
+    if (model < 0) {
+        println("cannot load {}", model_path);
+        return 1;
+    }
+
+    bool has_env = false;
+    if (a.len > 2) {
+        has_env = engine_environment_load(a[2].c_str());
+        if (!has_env) println("cannot load environment {}", a[2]);
+    }
+
+    // Fit the model in a 2-unit box standing on the ground.
+    Vec3 lo = vec3(0.0, 0.0, 0.0);
+    Vec3 hi = vec3(0.0, 0.0, 0.0);
+    engine_model_bounds(model, &lo, &hi);
+    Vec3 size = hi - lo;
+    float extent = max(size.x, max(size.y, size.z));
+    float scale = extent > 0.0 ? 2.0 / extent : 1.0;
+    Vec3 center = (lo + hi) * 0.5;
+    Mat4 fit = mat4_scale(vec3(scale, scale, scale)) * mat4_translate(vec3(-center.x, -lo.y, -center.z));
+
+    println("{} material(s), {} animation(s), {} morph target(s)", engine_model_material_count(model),
+            engine_model_animation_count(model), engine_model_morph_count(model));
+    for (int m = 0; m < engine_model_material_count(model); m++)
+        println("  material {}: {}", m, engine_model_material_name(model, m));
+
+    // Guess shading models from material names (skin scattering, hair highlights).
+    int skin_count = set_shading(model, ["skin", "face", "head", "body"], SHADING_SKIN);
+    int hair_count = set_shading(model, ["hair", "brow", "lash", "beard"], SHADING_HAIR);
+    if (skin_count + hair_count > 0) println("{} skin and {} hair material(s)", skin_count, hair_count);
+
+    int floor_mesh = engine_mesh_plane(40.0);
+    OrbitCamera cam = orbit_camera(vec3(0.0, size.y * scale * 0.5, 0.0), 3.6);
+    cam.yaw = 0.5;
+    cam.pitch = 0.15;
+    engine_set_light(-0.5, -0.9, -0.6, has_env ? 1.2 : 2.2);
+
+    int anim = engine_model_animation_count(model) > 0 ? 0 : -1;
+    int morph = -1;
+    bool skin = skin_count > 0;
+    bool background = true;
+    float time = 0.0;
+
+    while (engine_running()) {
+        float dt = engine_delta();
+        time += dt;
+        if (engine_key_pressed(KEY_SPACE) && engine_model_animation_count(model) > 0) {
+            anim = (anim + 1) % engine_model_animation_count(model);
+            time = 0.0;
+        }
+        if (engine_key_pressed(77) && engine_model_morph_count(model) > 0) {   // M
+            engine_model_clear_morphs(model);
+            morph = (morph + 1) % engine_model_morph_count(model);
+            println("morph {}: {}", morph, engine_model_morph_name(model, morph));
+        }
+        if (engine_key_pressed(75)) {   // K
+            skin = !skin;
+            for (int m = 0; m < engine_model_material_count(model); m++)
+                engine_model_set_material_flags(model, m, skin ? SHADING_SKIN : SHADING_DEFAULT);
+        }
+        if (engine_key_pressed(66)) {   // B
+            background = !background;
+            engine_environment_background(background);
+        }
+        if (morph >= 0) engine_model_set_morph(model, morph, sin(time * 2.0) * 0.5 + 0.5);
+
+        cam.update();
+        cam.apply();
+        if (engine_begin_frame(0.45, 0.55, 0.7)) {
+            if (!has_env || !background) {
+                Mat4 ground = mat4_identity();
+                engine_draw_checker(floor_mesh, &ground, 0.55, 0.55, 0.57);
+            }
+            Mat4 m = fit;
+            engine_draw_model(model, &m, anim, time);
+            engine_end_frame();
+        }
+    }
+    engine_shutdown();
+    return 0;
+}
