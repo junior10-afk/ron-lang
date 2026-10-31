@@ -85,7 +85,7 @@ HDRI, viewed with `ronc run examples/model_viewer.ron -- DamagedHelmet.glb studi
 
 ## Getting started
 
-Download `ron-0.1.0-windows-x64.zip` from the [releases](https://github.com/junior10-afk/ron-lang/releases),
+Download `ron-0.2.0-windows-x64.zip` from the [releases](https://github.com/junior10-afk/ron-lang/releases),
 unzip it, and run:
 
 ```powershell

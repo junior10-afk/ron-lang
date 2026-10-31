@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 ### Engine: realistic characters
 - JPEG decoder (baseline and progressive, any chroma subsampling, restart intervals) and Radiance

@@ -2,7 +2,7 @@
   "name": "ron-lang",
   "displayName": "Ron Language",
   "description": "Syntax highlighting for the Ron programming language",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "ron-lang",
   "license": "MIT",
   "engines": { "vscode": "^1.60.0" },

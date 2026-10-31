@@ -7,7 +7,7 @@ Syntax highlighting, comment toggling, bracket matching and auto-indentation for
 Copy this folder into your VS Code extensions directory and restart VS Code:
 
 ```powershell
-Copy-Item -Recurse editors\vscode "$env:USERPROFILE\.vscode\extensions\ron-lang-0.1.0"
+Copy-Item -Recurse editors\vscode "$env:USERPROFILE\.vscode\extensions\ron-lang-0.2.0"
 ```
 
 (If another extension also claims `.ron`, pick "Ron" in the language selector at the bottom right.)

@@ -18,6 +18,9 @@ try {
     Copy-Item build\Release\ronc.exe, build\Release\ron_engine.dll $stage
     Copy-Item -Recurse std, examples, assets, docs, editors (Join-Path $stage '.')
     Copy-Item README.md, LICENSE, CHANGELOG.md $stage
+    # Downloaded test models (assets/samples, not in git) are not ours to ship
+    $samples = Join-Path $stage 'assets\samples'
+    if (Test-Path $samples) { Remove-Item $samples -Recurse -Force }
     # Drop build products that may sit next to the examples
     Get-ChildItem $stage -Recurse -Include *.exe | Where-Object { $_.Name -ne 'ronc.exe' } | Remove-Item -Force
     Get-ChildItem (Join-Path $stage 'examples') -Recurse -Include *.dll | Remove-Item -Force
