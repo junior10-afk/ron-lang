@@ -30,6 +30,7 @@ public:
     FuncDecl* boundsFail = nullptr;     // std/runtime.ron: reports an index out of bounds
     const SourceManager* sources = nullptr;   // for file names in panic/assert messages
     bool boundsChecks = true;
+    bool testMode = false;   // `ronc test`: main runs the test blocks instead
     std::string fileName(SourceLoc loc) const;
     Type* typeInfoType() const {
         auto it = structs_.find("TypeInfo");
@@ -71,6 +72,8 @@ private:
     void checkMatch(MatchStmt* m);
     Expr* checkTry(TryExpr* e);
     bool isAnyType(Type* t) const;
+    bool isCollected(FuncDecl* f) const;
+    void buildTestMain();
     LocalVar* hiddenLocal(const char* name, Type* t, SourceLoc loc);
     Expr* mkIdent(LocalVar* v, SourceLoc loc);
     Expr* mkInt(uint64_t value, Type* t, SourceLoc loc);
@@ -149,6 +152,7 @@ private:
     std::set<EnumDecl*> sumLayoutActive_;
     std::map<std::pair<uint32_t, std::string>, uint32_t> aliases_;   // (file, alias) -> imported file
     FuncDecl* initFunc_ = nullptr;
+    std::vector<FuncDecl*> tests_;
 
     std::vector<std::map<std::string, LocalVar*>> scopes_;
     FuncDecl* currentFunc_ = nullptr;

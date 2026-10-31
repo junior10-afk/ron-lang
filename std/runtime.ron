@@ -6,8 +6,23 @@
 
 import "std/win32.ron";
 
-extern "kernel32.dll" {
+private extern "kernel32.dll" {
     fn AddVectoredExceptionHandler(u32 first, fn(void*) -> i32 handler) -> void*;
+    fn ExitThread(u32 code);
+    fn CreateThread(void* security, u64 stack_size, void* start, void* arg, u32 flags, u32* id) -> void*;
+    fn WaitForSingleObject(void* handle, u32 ms) -> u32;
+}
+
+// Set by the `ronc test` runner: a failure ends only the current test's thread.
+bool __ron_testing = false;
+i32 __ron_test_failed = 0;
+
+private fn terminate(u32 code) {
+    if (__ron_testing) {
+        __ron_test_failed = 1;
+        ExitThread(code);
+    }
+    ExitProcess(code);
 }
 
 // Layout written by the compiler (see CodeGen::emitDebugInfo).
@@ -151,7 +166,7 @@ private fn crash_handler(void* pointers) -> i32 {
     print_location(rip);
     err_write("\n");
     print_stack(rip, rbp);
-    ExitProcess(code);
+    terminate(code);
     return 1;
 }
 
@@ -170,7 +185,7 @@ private fn fail_at(u8* file, i64 line) {
     u64* frame = __ron_frame_pointer() as u64*;
     u64* wrapper = frame[0] as u64*;   // skip fail_at and the wrapper
     print_stack(wrapper[1] - 1, wrapper[0]);
-    ExitProcess(101);
+    terminate(101);
 }
 
 fn __ron_panic(u8* message, u8* file, i64 line) {
@@ -192,4 +207,61 @@ fn __ron_bounds_fail(i64 index, i64 length, u8* file, i64 line) {
     err_write(", length ");
     err_int(length);
     fail_at(file, line);
+}
+
+// ───────────── `ronc test` runner ─────────────
+
+private fn out_write(u8* s) {
+    u64 n = 0;
+    while (s[n] != 0) n++;
+    u32 written = 0;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s, n as u32, &written, null);
+}
+
+private fn out_int(i64 v) {
+    u8[24] buf;
+    int n = 0;
+    if (v == 0) {
+        buf[0] = '0';
+        n = 1;
+    }
+    while (v > 0) {
+        buf[n] = ('0' + v % 10) as u8;
+        v /= 10;
+        n++;
+    }
+    u8[25] text;
+    for (int i = 0; i < n; i++) text[i] = buf[n - 1 - i];
+    text[n] = 0;
+    out_write(&text[0]);
+}
+
+// Runs one test on its own thread so a failed assert or a crash ends only that test.
+fn __ron_test_run(u8* name, fn() test) -> bool {
+    __ron_test_failed = 0;
+    i64 freq = 0;
+    i64 start = 0;
+    i64 end = 0;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    void* thread = CreateThread(null, 0, test as void*, null, 0, null);
+    WaitForSingleObject(thread, 0xFFFFFFFF);
+    CloseHandle(thread);
+    QueryPerformanceCounter(&end);
+    bool ok = __ron_test_failed == 0;
+    out_write(ok ? "[ OK ] " : "[FAIL] ");
+    out_write(name);
+    out_write(" (");
+    out_int((end - start) * 1000 / freq);
+    out_write(" ms)\n");
+    return ok;
+}
+
+fn __ron_test_summary(int passed, i64 total) -> int {
+    out_write("\n");
+    out_int(passed);
+    out_write(" passed, ");
+    out_int(total - passed);
+    out_write(" failed\n");
+    return passed == total ? 0 : 1;
 }

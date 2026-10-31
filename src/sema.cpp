@@ -88,8 +88,9 @@ bool Sema::run() {
         if (s->typeParams.empty()) layoutStruct(s);
     for (auto& [name, e] : enums_) resolveEnum(e);
     // Signatures first: global initializers may call functions.
+    if (testMode) buildTestMain();
     for (Decl* d : program_.decls)
-        if (d->declKind == Decl::Kind::Func && static_cast<FuncDecl*>(d)->typeParams.empty())
+        if (d->declKind == Decl::Kind::Func && static_cast<FuncDecl*>(d)->typeParams.empty() && isCollected(static_cast<FuncDecl*>(d)))
             resolveSignature(static_cast<FuncDecl*>(d));
     for (Decl* d : program_.decls)
         if (d->declKind == Decl::Kind::Global) resolveGlobal(static_cast<GlobalVar*>(d));
@@ -110,7 +111,7 @@ bool Sema::run() {
     for (Decl* d : program_.decls) {
         if (d->declKind != Decl::Kind::Func) continue;
         auto* f = static_cast<FuncDecl*>(d);
-        if (f->body && f->typeParams.empty()) {
+        if (f->body && f->typeParams.empty() && isCollected(f)) {
             checkFunction(f);
             bodies.push_back(f);
         }
@@ -214,6 +215,18 @@ void Sema::collect() {
         }
         case Decl::Kind::Func: {
             auto* f = static_cast<FuncDecl*>(d);
+            if (!f->testName.empty()) {
+                // Test blocks exist only in test builds, and only from the user's files.
+                bool userFile = !sources || f->loc.fileId >= sources->count() || f->loc.fileId == 0 ||
+                                !sources->get(f->loc.fileId).library;
+                if (testMode && userFile) {
+                    f->returnType = types_.voidType();
+                    tests_.push_back(f);
+                    funcs_[f->name].push_back(f);
+                }
+                break;
+            }
+            if (testMode && f->name == "main") break;   // replaced by the test runner
             funcs_[f->name].push_back(f);
             break;
         }
@@ -680,6 +693,72 @@ void Sema::resolveSignature(FuncDecl* f) {
         for (Type* t : f->paramTypes) hasStruct |= t && t->isStruct();
         if (!hasStruct) diags_.error(f->loc, "operator overloads need at least one struct parameter");
     }
+}
+
+// A declared function that takes part in this build (test blocks only in test mode,
+// the user's main only outside test mode).
+bool Sema::isCollected(FuncDecl* f) const {
+    auto it = funcs_.find(f->name);
+    return it != funcs_.end() && std::find(it->second.begin(), it->second.end(), f) != it->second.end();
+}
+
+// main() for `ronc test`: runs every test block in its own thread and reports.
+//   int passed = 0; __ron_testing = true;
+//   if (__ron_test_run("name", __test_x)) passed++; ...
+//   return __ron_test_summary(passed, count);
+void Sema::buildTestMain() {
+    SourceLoc loc{0, 1, 1, 0};
+    auto* main = arena_.make<FuncDecl>(loc);
+    main->name = "main";
+    auto* intType = arena_.make<TypeExpr>(loc);
+    intType->name = "int";
+    main->returnTypeExpr = intType;
+    main->body = arena_.make<BlockStmt>(loc);
+    auto ident = [&](const std::string& n) {
+        auto* id = arena_.make<IdentExpr>(loc);
+        id->name = n;
+        return id;
+    };
+    auto call = [&](const std::string& fn, std::vector<Expr*> args) {
+        auto* c = arena_.make<CallExpr>(loc);
+        c->callee = ident(fn);
+        c->args = std::move(args);
+        return c;
+    };
+    auto* passed = arena_.make<VarDeclStmt>(loc);
+    passed->typeExpr = intType;
+    passed->name = "passed";
+    auto* zero = arena_.make<IntLitExpr>(loc);
+    passed->init = zero;
+    main->body->stmts.push_back(passed);
+    auto* enable = arena_.make<AssignExpr>(loc);
+    enable->target = ident("__ron_testing");
+    auto* yes = arena_.make<BoolLitExpr>(loc);
+    yes->value = true;
+    enable->value = yes;
+    auto* enableStmt = arena_.make<ExprStmt>(loc);
+    enableStmt->expr = enable;
+    main->body->stmts.push_back(enableStmt);
+    for (FuncDecl* t : tests_) {
+        auto* name = arena_.make<StringLitExpr>(t->loc);
+        name->value = t->testName;
+        auto* ifs = arena_.make<IfStmt>(t->loc);
+        ifs->cond = call("__ron_test_run", {name, ident(t->name)});
+        auto* inc = arena_.make<UnaryExpr>(t->loc);
+        inc->op = UnaryOp::PostInc;
+        inc->operand = ident("passed");
+        auto* incStmt = arena_.make<ExprStmt>(t->loc);
+        incStmt->expr = inc;
+        ifs->thenStmt = incStmt;
+        main->body->stmts.push_back(ifs);
+    }
+    auto* count = arena_.make<IntLitExpr>(loc);
+    count->value = tests_.size();
+    auto* ret = arena_.make<ReturnStmt>(loc);
+    ret->value = call("__ron_test_summary", {ident("passed"), count});
+    main->body->stmts.push_back(ret);
+    program_.decls.push_back(main);
+    funcs_["main"].push_back(main);
 }
 
 bool Sema::visibleFrom(const Decl* d, SourceLoc from) const {
@@ -1801,8 +1880,9 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
             }
             if (f->variadic && actual.size() == fixed) total += 1;
             if (!ok) continue;
-            // A non-template wins over a template with equally good conversions.
-            total = total * 2 + (isTemplate ? 1 : 0);
+            // Ties: a non-template beats a template, and a function of the calling
+            // file beats one from an imported file (local declarations shadow imports).
+            total = total * 4 + (isTemplate ? 2 : 0) + (f->loc.fileId == loc.fileId ? 0 : 1);
             if (total < bestCost) {
                 best = f;
                 bestTypeArgs = typeArgs;

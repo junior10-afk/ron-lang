@@ -106,6 +106,7 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
     Sema sema(program, arena, types, diags);
     sema.sources = &sources;
     sema.boundsChecks = !options.release;
+    sema.testMode = options.testMode;
     if (!sema.run()) return result;
     if (options.warningsAsErrors && diags.warningCount() > 0) {
         diags.error(SourceLoc{0, 0, 0, UINT32_MAX}, "warnings are treated as errors (--Werror)");

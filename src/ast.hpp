@@ -425,6 +425,7 @@ struct FuncDecl : Decl {
     std::vector<LocalVar*> locals;        // every local declared in the body
     std::vector<FuncDecl*> callees;       // direct calls (for dead-code elimination)
     bool variadic = false;                // last parameter is `..T`
+    std::string testName;                 // `test "name" { ... }` block (compiled by `ronc test`)
     bool used = false;                    // reachable from main
 
     FuncDecl() : Decl(Kind::Func) {}

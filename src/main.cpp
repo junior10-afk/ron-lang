@@ -30,6 +30,9 @@ void printUsage() {
         "                                               restart whenever a source file changes)\n"
         "  ronc check <file.ron>                        type-check only\n"
         "  ronc tokens <file.ron>                       print the lexer's tokens\n"
+        "  ronc test  <file.ron>                        run the file's test \"name\" { ... } blocks\n"
+        "  ronc new   <folder>                          create a new project\n"
+        "  ronc --version\n"
         "\n"
         "  ronc <file.ron> is a shortcut for 'ronc build <file.ron>'.\n"
         "\n"
@@ -105,6 +108,7 @@ struct BuildOutcome {
 
 bool g_release = false;
 bool g_werror = false;
+bool g_test = false;
 
 BuildOutcome build(const std::string& input, const std::string& output, ron::Subsystem subsystem) {
     ron::SourceManager sources;
@@ -116,6 +120,7 @@ BuildOutcome build(const std::string& input, const std::string& output, ron::Sub
     opts.subsystem = subsystem;
     opts.release = g_release;
     opts.warningsAsErrors = g_werror;
+    opts.testMode = g_test;
     ron::CompileResult r = ron::compile(opts, sources, diags);
     diags.printAll();
     if (!r.ok) {
@@ -146,8 +151,44 @@ std::map<std::string, fs::file_time_type> snapshot(const std::vector<std::string
     return m;
 }
 
+int newProject(const std::string& dir) {
+    fs::path root(dir);
+    std::error_code ec;
+    if (fs::exists(root / "main.ron")) {
+        std::fprintf(stderr, "ronc: %s already contains main.ron\n", dir.c_str());
+        return 1;
+    }
+    fs::create_directories(root, ec);
+    std::FILE* f = std::fopen((root / "main.ron").string().c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "ronc: cannot create %s\n", (root / "main.ron").string().c_str());
+        return 1;
+    }
+    std::fputs("import \"std/io.ron\";\n"
+               "\n"
+               "fn greet(u8* name) -> String { return format(\"Hello, {}!\", name); }\n"
+               "\n"
+               "fn main() -> int {\n"
+               "    println(greet(\"Ron\"));\n"
+               "    return 0;\n"
+               "}\n"
+               "\n"
+               "test \"greet builds the message\" {\n"
+               "    assert(greet(\"you\") == \"Hello, you!\");\n"
+               "}\n",
+               f);
+    std::fclose(f);
+    if (std::FILE* g = std::fopen((root / ".gitignore").string().c_str(), "wb")) {
+        std::fputs("*.exe\n*.dll\n", g);
+        std::fclose(g);
+    }
+    std::string main = (root / "main.ron").string();
+    std::printf("created %s\n  ronc run %s\n  ronc test %s\n", main.c_str(), main.c_str(), main.c_str());
+    return 0;
+}
+
 int run(const std::string& input, ron::Subsystem subsystem, bool watch) {
-    std::string output = (fs::path(input).replace_extension(".exe")).string();
+    std::string output = (fs::path(input).replace_extension(g_test ? ".test.exe" : ".exe")).string();
     BuildOutcome b = build(input, output, subsystem);
     if (!watch) {
         if (!b.ok) return 1;
@@ -196,10 +237,21 @@ int main(int argc, char** argv) {
         printUsage();
         return args.empty() ? 2 : 0;
     }
+    if (args[0] == "--version" || args[0] == "-v") {
+        std::printf("ronc %s\n", ron::kRonVersion);
+        return 0;
+    }
+    if (args[0] == "new") {
+        if (args.size() != 2) {
+            printUsage();
+            return 2;
+        }
+        return newProject(args[1]);
+    }
 
     std::string command = "build";
     size_t i = 0;
-    if (args[0] == "build" || args[0] == "run" || args[0] == "check" || args[0] == "tokens") {
+    if (args[0] == "build" || args[0] == "run" || args[0] == "check" || args[0] == "tokens" || args[0] == "test") {
         command = args[0];
         i = 1;
     }
@@ -227,6 +279,10 @@ int main(int argc, char** argv) {
     if (command == "tokens") return dumpTokens(input);
     if (command == "check") return build(input, "", subsystem).ok ? 0 : 1;
     if (command == "run") return run(input, subsystem, watch);
+    if (command == "test") {
+        g_test = true;
+        return run(input, subsystem, false);
+    }
 
     if (output.empty()) output = fs::path(input).replace_extension(".exe").string();
     if (!build(input, output, subsystem).ok) return 1;

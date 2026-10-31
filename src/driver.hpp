@@ -15,7 +15,10 @@ struct CompileOptions {
     Subsystem subsystem = Subsystem::Console;
     bool release = false;          // no bounds checks
     bool warningsAsErrors = false;
+    bool testMode = false;         // build the test blocks with a generated main
 };
+
+constexpr const char* kRonVersion = "0.1.0";
 
 struct CompileResult {
     bool ok = false;

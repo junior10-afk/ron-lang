@@ -1,0 +1,82 @@
+// Standard library tests, run with: ronc test tests/ron/std_test.ron
+
+import "std/io.ron";
+import "std/list.ron";
+import "std/map.ron";
+import "std/option.ron";
+import "std/math.ron";
+import "std/os.ron";
+
+test "String building and comparison" {
+    String s = string("score: ");
+    s.append(42);
+    assert(s == "score: 42");
+    assert(s.find("42") == 7);
+    assert(s.substring(0, 5).to_upper() == "SCORE");
+    s.free_string();
+}
+
+test "format placeholders" {
+    assert(format("{} + {} = {}", 1, 2, 3) == "1 + 2 = 3");
+    assert(format("{:.1}|{:x}|{:4}", 2.25, 255, 7) == "2.3|0xff|   7");
+    assert(format("{{}}") == "{}");
+}
+
+test "List push, remove, sort" {
+    List<int> l;
+    for (var i in 0..100) l.push(99 - i);
+    assert(l.len == 100);
+    l.sort();
+    assert(l.get(0) == 0 && l.get(99) == 99);
+    l.remove_swap(0);
+    assert(l.get(0) == 99);
+    l.free_list();
+}
+
+test "Map put, get, remove" {
+    Map<int, int> m;
+    for (var i in 0..500) m.put(i, i * 2);
+    assert(m.count == 500);
+    assert(*m.get(250) == 500);
+    assert(m.remove(250));
+    assert(!m.has(250) && m.has(251));
+    m.free_map();
+}
+
+test "Option and Result" {
+    Option<int> some = Option::Some(3);
+    Option<int> none = Option::None;
+    assert(some.unwrap_or(0) == 3 && none.unwrap_or(-1) == -1);
+    Result<int, u8*> err = Result::Err("bad");
+    assert(err.is_err());
+    assert(streq(err.unwrap_err(), "bad"));
+}
+
+test "math" {
+    assert(abs(sin(PI / 2.0) - 1.0) < 0.0001);
+    assert(abs(cos(PI) + 1.0) < 0.0001);
+    assert(length(vec3(3.0, 4.0, 0.0)) == 5.0);
+    Mat4 t = mat4_translate(vec3(1.0, 2.0, 3.0));
+    Vec3 p = transform_point(t, vec3(0.0, 0.0, 0.0));
+    assert(p.x == 1.0 && p.y == 2.0 && p.z == 3.0);
+}
+
+test "slices and for-in" {
+    int[5] a = [1, 2, 3, 4, 5];
+    int sum = 0;
+    for (var x in a[1..4]) sum += x;
+    assert(sum == 9);
+    for (var p in &a) *p = *p * 2;
+    assert(a[4] == 10);
+}
+
+test "files" {
+    var path = "ron_std_test.tmp";
+    assert(write_file(path, "hello"));
+    match (read_text(path)) {
+        Some(t) => assert(t == "hello");
+        None => assert(false);
+    }
+    assert(delete_file(path));
+    assert(!file_exists(path));
+}

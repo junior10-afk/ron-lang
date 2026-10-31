@@ -58,7 +58,7 @@ std::string runCapture(const std::string& exe, int& exitCode) {
     return out;
 }
 
-RunResult runProgram(const std::string& name, const std::string& source, bool release = false) {
+RunResult runProgram(const std::string& name, const std::string& source, bool release = false, bool testMode = false) {
     fs::path dir = fs::temp_directory_path() / "ron_e2e";
     fs::create_directories(dir);
     fs::path src = dir / (name + ".ron");
@@ -73,6 +73,7 @@ RunResult runProgram(const std::string& name, const std::string& source, bool re
     opts.output = exe.string();
     opts.stdRoot = RON_SOURCE_DIR;
     opts.release = release;
+    opts.testMode = testMode;
     r.compiled = compile(opts, sources, diags).ok;
     for (const auto& d : diags.all()) r.errors += diags.format(d);
     if (!r.compiled) {
@@ -756,6 +757,35 @@ TEST(e2e_os_and_threads) {
             return 0;
         }
     )", "80000 80000\ntrue\nfalse\n9\ntrue\ntrue\ntrue\ntrue\nline1\nline2\ntrue\nfalse\n"));
+}
+
+TEST(e2e_test_blocks) {
+    RunResult r = runProgram("testblocks", R"(
+        fn add(int a, int b) -> int { return a + b; }
+        struct Box { int v; }
+        test "addition" { assert(add(2, 3) == 5); }
+        test "broken assert" { assert(add(2, 2) == 5); }
+        test "crash" {
+            Box* b = null;
+            int x = b.v;
+        }
+        test "still runs after failures" { assert(true); }
+        fn main() -> int { return 42; }   // ignored by the test runner
+    )", false, true);
+    CHECK(r.compiled);
+    CHECK_EQ(r.exitCode, 1);
+    CHECK(r.output.find("[ OK ] addition") != std::string::npos);
+    CHECK(r.output.find("assertion failed: test \"broken assert\" { assert(add(2, 2) == 5); }") != std::string::npos);
+    CHECK(r.output.find("[FAIL] broken assert") != std::string::npos);
+    CHECK(r.output.find("crash: null pointer dereference") != std::string::npos);
+    CHECK(r.output.find("[FAIL] crash") != std::string::npos);
+    CHECK(r.output.find("[ OK ] still runs after failures") != std::string::npos);
+    CHECK(r.output.find("2 passed, 2 failed") != std::string::npos);
+    RunResult normal = runProgram("testblocks_main", R"(
+        test "never compiled here" { this_does_not_exist(); }
+        fn main() -> int { return 7; }
+    )");
+    CHECK(normal.compiled && normal.exitCode == 7);
 }
 
 TEST(e2e_std_math) {

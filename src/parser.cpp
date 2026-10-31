@@ -131,9 +131,13 @@ void Parser::fail(const Token& at, const std::string& message) {
 void Parser::parseProgram(Program& program) {
     while (!check(TokenKind::EndOfFile)) {
         try {
-            if (check(TokenKind::KwExtern) && peek(1).is(TokenKind::StringLiteral) &&
-                peek(2).is(TokenKind::LBrace)) {
+            if ((check(TokenKind::KwExtern) && peek(1).is(TokenKind::StringLiteral) && peek(2).is(TokenKind::LBrace)) ||
+                (check(TokenKind::KwPrivate) && peek(1).is(TokenKind::KwExtern) && peek(2).is(TokenKind::StringLiteral) &&
+                 peek(3).is(TokenKind::LBrace))) {
+                bool isPrivate = match(TokenKind::KwPrivate);
+                size_t first = program.decls.size();
                 parseExternBlock(program);
+                for (size_t i = first; i < program.decls.size(); ++i) program.decls[i]->isPrivate = isPrivate;
             } else {
                 bool isPrivate = match(TokenKind::KwPrivate);
                 Decl* d = parseDecl();
@@ -194,6 +198,15 @@ Decl* Parser::parseDecl() {
         advance();
         return parseGlobal(false, true);
     case TokenKind::Identifier:
+        if (t.text == "test" && peek(1).is(TokenKind::StringLiteral)) {
+            // test "adds numbers" { assert(add(1, 2) == 3); }
+            advance();
+            auto* fn = arena_.make<FuncDecl>(t.loc);
+            fn->testName = advance().strValue;
+            fn->name = "__test_" + std::to_string(t.loc.fileId) + "_" + std::to_string(t.loc.line);
+            fn->body = parseBlock();
+            return fn;
+        }
         return parseGlobal(false, false);
     default:
         fail(t, "expected a declaration (fn, struct, enum, const, import, extern or a global variable)");

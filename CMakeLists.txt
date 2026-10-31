@@ -62,3 +62,10 @@ add_executable(ron_tests
 target_link_libraries(ron_tests PRIVATE ron_core)
 target_compile_definitions(ron_tests PRIVATE RON_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME ron_tests COMMAND ron_tests)
+
+# Standard library tests written in Ron, run with `ronc test`
+file(GLOB RON_TEST_FILES ${CMAKE_SOURCE_DIR}/tests/ron/*.ron)
+foreach(test_file ${RON_TEST_FILES})
+    get_filename_component(test_name ${test_file} NAME_WE)
+    add_test(NAME ron_${test_name} COMMAND ronc test ${test_file})
+endforeach()
