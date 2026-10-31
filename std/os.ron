@@ -1,0 +1,126 @@
+// Operating system services: command-line arguments, environment variables,
+// files and directories, process exit.
+
+import "std/win32.ron";
+import "std/mem.ron";
+import "std/string.ron";
+import "std/list.ron";
+import "std/option.ron";
+
+extern "kernel32.dll" {
+    fn GetCommandLineW() -> u16*;
+    fn WideCharToMultiByte(u32 codepage, u32 flags, u16* wide, i32 wide_len, u8* out, i32 out_len, void* default_char,
+                           void* used_default) -> i32;
+    fn GetEnvironmentVariableA(u8* name, u8* buffer, u32 size) -> u32;
+    fn GetFileAttributesA(u8* path) -> u32;
+    fn DeleteFileA(u8* path) -> i32;
+    fn CreateDirectoryA(u8* path, void* security) -> i32;
+    fn SetFilePointer(void* file, i32 distance, i32* high, u32 method) -> u32;
+    fn FindFirstFileA(u8* pattern, void* data) -> void*;
+    fn FindNextFileA(void* find, void* data) -> i32;
+    fn FindClose(void* find) -> i32;
+    fn GetCurrentDirectoryA(u32 size, u8* buffer) -> u32;
+}
+
+extern "shell32.dll" {
+    fn CommandLineToArgvW(u16* command_line, i32* count) -> u16**;
+}
+
+private const u32 INVALID_ATTRIBUTES = 0xFFFFFFFF;
+private const u32 DIRECTORY_ATTRIBUTE = 0x10;
+private const u32 OPEN_ALWAYS = 4;
+private const u32 FILE_END = 2;
+
+// The command-line arguments, program name first (UTF-8).
+fn args() -> String[] {
+    i32 count = 0;
+    u16** wide = CommandLineToArgvW(GetCommandLineW(), &count);
+    String* items = alloc((count as u64) * sizeof(String));
+    for (int i = 0; i < count; i++) {
+        i32 bytes = WideCharToMultiByte(65001, 0, wide[i], -1, null, 0, null, null);
+        String s = string_with_capacity(bytes);
+        WideCharToMultiByte(65001, 0, wide[i], -1, s.data, bytes, null, null);
+        s.len = bytes - 1;
+        items[i] = s;
+    }
+    return items[0..count];
+}
+
+fn getenv(u8* name) -> Option<String> {
+    u32 needed = GetEnvironmentVariableA(name, null, 0);
+    if (needed == 0) return Option::None;
+    String s = string_with_capacity(needed as int);
+    s.len = GetEnvironmentVariableA(name, s.data, needed) as int;
+    return Option::Some(s);
+}
+
+fn exit(int code) { ExitProcess(code as u32); }
+
+fn file_exists(u8* path) -> bool {
+    u32 a = GetFileAttributesA(path);
+    return a != INVALID_ATTRIBUTES && (a & DIRECTORY_ATTRIBUTE) == 0;
+}
+
+fn dir_exists(u8* path) -> bool {
+    u32 a = GetFileAttributesA(path);
+    return a != INVALID_ATTRIBUTES && (a & DIRECTORY_ATTRIBUTE) != 0;
+}
+
+fn delete_file(u8* path) -> bool { return DeleteFileA(path) != 0; }
+fn create_dir(u8* path) -> bool { return CreateDirectoryA(path, null) != 0; }
+
+private fn write_bytes_to(u8* path, u8* data, u64 count, bool append) -> bool {
+    void* f = CreateFileA(path, GENERIC_WRITE, 0, null, append ? OPEN_ALWAYS : CREATE_ALWAYS, 0x80, null);
+    if (f as u64 == 0xFFFFFFFFFFFFFFFF) return false;
+    if (append) SetFilePointer(f, 0, null, FILE_END);
+    u32 written = 0;
+    i32 ok = WriteFile(f, data, count as u32, &written, null);
+    CloseHandle(f);
+    return ok != 0 && written as u64 == count;
+}
+
+fn write_file(u8* path, u8* text) -> bool { return write_bytes_to(path, text, strlen(text), false); }
+fn write_file(u8* path, String text) -> bool { return write_bytes_to(path, text.c_str(), text.len as u64, false); }
+fn append_file(u8* path, u8* text) -> bool { return write_bytes_to(path, text, strlen(text), true); }
+fn append_file(u8* path, String text) -> bool { return write_bytes_to(path, text.c_str(), text.len as u64, true); }
+
+// Whole file as a String, or None if it cannot be read.
+fn read_text(u8* path) -> Option<String> {
+    void* f = CreateFileA(path, GENERIC_READ, 1, null, OPEN_EXISTING, 0, null);
+    if (f as u64 == 0xFFFFFFFFFFFFFFFF) return Option::None;
+    i64 size = 0;
+    GetFileSizeEx(f, &size);
+    String s = string_with_capacity(size as int);
+    u32 got = 0;
+    ReadFile(f, s.data, size as u32, &got, null);
+    CloseHandle(f);
+    s.len = got as int;
+    s.data[s.len] = 0;
+    return Option::Some(s);
+}
+
+// Names of the entries in a directory (without "." and "..").
+fn list_dir(u8* path) -> List<String> {
+    List<String> names;
+    String pattern = string(path);
+    pattern.append("\\*");
+    u8[320] data;   // WIN32_FIND_DATAA; cFileName starts at byte 44
+    void* find = FindFirstFileA(pattern.c_str(), &data[0]);
+    pattern.free_string();
+    if (find as u64 == 0xFFFFFFFFFFFFFFFF) return names;
+    bool more = true;
+    while (more) {
+        u8* name = &data[44];
+        if (!streq(name, ".") && !streq(name, "..")) names.push(string(name));
+        more = FindNextFileA(find, &data[0]) != 0;
+    }
+    FindClose(find);
+    return names;
+}
+
+fn current_dir() -> String {
+    u32 needed = GetCurrentDirectoryA(0, null);
+    String s = string_with_capacity(needed as int);
+    s.len = GetCurrentDirectoryA(needed, s.data) as int;
+    return s;
+}

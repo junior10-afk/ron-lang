@@ -322,6 +322,16 @@ void Assembler::align(unsigned boundary) {
     }
 }
 
+void Assembler::lockXadd(const Mem& m, Reg src, unsigned size) {
+    byte(0xF0);   // lock
+    emitRM(0, size == 8, {0x0F, 0xC1}, src, m);
+}
+
+void Assembler::lockCmpxchg(const Mem& m, Reg src, unsigned size) {
+    byte(0xF0);
+    emitRM(0, size == 8, {0x0F, 0xB1}, src, m);
+}
+
 void Assembler::repMovsb() {
     byte(0xF3);
     byte(0xA4);

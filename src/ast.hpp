@@ -192,7 +192,7 @@ struct TernaryExpr : Expr {
     TernaryExpr() : Expr(ExprKind::Ternary) {}
 };
 
-enum class Intrinsic { None, SqrtF32, SqrtF64, DebugInfo, FramePointer };
+enum class Intrinsic { None, SqrtF32, SqrtF64, DebugInfo, FramePointer, AtomicAdd, AtomicCas, AtomicLoad, AtomicStore };
 
 struct CallExpr : Expr {
     Expr* callee = nullptr;

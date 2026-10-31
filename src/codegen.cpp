@@ -1256,7 +1256,41 @@ void CodeGen::genExpr(Expr* e) {
     }
     case ExprKind::Call: {
         auto* c = e->as<CallExpr>();
-        if (c->intrinsic == Intrinsic::DebugInfo) {
+        if (c->intrinsic >= Intrinsic::AtomicAdd) {
+            // Evaluate every argument into a temporary first (each may contain calls).
+            std::vector<int32_t> slots;
+            for (Expr* a : c->args) {
+                genExpr(a);
+                slots.push_back(allocTemp8());
+                as_.store(Mem::at(RBP, slots.back()), RAX, 8);
+            }
+            Type* it = c->args[0]->type->elem;
+            unsigned size = it->size;
+            as_.load(R10, Mem::at(RBP, slots[0]), 8, false);   // pointer
+            Mem target = Mem::at(R10, 0);
+            switch (c->intrinsic) {
+            case Intrinsic::AtomicAdd:
+                as_.load(RCX, Mem::at(RBP, slots[1]), 8, false);
+                as_.lockXadd(target, RCX, size);
+                as_.movRR(RAX, RCX);
+                normalize(it);
+                break;
+            case Intrinsic::AtomicCas:
+                as_.load(RAX, Mem::at(RBP, slots[1]), 8, false);
+                as_.load(RCX, Mem::at(RBP, slots[2]), 8, false);
+                as_.lockCmpxchg(target, RCX, size);
+                as_.setcc(CC_E, RAX);
+                as_.movzx(RAX, RAX, 1);
+                break;
+            case Intrinsic::AtomicLoad:
+                as_.load(RAX, target, size, it->isSigned);   // aligned loads are atomic on x86-64
+                break;
+            default:   // AtomicStore: an aligned store is atomic, and x86-64 keeps stores in order
+                as_.load(RAX, Mem::at(RBP, slots[1]), 8, false);
+                as_.store(target, RAX, size);
+                break;
+            }
+        } else if (c->intrinsic == Intrinsic::DebugInfo) {
             as_.lea(RAX, Mem::ripRel(Section::Rdata, debugInfoOffset_));
         } else if (c->intrinsic == Intrinsic::FramePointer) {
             as_.movRR(RAX, RBP);

@@ -1701,7 +1701,7 @@ Expr* Sema::toOffset(Expr* e) {
 bool Sema::castAllowed(Type* from, Type* to) {
     if (from == to) return true;
     // Function values convert to/from raw pointers and 64-bit integers (FFI, callbacks).
-    if (from->isFunction() && (to->isPointer() || (to->isInt() && to->size == 8))) return true;
+    if (from->isFunction() && (to->isPointer() || to->isFunction() || (to->isInt() && to->size == 8))) return true;
     if (to->isFunction() && (from->isPointer() || from->isNull() || (from->isInt() && from->size == 8))) return true;
     if ((from->isNumeric() || from->isBool()) && to->isNumeric()) return true;
     if (from->isNumeric() && to->isBool()) return true;
@@ -2631,6 +2631,30 @@ Expr* Sema::checkCall(CallExpr* e) {
         if (!e->func) return errorExpr(e);
         e->args = std::move(args);
         e->type = e->func->returnType;
+        return e;
+    }
+    // Atomic operations on 32/64-bit integers: atomic_add(p, v) -> old, atomic_cas(p, expected, desired) -> bool,
+    // atomic_load(p), atomic_store(p, v)
+    if ((name == "atomic_add" || name == "atomic_cas" || name == "atomic_load" || name == "atomic_store") &&
+        !funcs_.count(name)) {
+        size_t want = name == "atomic_cas" ? 3 : name == "atomic_load" ? 1 : 2;
+        if (e->args.size() != want) {
+            diags_.error(e->loc, name + " takes " + std::to_string(want) + " argument(s)");
+            return errorExpr(e);
+        }
+        Type* pt = e->args[0]->type;
+        if (!pt->isPointer() || !pt->elem->isInt() || (pt->elem->size != 4 && pt->elem->size != 8)) {
+            diags_.error(e->loc, name + " needs a pointer to a 32- or 64-bit integer, not '" + typeName(pt) + "'");
+            return errorExpr(e);
+        }
+        Type* it = pt->elem;
+        for (size_t i = 1; i < e->args.size(); ++i) {
+            e->args[i] = coerce(e->args[i], it, "argument");
+            if (!e->args[i]->type) return errorExpr(e);
+        }
+        e->intrinsic = name == "atomic_add" ? Intrinsic::AtomicAdd : name == "atomic_cas" ? Intrinsic::AtomicCas
+                     : name == "atomic_load" ? Intrinsic::AtomicLoad : Intrinsic::AtomicStore;
+        e->type = name == "atomic_cas" ? types_.boolType() : name == "atomic_store" ? types_.voidType() : it;
         return e;
     }
     if ((name == "__ron_debug_info" || name == "__ron_frame_pointer") && e->args.empty()) {

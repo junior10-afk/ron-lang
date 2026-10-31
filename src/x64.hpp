@@ -124,6 +124,8 @@ public:
     void align(unsigned boundary);   // multi-byte NOPs up to the next boundary
     void repMovsb();
     void repStosb();
+    void lockXadd(const Mem& m, Reg src, unsigned size);      // [m] += src, src = old value
+    void lockCmpxchg(const Mem& m, Reg src, unsigned size);   // if [m] == rax: [m] = src
 
     // SSE scalar floats (f32 = single precision when true)
     void movsLoad(Xmm dst, const Mem& m, bool f32);

@@ -713,6 +713,51 @@ TEST(e2e_warnings) {
     CHECK(r.errors.find("'_ok'") == std::string::npos);
 }
 
+TEST(e2e_os_and_threads) {
+    CHECK(prints("osthreads", R"(
+        import "std/io.ron";
+        import "std/os.ron";
+        import "std/thread.ron";
+        i64 counter = 0;
+        i64 plain = 0;
+        Mutex m;
+        fn worker(void* arg) {
+            for (var i in 0..10000) {
+                atomic_add(&counter, 1);
+                m.lock();
+                plain += 1;
+                m.unlock();
+            }
+        }
+        fn main() -> int {
+            List<Thread> threads;
+            for (var i in 0..8) threads.push(spawn(worker, null));
+            for (var t in &threads) t.join();
+            println("{} {}", counter, plain);
+            i64 v = 5;
+            println(atomic_cas(&v, 5, 9));
+            println(atomic_cas(&v, 5, 1));
+            println(atomic_load(&v));
+            println(cpu_count() > 0);
+            var a = args();
+            println(a.len >= 1);
+            println(getenv("PATH").is_some());
+            println(getenv("RON_SURELY_UNDEFINED_VARIABLE").is_none());
+            var path = "ron_os_test.txt";
+            write_file(path, "line1\n");
+            append_file(path, string("line2\n"));
+            match (read_text(path)) {
+                Some(text) => print(text);
+                None => println("read failed");
+            }
+            println(file_exists(path));
+            delete_file(path);
+            println(file_exists(path));
+            return 0;
+        }
+    )", "80000 80000\ntrue\nfalse\n9\ntrue\ntrue\ntrue\ntrue\nline1\nline2\ntrue\nfalse\n"));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

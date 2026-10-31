@@ -1,0 +1,59 @@
+// Threads, mutexes and atomic counters.
+//
+//   fn worker(void* arg) { atomic_add(arg as i64*, 1); }
+//   Thread t = spawn(worker, &counter);
+//   t.join();
+//
+// Atomic intrinsics (built into the compiler) work on i32/u32/i64/u64 pointers:
+//   atomic_add(p, v) -> old value, atomic_cas(p, expected, desired) -> bool,
+//   atomic_load(p), atomic_store(p, v)
+
+import "std/win32.ron";
+
+extern "kernel32.dll" {
+    fn CreateThread(void* security, u64 stack_size, void* start, void* arg, u32 flags, u32* id) -> void*;
+    fn WaitForSingleObject(void* handle, u32 ms) -> u32;
+    fn GetCurrentThreadId() -> u32;
+    fn AcquireSRWLockExclusive(void* lock);
+    fn ReleaseSRWLockExclusive(void* lock);
+    fn TryAcquireSRWLockExclusive(void* lock) -> u8;
+    fn GetSystemInfo(void* info);
+}
+
+struct Thread {
+    void* handle;
+    u32 id;
+}
+
+// Runs `entry(arg)` on a new thread.
+fn spawn(fn(void*) entry, void* arg) -> Thread {
+    Thread t;
+    t.handle = CreateThread(null, 0, entry as void*, arg, 0, &t.id);
+    return t;
+}
+
+// Waits for the thread to finish.
+fn join(Thread* t) {
+    if (t.handle == null) return;
+    WaitForSingleObject(t.handle, 0xFFFFFFFF);
+    CloseHandle(t.handle);
+    t.handle = null;
+}
+
+fn thread_id() -> u32 { return GetCurrentThreadId(); }
+
+// Number of logical processors.
+fn cpu_count() -> int {
+    u8[48] info;   // SYSTEM_INFO; dwNumberOfProcessors at byte 32
+    GetSystemInfo(&info[0]);
+    return *((&info[32]) as u32*) as int;
+}
+
+// A lightweight lock (Windows SRW lock). Zero-initialized = unlocked.
+struct Mutex {
+    void* state;
+}
+
+fn lock(Mutex* m) { AcquireSRWLockExclusive(&m.state); }
+fn unlock(Mutex* m) { ReleaseSRWLockExclusive(&m.state); }
+fn try_lock(Mutex* m) -> bool { return TryAcquireSRWLockExclusive(&m.state) != 0; }
