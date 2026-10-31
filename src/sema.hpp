@@ -5,6 +5,7 @@
 #include "types.hpp"
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,16 @@ private:
     Expr* indirectCall(CallExpr* e, Expr* callee);
     Expr* functionValue(IdentExpr* e, std::vector<FuncDecl*>& overloads);
     void lowerForIn(ForInStmt* f);
+    Type* newSumType(const std::string& name, EnumDecl* e);
+    void layoutSum(EnumDecl* e);
+    Type* instantiateEnum(EnumDecl* g, const std::vector<Type*>& args);
+    Type* placeholderType(EnumDecl* g);
+    Expr* makeVariant(EnumDecl* en, const std::string& member, const std::vector<TypeExpr*>& typeArgs,
+                      std::vector<Expr*>& args, SourceLoc loc, bool called);
+    Expr* bindVariant(VariantExpr* v, EnumDecl* concrete);
+    Expr* finalizeVariant(Expr* e, bool report);
+    void checkMatch(MatchStmt* m);
+    Expr* checkTry(TryExpr* e);
     LocalVar* hiddenLocal(const char* name, Type* t, SourceLoc loc);
     Expr* mkIdent(LocalVar* v, SourceLoc loc);
     Expr* mkInt(uint64_t value, Type* t, SourceLoc loc);
@@ -120,6 +131,9 @@ private:
     std::vector<FuncDecl*> pendingInstances_;   // instantiated, body not yet checked
     std::map<FuncDecl*, SourceLoc> instantiatedAt_;
     std::vector<FuncDecl*> globalRefs_;   // functions referenced outside any function (DCE roots)
+    std::map<std::pair<EnumDecl*, std::vector<Type*>>, EnumDecl*> enumInstances_;
+    std::map<EnumDecl*, Type*> placeholders_;
+    std::set<EnumDecl*> sumLayoutActive_;
 
     std::vector<std::map<std::string, LocalVar*>> scopes_;
     FuncDecl* currentFunc_ = nullptr;

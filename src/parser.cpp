@@ -269,15 +269,29 @@ EnumDecl* Parser::parseEnum() {
     const Token& kw = advance();
     auto* e = arena_.make<EnumDecl>(kw.loc);
     e->name = std::string(expect(TokenKind::Identifier, "an enum name").text);
+    if (match(TokenKind::Less)) e->typeParams = parseTypeParams();
     expect(TokenKind::LBrace, "'{' after enum name");
     while (!check(TokenKind::RBrace)) {
         EnumMember m;
         m.loc = peek().loc;
         m.name = std::string(expect(TokenKind::Identifier, "an enum member name").text);
-        if (match(TokenKind::Eq)) m.value = parseExpression();
+        if (match(TokenKind::LParen)) {
+            // Sum-type variant carrying values: Rect(float, float)
+            m.hasPayload = true;
+            if (!check(TokenKind::RParen)) {
+                do {
+                    m.payload.push_back(parseType());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RParen, "')' after the variant's types");
+        } else if (match(TokenKind::Eq)) {
+            m.value = parseExpression();
+        }
+        e->isSum |= m.hasPayload;
         e->members.push_back(std::move(m));
         if (!match(TokenKind::Comma)) break;
     }
+    e->isSum |= !e->typeParams.empty();
     expect(TokenKind::RBrace, "'}' to close enum");
     return e;
 }
@@ -572,6 +586,37 @@ Stmt* Parser::parseStmt() {
         s->body = parseStmt();
         return s;
     }
+    case TokenKind::KwMatch: {
+        advance();
+        auto* m = arena_.make<MatchStmt>(t.loc);
+        expect(TokenKind::LParen, "'(' after 'match'");
+        m->subject = parseExpression();
+        expect(TokenKind::RParen, "')' after the matched value");
+        expect(TokenKind::LBrace, "'{' to open the match");
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfFile)) {
+            MatchArm arm;
+            arm.loc = peek().loc;
+            std::string first(expect(TokenKind::Identifier, "a variant name or '_'").text);
+            if (match(TokenKind::ColonColon))   // Shape::Circle(r)
+                first = std::string(expect(TokenKind::Identifier, "a variant name").text);
+            if (first != "_") arm.variant = first;
+            if (match(TokenKind::LParen)) {
+                arm.hasParens = true;
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        arm.bindings.push_back(std::string(expect(TokenKind::Identifier, "a binding name or '_'").text));
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen, "')' after the bindings");
+            }
+            expect(TokenKind::FatArrow, "'=>' after the pattern");
+            arm.body = parseStmt();
+            match(TokenKind::Comma);
+            m->arms.push_back(std::move(arm));
+        }
+        expect(TokenKind::RBrace, "'}' to close the match");
+        return m;
+    }
     case TokenKind::KwIf: {
         advance();
         auto* s = arena_.make<IfStmt>(t.loc);
@@ -769,6 +814,14 @@ Expr* Parser::parsePostfix(Expr* e) {
             m->base = e;
             m->name = std::string(expect(TokenKind::Identifier, "a field or method name after '.'").text);
             e = m;
+        } else if (t.is(TokenKind::Question) &&
+                   (peek(1).is(TokenKind::Semicolon) || peek(1).is(TokenKind::RParen) || peek(1).is(TokenKind::Comma) ||
+                    peek(1).is(TokenKind::Dot) || peek(1).is(TokenKind::RBracket) || peek(1).is(TokenKind::RBrace))) {
+            // `value?` (error propagation), as opposed to the ternary `c ? a : b`
+            advance();
+            auto* tr = arena_.make<TryExpr>(t.loc);
+            tr->operand = e;
+            e = tr;
         } else if (t.is(TokenKind::PlusPlus) || t.is(TokenKind::MinusMinus)) {
             advance();
             auto* u = arena_.make<UnaryExpr>(t.loc);
@@ -849,9 +902,10 @@ Expr* Parser::parsePrimary() {
             advance();
             typeArgs = parseTypeArgs();
         }
-        if (typeArgs.empty() && check(TokenKind::ColonColon)) {
+        if (check(TokenKind::ColonColon) && peek(1).is(TokenKind::Identifier)) {
             advance();
             auto* p = arena_.make<PathExpr>(t.loc);
+            p->typeArgs = typeArgs;
             p->scope = std::string(t.text);
             p->member = std::string(expect(TokenKind::Identifier, "a name after '::'").text);
             return p;

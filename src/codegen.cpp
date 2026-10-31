@@ -446,40 +446,16 @@ void CodeGen::genStmt(Stmt* s) {
     }
     case StmtKind::Return: {
         auto* r = s->as<ReturnStmt>();
-        if (r->value) {
-            int32_t mark = frameSize_;
-            genExpr(r->value);
-            Type* rt = func_->returnType;
-            if (rt->isAggregate()) {
-                if (hiddenReturn_) {
-                    as_.load(R10, Mem::at(RBP, 16), 8, false);
-                    copyMem(Mem::at(R10, 0), Mem::at(RAX, 0), rt->size);
-                    as_.movRR(RAX, R10);
-                } else {
-                    as_.load(RAX, Mem::at(RAX, 0), rt->size, false);
-                }
-            }
-            frameSize_ = mark;
-        } else if (func_->returnType->isInt()) {
-            as_.movRI(RAX, 0);
-        }
-        bool pending = false;
-        for (const auto& frame : deferFrames_) pending |= !frame.empty();
-        if (pending) {
-            // Keep the return value safe while the deferred statements run.
-            int32_t mark = frameSize_;
-            int32_t save = allocTemp8();
-            bool isFloat = func_->returnType->isFloat();
-            if (isFloat) as_.movsStore(Mem::at(RBP, save), XMM0, false);
-            else as_.store(Mem::at(RBP, save), RAX, 8);
-            emitDefers(0);
-            if (isFloat) as_.movsLoad(XMM0, Mem::at(RBP, save), false);
-            else as_.load(RAX, Mem::at(RBP, save), 8, false);
-            frameSize_ = mark;
-        }
-        as_.jmp(epilogue_);
+        int32_t mark = frameSize_;
+        if (r->value) genExpr(r->value);
+        else if (func_->returnType->isInt()) as_.movRI(RAX, 0);
+        finishReturn(r->value != nullptr);
+        frameSize_ = mark;
         break;
     }
+    case StmtKind::Match:
+        genMatch(s->as<MatchStmt>());
+        break;
     case StmtKind::Break: {
         int i = findLoop(s->as<BreakStmt>()->label, false);
         emitDefers(loops_[i].deferDepth);
@@ -493,6 +469,150 @@ void CodeGen::genStmt(Stmt* s) {
         break;
     }
     }
+}
+
+// The return value is in RAX / XMM0 (aggregates: their address in RAX).
+void CodeGen::finishReturn(bool hasValue) {
+    Type* rt = func_->returnType;
+    if (hasValue && rt->isAggregate()) {
+        if (hiddenReturn_) {
+            as_.load(R10, Mem::at(RBP, 16), 8, false);
+            copyMem(Mem::at(R10, 0), Mem::at(RAX, 0), rt->size);
+            as_.movRR(RAX, R10);
+        } else {
+            as_.load(RAX, Mem::at(RAX, 0), rt->size, false);
+        }
+    }
+    bool pending = false;
+    for (const auto& frame : deferFrames_) pending |= !frame.empty();
+    if (pending) {
+        // Keep the return value safe while the deferred statements run.
+        int32_t mark = frameSize_;
+        int32_t save = allocTemp8();
+        bool isFloat = rt->isFloat();
+        if (isFloat) as_.movsStore(Mem::at(RBP, save), XMM0, false);
+        else as_.store(Mem::at(RBP, save), RAX, 8);
+        emitDefers(0);
+        if (isFloat) as_.movsLoad(XMM0, Mem::at(RBP, save), false);
+        else as_.load(RAX, Mem::at(RBP, save), 8, false);
+        frameSize_ = mark;
+    }
+    as_.jmp(epilogue_);
+}
+
+static int variantIndex(EnumDecl* e, const char* name) {
+    for (size_t i = 0; i < e->members.size(); ++i)
+        if (e->members[i].name == name) return static_cast<int>(i);
+    return 0;
+}
+
+void CodeGen::genVariant(VariantExpr* v) {
+    EnumDecl* e = v->sum;
+    Type* t = e->type;
+    int32_t slot = allocSlot(t->size, std::max<uint32_t>(t->align, 8));
+    zeroMem(Mem::at(RBP, slot), t->size);
+    as_.storeImm32(Mem::at(RBP, slot), v->member, 4);
+    const EnumMember& m = e->members[v->member];
+    for (size_t i = 0; i < v->args.size(); ++i) {
+        genExpr(v->args[i]);
+        storeValue(m.payloadTypes[i], Mem::at(RBP, slot + static_cast<int32_t>(e->payloadOffset + m.payloadOffsets[i])));
+    }
+    as_.lea(RAX, Mem::at(RBP, slot));
+}
+
+// value? → the success payload, or an early return of None / Err(e)
+void CodeGen::genTry(TryExpr* e) {
+    EnumDecl* sum = e->operand->type->sumDecl;
+    bool isResult = sum->genericOrigin->name == "Result";
+    int success = variantIndex(sum, isResult ? "Ok" : "Some");
+    genExpr(e->operand);
+    int32_t ptrSlot = allocTemp8();
+    as_.store(Mem::at(RBP, ptrSlot), RAX, 8);
+    as_.load(RCX, Mem::at(RAX, 0), 4, false);
+    as_.cmpImm(RCX, success);
+    Label ok = as_.newLabel();
+    as_.jcc(CC_E, ok);
+
+    // Failure: build the function's own None / Err(value) and return it.
+    Type* rt = func_->returnType;
+    EnumDecl* out = rt->sumDecl;
+    int32_t slot = allocSlot(rt->size, std::max<uint32_t>(rt->align, 8));
+    zeroMem(Mem::at(RBP, slot), rt->size);
+    int failure = variantIndex(out, isResult ? "Err" : "None");
+    as_.storeImm32(Mem::at(RBP, slot), failure, 4);
+    if (isResult) {
+        int err = variantIndex(sum, "Err");
+        const EnumMember& src = sum->members[err];
+        const EnumMember& dst = out->members[failure];
+        if (!src.payloadTypes.empty() && !dst.payloadTypes.empty()) {
+            as_.load(R10, Mem::at(RBP, ptrSlot), 8, false);
+            copyMem(Mem::at(RBP, slot + static_cast<int32_t>(out->payloadOffset + dst.payloadOffsets[0])),
+                    Mem::at(R10, static_cast<int32_t>(sum->payloadOffset + src.payloadOffsets[0])),
+                    src.payloadTypes[0]->size);
+        }
+    }
+    as_.lea(RAX, Mem::at(RBP, slot));
+    finishReturn(true);
+
+    as_.bind(ok);
+    as_.load(RAX, Mem::at(RBP, ptrSlot), 8, false);
+    const EnumMember& m = sum->members[success];
+    loadValue(m.payloadTypes[0], Mem::at(RAX, static_cast<int32_t>(sum->payloadOffset + m.payloadOffsets[0])));
+}
+
+void CodeGen::genMatch(MatchStmt* m) {
+    Type* t = m->subject->type;
+    EnumDecl* sum = t->sumDecl;
+    int32_t mark = frameSize_;
+    int32_t ptrSlot = 0;
+    if (sum) {
+        genExpr(m->subject);   // address of the tagged union
+        ptrSlot = allocTemp8();
+        as_.store(Mem::at(RBP, ptrSlot), RAX, 8);
+        as_.load(RCX, Mem::at(RAX, 0), 4, false);
+    } else {
+        genExpr(m->subject);   // plain enum value
+        as_.movRR(RCX, RAX);
+    }
+    Label end = as_.newLabel();
+    Label fallback = end;
+    std::vector<Label> labels;
+    for (const MatchArm& arm : m->arms) {
+        Label l = as_.newLabel();
+        labels.push_back(l);
+        if (arm.member < 0) {
+            fallback = l;
+            continue;
+        }
+        int64_t value = sum ? arm.member : t->enumDecl->members[arm.member].resolved;
+        as_.cmpImm(RCX, static_cast<int32_t>(value));
+        as_.jcc(CC_E, l);
+    }
+    as_.jmp(fallback);
+    for (size_t i = 0; i < m->arms.size(); ++i) {
+        const MatchArm& arm = m->arms[i];
+        as_.bind(labels[i]);
+        if (sum && arm.member >= 0) {
+            const EnumMember& mem = sum->members[arm.member];
+            for (size_t b = 0; b < arm.vars.size(); ++b) {
+                LocalVar* v = arm.vars[b];
+                if (!v) continue;
+                as_.load(R10, Mem::at(RBP, ptrSlot), 8, false);
+                loadValue(v->type, Mem::at(R10, static_cast<int32_t>(sum->payloadOffset + mem.payloadOffsets[b])));
+                if (v->reg >= 0) {
+                    if (v->type->isFloat()) as_.movaps(static_cast<Xmm>(v->reg), XMM0);
+                    else as_.movRR(static_cast<Reg>(v->reg), RAX);
+                } else {
+                    v->frameOffset = allocSlot(v->type->size, v->type->align);
+                    storeValue(v->type, localMem(v));
+                }
+            }
+        }
+        genStmt(arm.body);
+        as_.jmp(end);
+    }
+    as_.bind(end);
+    frameSize_ = mark;
 }
 
 void CodeGen::genScope(const std::vector<Stmt*>& stmts) {
@@ -1116,6 +1236,12 @@ void CodeGen::genExpr(Expr* e) {
     }
     case ExprKind::Slice:
         genSlice(e->as<SliceExpr>());
+        break;
+    case ExprKind::Variant:
+        genVariant(e->as<VariantExpr>());
+        break;
+    case ExprKind::Try:
+        genTry(e->as<TryExpr>());
         break;
     case ExprKind::Index:
     case ExprKind::Member:

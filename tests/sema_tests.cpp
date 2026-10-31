@@ -160,6 +160,24 @@ TEST(sema_functions_and_slices) {
     CHECK(valid("fn id<T>(T v) -> T { return v; } fn main() -> int { var f = id::<int>; return f(3) - 3; }"));
 }
 
+TEST(sema_sum_types) {
+    const char* shape = "enum Shape { Circle(float), Rect(float, float), Empty } ";
+    CHECK(fails(std::string(shape) + "fn main() -> int { Shape s = Shape::Empty; match (s) { Circle(r) => {} } return 0; }",
+                "does not handle: Rect, Empty"));
+    CHECK(fails(std::string(shape) + "fn main() -> int { Shape s = Shape::Empty; match (s) { Rect(w) => {} _ => {} } return 0; }",
+                "carries 2 value(s)"));
+    CHECK(fails(std::string(shape) + "fn main() -> int { Shape s = Shape::Circle(1.0, 2.0); return 0; }", "takes 1 value"));
+    CHECK(fails(std::string(shape) + "fn main() -> int { Shape s = Shape::Square; return 0; }", "has no variant 'Square'"));
+    CHECK(fails("enum Option<T> { Some(T), None } fn main() -> int { var x = Option::None; return 0; }",
+                "cannot infer the type"));
+    CHECK(fails("enum Option<T> { Some(T), None } fn f() -> int { Option<int> o = Option::None; return o?; } "
+                "fn main() -> int { return f(); }",
+                "returns an Option"));
+    CHECK(fails("fn main() -> int { int x = 3; match (x) { _ => {} } return 0; }", "match needs an enum"));
+    CHECK(valid("enum Option<T> { Some(T), None } fn f(Option<i64> o) -> i64 { match (o) { Some(v) => return v; None => return 0; } } "
+                "fn main() -> int { return f(Option::Some(5)) as int + f(Option::None) as int; }"));
+}
+
 TEST(sema_requires_main) {
     CHECK(fails("fn notmain() {}", "no 'main' function"));
 }

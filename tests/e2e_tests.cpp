@@ -491,6 +491,77 @@ TEST(e2e_functions_slices_for_in) {
     )", "42\n7\ntrue\n10\n15\n5\n60\n54321\n50\n30\n5\n16\n8\n"));
 }
 
+TEST(e2e_sum_types_match_try) {
+    CHECK(prints("sumtypes", R"(
+        import "std/io.ron";
+        import "std/option.ron";
+        enum Shape { Circle(float), Rect(float, float), Empty }
+        fn area(Shape s) -> float {
+            match (s) {
+                Circle(r) => return 3.0 * r * r;
+                Rect(w, h) => return w * h;
+                Empty => return 0.0;
+            }
+        }
+        enum Tree { Leaf(int), Node(Tree*, Tree*) }
+        fn sum(Tree* t) -> int {
+            match (*t) {
+                Leaf(v) => return v;
+                Node(l, r) => return sum(l) + sum(r);
+            }
+        }
+        fn parse_digit(u8 c) -> Result<int, u8*> {
+            if (c >= '0' && c <= '9') return Result::Ok((c - '0') as int);
+            return Result::Err("not a digit");
+        }
+        fn add_digits(u8 a, u8 b) -> Result<int, u8*> {
+            var x = parse_digit(a)?;
+            var y = parse_digit(b)?;
+            return Result::Ok(x + y);
+        }
+        fn find(int[] xs, int target) -> Option<int> {
+            for (var i in 0..xs.len)
+                if (xs[i] == target) return Option::Some(i as int);
+            return Option::None;
+        }
+        enum Light { Red, Green }
+        fn main() -> int {
+            println(area(Shape::Circle(1.0)));
+            println(area(Shape::Rect(2.0, 3.0)));
+            println(area(Shape::Empty));
+            Tree a = Tree::Leaf(3);
+            Tree b = Tree::Leaf(4);
+            Tree c = Tree::Node(&a, &b);
+            println(sum(&c));
+            match (add_digits('4', '5')) {
+                Ok(v) => println(v);
+                Err(e) => println(e);
+            }
+            match (add_digits('4', 'x')) {
+                Ok(v) => println(v);
+                Err(e) => println(e);
+            }
+            var r = find([5, 7, 9], 9);
+            println(r.is_some());
+            println(r.unwrap());
+            println(find([1], 3).unwrap_or(-1));
+            Option<int> none = Option::None;
+            println(none.is_none());
+            var o = Option::Some(2.5);
+            match (o) {
+                Some(x) => println(x);
+                None => println("none");
+            }
+            Light l = Light::Green;
+            match (l) {
+                Red => println("stop");
+                _ => println("go");
+            }
+            return 0;
+        }
+    )", "3.0\n6.0\n0.0\n7\n9\nnot a digit\ntrue\n2\n-1\ntrue\n2.5\ngo\n"));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

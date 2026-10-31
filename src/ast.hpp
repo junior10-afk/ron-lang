@@ -57,7 +57,7 @@ struct TypeExpr : AstNode {
 enum class ExprKind {
     IntLit, FloatLit, StringLit, BoolLit, NullLit,
     Ident, Path, Unary, Binary, Assign, Ternary,
-    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit, Slice,
+    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit, Slice, Variant, Try,
 };
 
 enum class UnaryOp { Neg, Not, BitNot, AddrOf, Deref, PreInc, PreDec, PostInc, PostDec };
@@ -118,11 +118,31 @@ struct IdentExpr : Expr {
     IdentExpr() : Expr(ExprKind::Ident) {}
 };
 
-// `Enum::Member`
+// `Enum::Member`, `Option::<int>::None`
 struct PathExpr : Expr {
     std::string scope;
     std::string member;
+    std::vector<TypeExpr*> typeArgs;
     PathExpr() : Expr(ExprKind::Path) {}
+};
+
+struct EnumDecl;
+
+// A value of a sum type: `Shape::Circle(2.0)`, `Option::None` (built by sema).
+// While `generic` is set the type arguments are not known yet (e.g. a bare
+// `Option::None`); coerce() resolves them from the destination type.
+struct VariantExpr : Expr {
+    EnumDecl* sum = nullptr;        // instantiated enum
+    EnumDecl* generic = nullptr;    // template, until resolved
+    int member = 0;
+    std::vector<Expr*> args;
+    VariantExpr() : Expr(ExprKind::Variant) {}
+};
+
+// `expr?`: unwraps Option/Result, or returns None/Err from the current function.
+struct TryExpr : Expr {
+    Expr* operand = nullptr;
+    TryExpr() : Expr(ExprKind::Try) {}
 };
 
 struct UnaryExpr : Expr {
@@ -219,7 +239,7 @@ struct ArrayLitExpr : Expr {
 
 // ───────────────────────────── Statements ─────────────────────────────
 
-enum class StmtKind { Block, VarDecl, Expr, If, While, For, Return, Break, Continue, Switch, Defer, DoWhile, ForIn };
+enum class StmtKind { Block, VarDecl, Expr, If, While, For, Return, Break, Continue, Switch, Defer, DoWhile, ForIn, Match };
 
 struct Stmt : AstNode {
     StmtKind kind;
@@ -318,6 +338,24 @@ struct ForInStmt : Stmt {
     ForInStmt() : Stmt(StmtKind::ForIn) {}
 };
 
+struct MatchArm {
+    std::string variant;              // empty for `_`
+    std::vector<std::string> bindings;   // `_` ignores a payload value
+    bool hasParens = false;
+    Stmt* body = nullptr;
+    SourceLoc loc;
+    // Set by sema
+    int member = -1;
+    std::vector<LocalVar*> vars;      // null for ignored bindings
+};
+
+// match (shape) { Circle(r) => ..., Rect(w, h) => ..., _ => ... }
+struct MatchStmt : Stmt {
+    Expr* subject = nullptr;
+    std::vector<MatchArm> arms;
+    MatchStmt() : Stmt(StmtKind::Match) {}
+};
+
 // Runs `body` when the enclosing block exits (normally, or via return/break/continue).
 struct DeferStmt : Stmt {
     Stmt* body = nullptr;
@@ -391,15 +429,27 @@ struct StructDecl : Decl {
 
 struct EnumMember {
     std::string name;
-    Expr* value = nullptr;          // optional explicit value
+    Expr* value = nullptr;          // optional explicit value (plain enums)
     SourceLoc loc;
     int64_t resolved = 0;
+    bool hasPayload = false;        // Circle(float): a sum-type variant
+    std::vector<TypeExpr*> payload;
+    // Set by sema (sum types)
+    std::vector<Type*> payloadTypes;
+    std::vector<uint32_t> payloadOffsets;   // relative to the payload area
 };
 
+// Plain enums are integers. An enum with payloads or type parameters is a sum
+// type (tagged union): { i32 tag; payload } laid out like a struct.
 struct EnumDecl : Decl {
     std::string name;
     std::vector<EnumMember> members;
     Type* type = nullptr;
+    std::vector<std::string> typeParams;
+    EnumDecl* genericOrigin = nullptr;
+    std::vector<Type*> typeArgs;
+    bool isSum = false;
+    uint32_t payloadOffset = 0;
     EnumDecl() : Decl(Kind::Enum) {}
 };
 

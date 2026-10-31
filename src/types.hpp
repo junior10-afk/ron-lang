@@ -22,6 +22,8 @@ struct Type {
     uint64_t count = 0;           // Array
     StructDecl* structDecl = nullptr;
     EnumDecl* enumDecl = nullptr; // Int types that come from an enum
+    EnumDecl* sumDecl = nullptr;  // Struct types that are sum types (tagged unions)
+    bool placeholder = false;     // generic sum type whose arguments are not known yet
     bool complete = true;         // false while a struct layout is being computed
     std::string name;
     std::vector<Type*> params;    // Function

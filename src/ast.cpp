@@ -84,6 +84,7 @@ Expr* cloneExpr(AstArena& a, Expr* e) {
         auto* c = a.make<PathExpr>(e->loc);
         c->scope = e->as<PathExpr>()->scope;
         c->member = e->as<PathExpr>()->member;
+        c->typeArgs = e->as<PathExpr>()->typeArgs;
         return c;
     }
     case ExprKind::Unary: {
@@ -161,6 +162,13 @@ Expr* cloneExpr(AstArena& a, Expr* e) {
         for (Expr* x : e->as<ArrayLitExpr>()->elems) c->elems.push_back(cloneExpr(a, x));
         return c;
     }
+    case ExprKind::Try: {
+        auto* c = a.make<TryExpr>(e->loc);
+        c->operand = cloneExpr(a, e->as<TryExpr>()->operand);
+        return c;
+    }
+    case ExprKind::Variant:
+        return e;   // only created by sema, never part of an unchecked template
     case ExprKind::Slice: {
         auto* src = e->as<SliceExpr>();
         auto* c = a.make<SliceExpr>(e->loc);
@@ -228,6 +236,21 @@ Stmt* cloneStmt(AstArena& a, Stmt* s) {
             for (Expr* v : sc.values) copy.values.push_back(cloneExpr(a, v));
             for (Stmt* st : sc.body) copy.body.push_back(cloneStmt(a, st));
             c->cases.push_back(std::move(copy));
+        }
+        return c;
+    }
+    case StmtKind::Match: {
+        auto* src = s->as<MatchStmt>();
+        auto* c = a.make<MatchStmt>(s->loc);
+        c->subject = cloneExpr(a, src->subject);
+        for (const MatchArm& arm : src->arms) {
+            MatchArm copy;
+            copy.variant = arm.variant;
+            copy.bindings = arm.bindings;
+            copy.hasParens = arm.hasParens;
+            copy.loc = arm.loc;
+            copy.body = cloneStmt(a, arm.body);
+            c->arms.push_back(std::move(copy));
         }
         return c;
     }

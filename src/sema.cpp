@@ -186,7 +186,8 @@ void Sema::collect() {
                 diags_.error(e->loc, "type '" + e->name + "' is already defined");
                 break;
             }
-            e->type = types_.newEnum(e->name, e);
+            if (!e->isSum) e->type = types_.newEnum(e->name, e);
+            else if (e->typeParams.empty()) e->type = newSumType(e->name, e);   // generic templates get types per instance
             enums_[e->name] = e;
             break;
         }
@@ -245,7 +246,25 @@ Type* Sema::resolveType(TypeExpr* t) {
             }
             return instantiateStruct(s, args);
         }
-        if (auto it = enums_.find(t->name); it != enums_.end()) return it->second->type;
+        if (auto it = enums_.find(t->name); it != enums_.end()) {
+            EnumDecl* en = it->second;
+            if (en->typeParams.empty()) {
+                if (!t->typeArgs.empty()) diags_.error(t->loc, "enum '" + en->name + "' is not generic");
+                return en->type;
+            }
+            if (t->typeArgs.size() != en->typeParams.size()) {
+                diags_.error(t->loc, "generic enum '" + en->name + "' needs " + std::to_string(en->typeParams.size()) +
+                                         " type argument(s), e.g. " + en->name + "<int>");
+                return nullptr;
+            }
+            std::vector<Type*> args;
+            for (TypeExpr* a : t->typeArgs) {
+                Type* r = resolveType(a);
+                if (!r) return nullptr;
+                args.push_back(r);
+            }
+            return instantiateEnum(en, args);
+        }
         diags_.error(t->loc, "unknown type '" + t->name + "'");
         return nullptr;
     }
@@ -274,7 +293,10 @@ Type* Sema::resolveType(TypeExpr* t) {
     case TypeExpr::Kind::Array: {
         Type* inner = resolveType(t->inner);
         if (!inner) return nullptr;
-        if (inner->isStruct() && !inner->complete) layoutStruct(inner->structDecl);
+        if (inner->isStruct() && !inner->complete) {
+            if (inner->sumDecl) layoutSum(inner->sumDecl);
+            else layoutStruct(inner->structDecl);
+        }
         if (!inner->complete) return nullptr;
         if (inner->isVoid()) {
             diags_.error(t->loc, "cannot make an array of void");
@@ -325,7 +347,8 @@ void Sema::layoutStruct(StructDecl* s) {
         Type* t = resolveType(f.typeExpr);
         if (!t) continue;
         if (t->isStruct() && !t->complete) {
-            layoutStruct(t->structDecl);
+            if (t->sumDecl) layoutSum(t->sumDecl);
+            else layoutStruct(t->structDecl);
             if (!t->complete) continue;
         }
         if (t->isVoid()) {
@@ -413,6 +436,21 @@ bool Sema::unify(TypeExpr* p, Type* a, const std::vector<std::string>& params, s
             for (size_t i = 0; i < p->typeArgs.size(); ++i)
                 if (!unify(p->typeArgs[i], a->structDecl->typeArgs[i], params, env)) return false;
         }
+        if (!p->typeArgs.empty() && a->sumDecl && a->sumDecl->genericOrigin &&
+            a->sumDecl->genericOrigin->name == p->name && a->sumDecl->typeArgs.size() == p->typeArgs.size()) {
+            for (size_t i = 0; i < p->typeArgs.size(); ++i)
+                if (!unify(p->typeArgs[i], a->sumDecl->typeArgs[i], params, env)) return false;
+        }
+        return true;
+    case TypeExpr::Kind::Slice:
+        if (a->isSlice() || a->isArray()) return unify(p->inner, a->elem, params, env);
+        return true;
+    case TypeExpr::Kind::Function:
+        if (a->isFunction() && a->params.size() == p->params.size()) {
+            for (size_t i = 0; i < p->params.size(); ++i)
+                if (!unify(p->params[i], a->params[i], params, env)) return false;
+            if (p->inner && !unify(p->inner, a->ret, params, env)) return false;
+        }
         return true;
     case TypeExpr::Kind::Pointer:
         if (a->isPointer() || a->isArray()) return unify(p->inner, a->elem, params, env);
@@ -457,6 +495,12 @@ bool Sema::deduceTypeArgs(FuncDecl* f, const std::vector<Expr*>& args, const std
 }
 
 void Sema::resolveEnum(EnumDecl* e) {
+    if (e->isSum) {
+        if (e->typeParams.empty()) layoutSum(e);
+        for (const EnumMember& m : e->members)
+            if (m.value) diags_.error(m.loc, "variants of a sum type cannot have explicit values");
+        return;
+    }
     int64_t next = 0;
     std::map<std::string, bool> seen;
     for (EnumMember& m : e->members) {
@@ -556,6 +600,263 @@ void Sema::resolveSignature(FuncDecl* f) {
     }
 }
 
+// ───────────────────────────── Sum types ─────────────────────────────
+
+// A sum type is represented as a struct type (so it is copied, passed and
+// returned like one) whose layout is { i32 tag; payload area }.
+Type* Sema::newSumType(const std::string& name, EnumDecl* e) {
+    auto* shell = arena_.make<StructDecl>(e->loc);
+    shell->name = name;
+    Type* t = types_.newStruct(name, shell);
+    shell->type = t;
+    t->sumDecl = e;
+    return t;
+}
+
+void Sema::layoutSum(EnumDecl* e) {
+    if (e->type->complete) return;
+    if (sumLayoutActive_.count(e)) {
+        diags_.error(e->loc, "enum '" + e->name + "' contains itself (use a pointer)");
+        return;
+    }
+    sumLayoutActive_.insert(e);
+    bool generic = e->genericOrigin != nullptr;
+    if (generic) pushTypeEnv(e->genericOrigin->typeParams, e->typeArgs);
+    uint32_t align = 4, payloadSize = 0;
+    std::map<std::string, bool> seen;
+    for (EnumMember& m : e->members) {
+        if (seen[m.name]) diags_.error(m.loc, "duplicate variant '" + m.name + "'");
+        seen[m.name] = true;
+        m.payloadTypes.clear();
+        m.payloadOffsets.clear();
+        uint32_t off = 0;
+        for (TypeExpr* te : m.payload) {
+            Type* t = resolveType(te);
+            if (t && t->isStruct() && !t->complete) {
+                if (t->sumDecl) layoutSum(t->sumDecl);
+                else layoutStruct(t->structDecl);
+            }
+            if (!t || !t->complete || t->isVoid()) {
+                if (t && t->isVoid()) diags_.error(te->loc, "a variant cannot carry void");
+                t = types_.i32();
+            }
+            off = (off + t->align - 1) / t->align * t->align;
+            m.payloadTypes.push_back(t);
+            m.payloadOffsets.push_back(off);
+            off += t->size;
+            align = std::max(align, t->align);
+        }
+        payloadSize = std::max(payloadSize, off);
+    }
+    if (generic) popTypeEnv();
+    e->payloadOffset = (4 + align - 1) / align * align;
+    e->type->size = (e->payloadOffset + payloadSize + align - 1) / align * align;
+    e->type->align = align;
+    e->type->complete = true;
+    sumLayoutActive_.erase(e);
+}
+
+Type* Sema::instantiateEnum(EnumDecl* g, const std::vector<Type*>& args) {
+    auto key = std::make_pair(g, args);
+    if (auto it = enumInstances_.find(key); it != enumInstances_.end()) return it->second->type;
+    auto* inst = arena_.make<EnumDecl>(g->loc);
+    inst->name = instanceName(g->name, args);
+    inst->members = g->members;
+    inst->genericOrigin = g;
+    inst->typeArgs = args;
+    inst->isSum = true;
+    inst->type = newSumType(inst->name, inst);
+    enumInstances_[key] = inst;
+    layoutSum(inst);
+    return inst->type;
+}
+
+Type* Sema::placeholderType(EnumDecl* g) {
+    auto it = placeholders_.find(g);
+    if (it != placeholders_.end()) return it->second;
+    Type* t = newSumType(g->name + "<?>", g);
+    t->placeholder = true;
+    t->complete = true;
+    placeholders_[g] = t;
+    return t;
+}
+
+// Builds `Enum::Member(args)`. For generic enums without explicit type arguments
+// the variant stays a placeholder until coerce()/finalizeVariant() fixes them.
+Expr* Sema::makeVariant(EnumDecl* en, const std::string& member, const std::vector<TypeExpr*>& typeArgs,
+                        std::vector<Expr*>& args, SourceLoc loc, bool called) {
+    int index = -1;
+    for (size_t i = 0; i < en->members.size(); ++i)
+        if (en->members[i].name == member) index = static_cast<int>(i);
+    auto* v = arena_.make<VariantExpr>(loc);
+    if (index < 0) {
+        diags_.error(loc, "enum '" + en->name + "' has no variant '" + member + "'");
+        return errorExpr(v);
+    }
+    const EnumMember& m = en->members[index];
+    if (m.payload.size() != args.size() || (m.hasPayload && !called && !m.payload.empty())) {
+        diags_.error(loc, "variant '" + en->name + "::" + member + "' takes " + std::to_string(m.payload.size()) +
+                              " value(s), but " + std::to_string(args.size()) + " were given");
+        return errorExpr(v);
+    }
+    v->member = index;
+    v->args = args;
+    if (!en->typeParams.empty()) {
+        if (typeArgs.empty()) {
+            v->generic = en;
+            v->type = placeholderType(en);
+            return v;
+        }
+        if (typeArgs.size() != en->typeParams.size()) {
+            diags_.error(loc, "generic enum '" + en->name + "' needs " + std::to_string(en->typeParams.size()) +
+                                  " type argument(s)");
+            return errorExpr(v);
+        }
+        std::vector<Type*> targs;
+        for (TypeExpr* t : typeArgs) {
+            Type* r = resolveType(t);
+            if (!r) return errorExpr(v);
+            targs.push_back(r);
+        }
+        en = instantiateEnum(en, targs)->sumDecl;
+    }
+    return bindVariant(v, en);
+}
+
+// Gives a variant its concrete enum and converts the payload values.
+Expr* Sema::bindVariant(VariantExpr* v, EnumDecl* concrete) {
+    layoutSum(concrete);
+    const EnumMember& m = concrete->members[v->member];
+    for (size_t i = 0; i < v->args.size(); ++i) {
+        v->args[i] = coerce(v->args[i], m.payloadTypes[i], ("value of variant '" + m.name + "'").c_str());
+        if (!v->args[i]->type) return errorExpr(v);
+    }
+    v->generic = nullptr;
+    v->sum = concrete;
+    v->type = concrete->type;
+    return v;
+}
+
+// Resolves a placeholder variant from its own payload: Option::Some(5) → Option<i32>.
+Expr* Sema::finalizeVariant(Expr* e, bool report) {
+    if (!e || e->kind != ExprKind::Variant || !e->as<VariantExpr>()->generic) return e;
+    auto* v = e->as<VariantExpr>();
+    EnumDecl* g = v->generic;
+    std::map<std::string, Type*> env;
+    const EnumMember& m = g->members[v->member];
+    for (size_t i = 0; i < v->args.size(); ++i) {
+        Expr* a = v->args[i];
+        if (isUntyped(a)) {
+            if (a->kind == ExprKind::IntLit) setUntypedIntType(a->as<IntLitExpr>());
+        }
+        unify(m.payload[i], a->type, g->typeParams, env);
+    }
+    std::vector<Type*> targs;
+    for (const std::string& p : g->typeParams) {
+        auto it = env.find(p);
+        if (it == env.end()) {
+            if (report)
+                diags_.error(e->loc, "cannot infer the type of '" + g->name + "::" + m.name + "' here; write " + g->name +
+                                         "::<...>::" + m.name + " or use it where the type is known");
+            return report ? errorExpr(e) : e;
+        }
+        targs.push_back(it->second);
+    }
+    return bindVariant(v, instantiateEnum(g, targs)->sumDecl);
+}
+
+void Sema::checkMatch(MatchStmt* m) {
+    m->subject = finalizeVariant(check(m->subject), true);
+    Type* t = m->subject->type;
+    if (!t) return;
+    EnumDecl* en = t->sumDecl ? t->sumDecl : t->enumDecl;
+    if (!en) {
+        diags_.error(m->subject->loc, "match needs an enum value, not '" + typeName(t) + "' (use switch for integers)");
+        return;
+    }
+    if (en->isSum) layoutSum(en);
+    std::vector<bool> handled(en->members.size(), false);
+    bool hasWildcard = false;
+    for (MatchArm& arm : m->arms) {
+        pushScope();
+        if (arm.variant.empty()) {
+            if (hasWildcard) diags_.error(arm.loc, "duplicate '_' arm");
+            hasWildcard = true;
+        } else {
+            for (size_t i = 0; i < en->members.size(); ++i)
+                if (en->members[i].name == arm.variant) arm.member = static_cast<int>(i);
+            if (arm.member < 0) {
+                diags_.error(arm.loc, "enum '" + en->name + "' has no variant '" + arm.variant + "'");
+            } else {
+                if (handled[arm.member]) diags_.error(arm.loc, "variant '" + arm.variant + "' is matched twice");
+                handled[arm.member] = true;
+                const EnumMember& mem = en->members[arm.member];
+                size_t expected = en->isSum ? mem.payloadTypes.size() : 0;
+                if (arm.hasParens || expected > 0) {
+                    if (arm.bindings.size() != expected) {
+                        diags_.error(arm.loc, "variant '" + arm.variant + "' carries " + std::to_string(expected) +
+                                                  " value(s), but the pattern binds " + std::to_string(arm.bindings.size()));
+                    } else {
+                        for (size_t i = 0; i < expected; ++i) {
+                            if (arm.bindings[i] == "_") {
+                                arm.vars.push_back(nullptr);
+                                continue;
+                            }
+                            LocalVar* v = declareLocal(arm.bindings[i], mem.payloadTypes[i], arm.loc, false);
+                            currentFunc_->locals.push_back(v);
+                            arm.vars.push_back(v);
+                        }
+                    }
+                }
+            }
+        }
+        if (arm.body->kind == StmtKind::Defer) diags_.error(arm.body->loc, "defer must be inside a block { ... }");
+        checkStmt(arm.body);
+        popScope();
+    }
+    if (!hasWildcard) {
+        std::string missing;
+        for (size_t i = 0; i < en->members.size(); ++i)
+            if (!handled[i]) missing += (missing.empty() ? "" : ", ") + en->members[i].name;
+        if (!missing.empty())
+            diags_.error(m->loc, "match on '" + typeName(t) + "' does not handle: " + missing + " (add these arms or '_')");
+    }
+}
+
+// Option<T> / Result<T, E>: the first variant carrying one value is "success".
+static bool isTryable(Type* t) {
+    if (!t || !t->sumDecl || !t->sumDecl->genericOrigin) return false;
+    const std::string& n = t->sumDecl->genericOrigin->name;
+    return n == "Option" || n == "Result";
+}
+
+Expr* Sema::checkTry(TryExpr* e) {
+    e->operand = finalizeVariant(check(e->operand), true);
+    Type* t = e->operand->type;
+    if (!t) return errorExpr(e);
+    if (!isTryable(t)) {
+        diags_.error(e->loc, "'?' needs an Option or Result value, not '" + typeName(t) + "'");
+        return errorExpr(e);
+    }
+    Type* rt = currentFunc_ ? currentFunc_->returnType : nullptr;
+    EnumDecl* sum = t->sumDecl;
+    bool isResult = sum->genericOrigin->name == "Result";
+    if (!isTryable(rt) || rt->sumDecl->genericOrigin != sum->genericOrigin) {
+        diags_.error(e->loc, std::string("'?' can only be used in a function that returns ") +
+                                 (isResult ? "a Result" : "an Option"));
+        return errorExpr(e);
+    }
+    if (isResult && rt->sumDecl->typeArgs[1] != sum->typeArgs[1]) {
+        diags_.error(e->loc, "the error type '" + typeName(sum->typeArgs[1]) + "' does not match the function's '" +
+                                 typeName(rt->sumDecl->typeArgs[1]) + "'");
+        return errorExpr(e);
+    }
+    if (deferDepth_ > 0) diags_.error(e->loc, "'?' may return, which is not allowed inside a defer block");
+    e->type = sum->members[0].payloadTypes[0];
+    e->isLvalue = false;
+    return e;
+}
+
 // ───────────────────────────── Scopes ─────────────────────────────
 
 LocalVar* Sema::lookupLocal(const std::string& name) {
@@ -618,6 +919,14 @@ bool Sema::alwaysReturns(Stmt* s) {
         return s->as<ForStmt>()->cond == nullptr;
     case StmtKind::DoWhile:
         return alwaysReturns(s->as<DoWhileStmt>()->body);
+    case StmtKind::Match: {
+        // check() already rejected non-exhaustive matches, so all arms returning is enough
+        auto* m = s->as<MatchStmt>();
+        if (m->arms.empty()) return false;
+        for (const MatchArm& arm : m->arms)
+            if (!alwaysReturns(arm.body)) return false;
+        return true;
+    }
     case StmtKind::Switch: {
         // Every case returns, and the switch cannot fall out (default, or all enum members).
         auto* sw = s->as<SwitchStmt>();
@@ -643,6 +952,7 @@ bool Sema::alwaysReturns(Stmt* s) {
 
 // Type of `var x = e;`: untyped literals default to int / double.
 Type* Sema::inferType(Expr*& e) {
+    e = finalizeVariant(e, true);
     if (!e || !e->type) return nullptr;
     if (e->type->isNull()) {
         diags_.error(e->loc, "cannot infer a type from 'null'; write the pointer type (e.g. Enemy* p = null;)");
@@ -930,7 +1240,7 @@ void Sema::checkStmt(Stmt* s) {
     }
     case StmtKind::Expr: {
         auto* e = s->as<ExprStmt>();
-        e->expr = check(e->expr);
+        e->expr = finalizeVariant(check(e->expr), true);
         break;
     }
     case StmtKind::If: {
@@ -1018,6 +1328,9 @@ void Sema::checkStmt(Stmt* s) {
     case StmtKind::ForIn:
         lowerForIn(s->as<ForInStmt>());
         break;
+    case StmtKind::Match:
+        checkMatch(s->as<MatchStmt>());
+        break;
     case StmtKind::Defer: {
         auto* d = s->as<DeferStmt>();
         breakTargets_.push_back({"", BreakTarget::Barrier});
@@ -1074,6 +1387,19 @@ int Sema::conversionCost(Expr* e, Type* to) {
             worst = std::max(worst, c);
         }
         return worst;
+    }
+    if (from->placeholder) {
+        // Option::None and friends adopt the destination's type arguments.
+        auto* v = e->as<VariantExpr>();
+        if (!to->sumDecl || to->sumDecl->genericOrigin != v->generic) return -1;
+        const EnumMember& m = to->sumDecl->members[v->member];
+        int worst = 0;
+        for (size_t i = 0; i < v->args.size(); ++i) {
+            int c = conversionCost(v->args[i], m.payloadTypes[i]);
+            if (c < 0) return -1;
+            worst = std::max(worst, c);
+        }
+        return worst + 1;
     }
     if (to->isSlice() && from != to) {
         if (e->kind == ExprKind::ArrayLit) {
@@ -1199,6 +1525,10 @@ Expr* Sema::coerce(Expr* e, Type* to, const char* context) {
         Expr* arr = coerce(e, types_.arrayOf(to->elem, e->as<ArrayLitExpr>()->elems.size()), context);
         return arr->type ? implicitCast(arr, to) : arr;
     }
+    if (e->type->placeholder && to->sumDecl && to->sumDecl->genericOrigin == e->as<VariantExpr>()->generic)
+        return bindVariant(e->as<VariantExpr>(), to->sumDecl);
+    if (e->type->placeholder) e = finalizeVariant(e, true);
+    if (!e->type) return e;
     if (e->kind == ExprKind::Ident && e->as<IdentExpr>()->func && to->isFunction() && e->type != to) {
         // Pick the overload whose signature matches the expected function type.
         auto* id = e->as<IdentExpr>();
@@ -1292,6 +1622,19 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
     bool bestUsesAddr = false;
     int bestCost = std::numeric_limits<int>::max();
     int ties = 0;
+    // Pass 0 keeps open variants (Option::Some(5)) so they adopt a parameter's type
+    // arguments; if nothing matches, pass 1 resolves them from their own payload.
+    for (int pass = 0; pass < 2 && !best; ++pass) {
+    if (pass == 1) {
+        bool changed = false;
+        for (Expr*& a : args) {
+            if (a->type && a->type->placeholder) {
+                a = finalizeVariant(a, false);
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
     for (FuncDecl* f : it->second) {
         if (f->params.size() != args.size()) continue;
         bool isTemplate = !f->typeParams.empty();
@@ -1334,6 +1677,7 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
                 ++ties;
             }
         }
+    }
     }
 
     if (!best) {
@@ -1425,6 +1769,8 @@ Expr* Sema::check(Expr* e) {
     case ExprKind::StructLit: return checkStructLit(e->as<StructLitExpr>());
     case ExprKind::ArrayLit: return checkArrayLit(e->as<ArrayLitExpr>());
     case ExprKind::Slice: return checkSlice(e->as<SliceExpr>());
+    case ExprKind::Try: return checkTry(e->as<TryExpr>());
+    case ExprKind::Variant: return e;   // built by sema, already checked
     }
     return errorExpr(e);
 }
@@ -1523,6 +1869,10 @@ Expr* Sema::checkPath(PathExpr* e) {
     if (it == enums_.end()) {
         diags_.error(e->loc, "unknown enum '" + e->scope + "'");
         return errorExpr(e);
+    }
+    if (it->second->isSum) {
+        std::vector<Expr*> noArgs;
+        return makeVariant(it->second, e->member, e->typeArgs, noArgs, e->loc, false);
     }
     for (const EnumMember& m : it->second->members) {
         if (m.name == e->member) {
@@ -1715,8 +2065,8 @@ Expr* Sema::fold(BinaryExpr* e) {
 }
 
 Expr* Sema::checkBinary(BinaryExpr* e) {
-    e->lhs = check(e->lhs);
-    e->rhs = check(e->rhs);
+    e->lhs = finalizeVariant(check(e->lhs), true);
+    e->rhs = finalizeVariant(check(e->rhs), true);
     if (!e->lhs->type || !e->rhs->type) return errorExpr(e);
     Type* lt = e->lhs->type;
     Type* rt = e->rhs->type;
@@ -2019,6 +2369,11 @@ Expr* Sema::checkCall(CallExpr* e) {
         return e;
     }
 
+    if (e->callee->kind == ExprKind::Path) {
+        auto* p = e->callee->as<PathExpr>();
+        auto it = enums_.find(p->scope);
+        if (it != enums_.end() && it->second->isSum) return makeVariant(it->second, p->member, p->typeArgs, e->args, e->loc, true);
+    }
     if (e->callee->kind != ExprKind::Ident) {
         // Any expression of function type can be called: handlers[i](x), make_op()(1, 2)
         Expr* callee = check(e->callee);

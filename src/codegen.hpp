@@ -74,6 +74,10 @@ private:
     void genCall(const std::vector<Type*>& paramTypes, Type* rt, const std::vector<Expr*>& args, FuncDecl* direct,
                  Expr* calleeValue);
     void genSlice(SliceExpr* e);
+    void genVariant(VariantExpr* v);
+    void genTry(TryExpr* e);
+    void genMatch(MatchStmt* m);
+    void finishReturn(bool hasValue);
     void genFunctionAddress(FuncDecl* f);
     std::vector<std::pair<size_t, FuncDecl*>> funcRefs_;   // fixup index -> function whose address is taken
     void genCast(CastExpr* e);
