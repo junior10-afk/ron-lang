@@ -753,7 +753,11 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
         return nullptr;
     }
 
-    if (bestUsesAddr) args[0] = addrOfBase;
+    if (bestUsesAddr) {
+        args[0] = addrOfBase;
+        if (ufcsBase->kind == ExprKind::Ident && ufcsBase->as<IdentExpr>()->local)
+            ufcsBase->as<IdentExpr>()->local->addressTaken = true;
+    }
     for (size_t i = 0; i < args.size(); ++i) args[i] = coerce(args[i], best->paramTypes[i], "argument");
     if (currentFunc_) currentFunc_->callees.push_back(best);
     return best;
@@ -808,6 +812,9 @@ Expr* Sema::check(Expr* e) {
 
 Expr* Sema::checkIdent(IdentExpr* e) {
     if (LocalVar* v = lookupLocal(e->name)) {
+        double weight = 1;
+        for (int i = 0; i < loopDepth_ && i < 6; ++i) weight *= 8;
+        v->useWeight += weight;
         e->local = v;
         e->type = v->type;
         e->isLvalue = true;
@@ -955,6 +962,7 @@ Expr* Sema::checkUnary(UnaryExpr* e) {
             diags_.error(e->loc, "cannot take the address of a temporary value");
             return errorExpr(e);
         }
+        if (x->kind == ExprKind::Ident && x->as<IdentExpr>()->local) x->as<IdentExpr>()->local->addressTaken = true;
         e->type = types_.pointerTo(t);
         return e;
     case UnaryOp::Deref:

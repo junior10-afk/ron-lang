@@ -267,7 +267,10 @@ struct LocalVar {
     bool isConst = false;
     bool isParam = false;
     bool indirect = false;          // slot holds a pointer to the value (large struct params)
+    bool addressTaken = false;      // &v was used: must live in memory
+    double useWeight = 0;           // uses weighted by loop depth (register allocation priority)
     int32_t frameOffset = 0;        // rbp-relative, set by codegen
+    int8_t reg = -1;                // allocated register (GPR or XMM number), -1 = stack slot
 };
 
 struct Param {

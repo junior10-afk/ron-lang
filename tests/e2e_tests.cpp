@@ -251,6 +251,30 @@ TEST(e2e_enums_and_casts) {
     )", 57));
 }
 
+TEST(e2e_register_pressure) {
+    CHECK(exitsWith("regs", R"(
+        fn touch(int* p) { *p += 1; }
+        fn mix(float a, float b) -> float { return a * 2.0 + b; }
+        fn main() -> int {
+            int a = 1; int b = 2; int c = 3; int d = 4; int e = 5;
+            int f = 6; int g = 7; int h = 8; int i = 9; int j = 10;   // more ints than registers
+            float x0 = 0.5; float x1 = 1.0; float x2 = 1.5; float x3 = 2.0; float x4 = 2.5; float x5 = 3.0;
+            float x6 = 3.5; float x7 = 4.0; float x8 = 4.5; float x9 = 5.0; float x10 = 5.5; float x11 = 6.0;
+            int addr = 100;
+            touch(&addr);                          // address taken: must stay in memory
+            for (int k = 0; k < 3; k++) {
+                a += b; b += c; c += d; d += e; e += f; f += g; g += h; h += i; i += j; j += a;
+                x0 = mix(x0, x11);                 // calls must not clobber register variables
+                x11 += x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10;
+            }
+            u8 small = 250;
+            small += 10;                           // narrow register variable wraps to 4
+            int fsum = (x0 + x11) as int;
+            return (a + b + c + d + e + f + g + h + i + j) % 100 + addr + (small as int) + fsum % 7;
+        }
+    )", 181));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

@@ -10,10 +10,34 @@ using namespace x64;
 namespace {
 
 constexpr Reg kArgRegs[4] = {RCX, RDX, R8, R9};
+// Callee-saved registers available for local variables (Win64 ABI).
+constexpr Reg kVarGprs[] = {RBX, RSI, RDI, R12, R13, R14, R15};
+constexpr int kFirstVarXmm = 6;   // xmm6..xmm15 are callee-saved
+constexpr int kLastVarXmm = 15;
 
 int32_t alignUp(int32_t v, int32_t a) { return (v + a - 1) / a * a; }
 
 bool isSignedInt(const Type* t) { return t->isInt() && t->isSigned; }
+
+bool fitsInt32(uint64_t v) {
+    auto s = static_cast<int64_t>(v);
+    return s >= INT32_MIN && s <= INT32_MAX;
+}
+
+int scaleFor(uint32_t size) { return size == 1 || size == 2 || size == 4 || size == 8 ? static_cast<int>(size) : 0; }
+
+// Strips implicit integer widenings: a widened register variable already holds
+// the extended 64-bit value.
+Expr* stripWidening(Expr* e) {
+    while (e->kind == ExprKind::Cast && !e->as<CastExpr>()->target) {
+        Expr* op = e->as<CastExpr>()->operand;
+        if (!(op->type->isInt() || op->type->isBool()) || !e->type->isInt() || op->type->size > e->type->size ||
+            (op->type->isSigned && !e->type->isSigned))
+            break;
+        e = op;
+    }
+    return e;
+}
 
 } // namespace
 
@@ -119,13 +143,75 @@ int32_t CodeGen::allocSlot(uint32_t size, uint32_t align) {
     return -frameSize_;
 }
 
+// ───────────────────────────── Register allocation ─────────────────────────────
+
+// Scalar variables whose address is never taken live in callee-saved registers
+// for the whole function, most frequently used (loop-weighted) first.
+void CodeGen::allocateRegisters(FuncDecl* f) {
+    std::vector<LocalVar*> candidates;
+    auto consider = [&](LocalVar* v) {
+        v->reg = -1;
+        if (!v->type || v->addressTaken || passedByRef(v->type)) return;
+        if (v->type->isScalar() || v->type->isFloat()) candidates.push_back(v);
+    };
+    for (LocalVar* v : f->paramVars) consider(v);
+    for (LocalVar* v : f->locals) consider(v);
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](LocalVar* a, LocalVar* b) { return a->useWeight > b->useWeight; });
+
+    size_t nextGpr = 0;
+    int nextXmm = kFirstVarXmm;
+    for (LocalVar* v : candidates) {
+        if (v->type->isFloat()) {
+            if (nextXmm <= kLastVarXmm) v->reg = static_cast<int8_t>(nextXmm++);
+        } else if (nextGpr < std::size(kVarGprs)) {
+            v->reg = static_cast<int8_t>(kVarGprs[nextGpr++]);
+        }
+    }
+    for (size_t i = 0; i < nextGpr; ++i) savedGprs_.push_back({kVarGprs[i], 0});
+    for (int x = kFirstVarXmm; x < nextXmm; ++x) savedXmms_.push_back({static_cast<Xmm>(x), 0});
+}
+
+int CodeGen::regOf(Expr* e) const {
+    e = stripWidening(e);
+    if (e->kind != ExprKind::Ident) return -1;
+    LocalVar* v = e->as<IdentExpr>()->local;
+    return v && v->reg >= 0 && !v->type->isFloat() ? v->reg : -1;
+}
+
+int CodeGen::xmmOf(Expr* e) const {
+    if (e->kind != ExprKind::Ident) return -1;
+    LocalVar* v = e->as<IdentExpr>()->local;
+    return v && v->reg >= 0 && v->type->isFloat() ? v->reg : -1;
+}
+
+bool CodeGen::isSimple(Expr* e) const {
+    if (e->kind == ExprKind::IntLit || e->kind == ExprKind::NullLit || e->kind == ExprKind::BoolLit) return true;
+    Expr* x = stripWidening(e);
+    if (x->kind != ExprKind::Ident || !x->type->isScalar()) return false;
+    auto* id = x->as<IdentExpr>();
+    return (id->local && !id->local->indirect) || id->global;
+}
+
+bool CodeGen::isSimpleFloat(Expr* e) const {
+    if (e->kind == ExprKind::FloatLit) return true;
+    if (e->kind != ExprKind::Ident || !e->type->isFloat()) return false;
+    auto* id = e->as<IdentExpr>();
+    return (id->local && !id->local->indirect) || id->global;
+}
+
+// ───────────────────────────── Functions ─────────────────────────────
+
 void CodeGen::genFunction(FuncDecl* f) {
     func_ = f;
     frameSize_ = 0;
     maxFrame_ = 0;
     maxOutgoing_ = 32;
     loops_.clear();
+    savedGprs_.clear();
+    savedXmms_.clear();
     hiddenReturn_ = passedByRef(f->returnType);
+    allocateRegisters(f);
 
     as_.bind(funcLabels_[f]);
     as_.push(RBP);
@@ -134,7 +220,17 @@ void CodeGen::genFunction(FuncDecl* f) {
     uint32_t frameImm = 0;
     as_.subImm32Patchable(RSP, frameImm);   // 7 bytes, patched once the frame size is known
 
-    // Home register parameters into their shadow-space slots.
+    // Save the callee-saved registers we use.
+    for (auto& [r, slot] : savedGprs_) {
+        slot = allocSlot(8, 8);
+        as_.store(Mem::at(RBP, slot), r, 8);
+    }
+    for (auto& [x, slot] : savedXmms_) {
+        slot = allocSlot(16, 16);
+        as_.movupsStore(Mem::at(RBP, slot), x);
+    }
+
+    // Parameters: into their register, or homed into their shadow-space slot.
     int k0 = hiddenReturn_ ? 1 : 0;
     if (hiddenReturn_) as_.store(Mem::at(RBP, 16), RCX, 8);
     for (size_t i = 0; i < f->paramVars.size(); ++i) {
@@ -142,8 +238,20 @@ void CodeGen::genFunction(FuncDecl* f) {
         LocalVar* v = f->paramVars[i];
         v->frameOffset = 16 + 8 * k;
         v->indirect = passedByRef(v->type);
-        if (k < 4) {
-            if (v->type->isFloat()) as_.movsStore(localMem(v), static_cast<Xmm>(k), v->type->size == 4);
+        bool isFloat = v->type->isFloat();
+        bool f32 = v->type->size == 4;
+        if (v->reg >= 0) {
+            if (isFloat) {
+                if (k < 4) as_.movaps(static_cast<Xmm>(v->reg), static_cast<Xmm>(k));
+                else as_.movsLoad(static_cast<Xmm>(v->reg), localMem(v), f32);
+            } else {
+                Reg r = static_cast<Reg>(v->reg);
+                if (k < 4) as_.movRR(r, kArgRegs[k]);
+                else as_.load(r, localMem(v), 8, false);
+                normalize(v->type, r);
+            }
+        } else if (k < 4) {
+            if (isFloat) as_.movsStore(localMem(v), static_cast<Xmm>(k), f32);
             else as_.store(localMem(v), kArgRegs[k], 8);
         }
     }
@@ -152,6 +260,8 @@ void CodeGen::genFunction(FuncDecl* f) {
     genStmt(f->body);
     as_.movRI(RAX, 0);   // falling off the end returns 0 (main's implicit exit code)
     as_.bind(epilogue_);
+    for (auto& [r, slot] : savedGprs_) as_.load(r, Mem::at(RBP, slot), 8, false);
+    for (auto& [x, slot] : savedXmms_) as_.movupsLoad(x, Mem::at(RBP, slot));
     as_.movRR(RSP, RBP);
     as_.pop(RBP);
     as_.ret();
@@ -184,13 +294,28 @@ void CodeGen::genStmt(Stmt* s) {
     case StmtKind::VarDecl: {
         auto* v = s->as<VarDeclStmt>();
         LocalVar* var = v->var;
+        if (var->reg >= 0) {
+            int32_t mark = frameSize_;
+            bool isFloat = var->type->isFloat();
+            if (v->init) {
+                genExpr(v->init);
+                if (isFloat) as_.movaps(static_cast<Xmm>(var->reg), XMM0);
+                else as_.movRR(static_cast<Reg>(var->reg), RAX);
+            } else if (isFloat) {
+                as_.xorps(static_cast<Xmm>(var->reg), static_cast<Xmm>(var->reg));
+            } else {
+                as_.movRI(static_cast<Reg>(var->reg), 0);
+            }
+            frameSize_ = mark;
+            break;
+        }
         var->frameOffset = allocSlot(var->type->size, var->type->align);
         int32_t mark = frameSize_;
         if (v->init) {
             genExpr(v->init);
             storeValue(var->type, localMem(var));
         } else {
-            zeroMem(RBP, var->frameOffset, var->type->size);
+            zeroMem(localMem(var), var->type->size);
         }
         frameSize_ = mark;
         break;
@@ -216,40 +341,43 @@ void CodeGen::genStmt(Stmt* s) {
         break;
     }
     case StmtKind::While: {
+        // Loop rotation: test at the bottom, one jump per iteration.
         auto* w = s->as<WhileStmt>();
-        Label top = as_.newLabel();
+        Label body = as_.newLabel();
+        Label cond = as_.newLabel();
         Label end = as_.newLabel();
-        as_.bind(top);
-        int32_t mark = frameSize_;
-        genBranch(w->cond, end, false);
-        frameSize_ = mark;
-        loops_.push_back({end, top});
+        as_.jmp(cond);
+        as_.bind(body);
+        loops_.push_back({end, cond});
         genStmt(w->body);
         loops_.pop_back();
-        as_.jmp(top);
+        as_.bind(cond);
+        int32_t mark = frameSize_;
+        genBranch(w->cond, body, true);
+        frameSize_ = mark;
         as_.bind(end);
         break;
     }
     case StmtKind::For: {
         auto* f = s->as<ForStmt>();
         if (f->init) genStmt(f->init);
-        Label top = as_.newLabel();
+        Label body = as_.newLabel();
         Label cont = as_.newLabel();
+        Label cond = as_.newLabel();
         Label end = as_.newLabel();
-        as_.bind(top);
-        int32_t mark = frameSize_;
-        if (f->cond) genBranch(f->cond, end, false);
-        frameSize_ = mark;
+        as_.jmp(cond);
+        as_.bind(body);
         loops_.push_back({end, cont});
         genStmt(f->body);
         loops_.pop_back();
         as_.bind(cont);
-        if (f->step) {
-            mark = frameSize_;
-            genExpr(f->step);
-            frameSize_ = mark;
-        }
-        as_.jmp(top);
+        int32_t mark = frameSize_;
+        if (f->step) genExpr(f->step);
+        frameSize_ = mark;
+        as_.bind(cond);
+        if (f->cond) genBranch(f->cond, body, true);
+        else as_.jmp(body);
+        frameSize_ = mark;
         as_.bind(end);
         break;
     }
@@ -262,7 +390,7 @@ void CodeGen::genStmt(Stmt* s) {
             if (rt->isAggregate()) {
                 if (hiddenReturn_) {
                     as_.load(R10, Mem::at(RBP, 16), 8, false);
-                    copyMem(R10, 0, RAX, 0, rt->size);
+                    copyMem(Mem::at(R10, 0), Mem::at(RAX, 0), rt->size);
                     as_.movRR(RAX, R10);
                 } else {
                     as_.load(RAX, Mem::at(RAX, 0), rt->size, false);
@@ -298,7 +426,6 @@ void CodeGen::genBranch(Expr* cond, Label target, bool jumpWhen) {
         if (b->op == BinaryOp::LogAnd || b->op == BinaryOp::LogOr) {
             bool isAnd = b->op == BinaryOp::LogAnd;
             if (isAnd != jumpWhen) {
-                // and/false: jump if either is false.  or/true: jump if either is true.
                 genBranch(b->lhs, target, jumpWhen);
                 genBranch(b->rhs, target, jumpWhen);
             } else {
@@ -316,8 +443,13 @@ void CodeGen::genBranch(Expr* cond, Label target, bool jumpWhen) {
             return;
         }
     }
-    genExpr(cond);
-    as_.test(RAX, RAX);
+    int r = regOf(cond);
+    if (r >= 0) {
+        as_.test(static_cast<Reg>(r), static_cast<Reg>(r));
+    } else {
+        genExpr(cond);
+        as_.test(RAX, RAX);
+    }
     as_.jcc(jumpWhen ? CC_NE : CC_E, target);
 }
 
@@ -353,51 +485,62 @@ void CodeGen::loadValue(Type* t, const Mem& m) {
 }
 
 void CodeGen::storeValue(Type* t, const Mem& m) {
-    if (t->isFloat()) {
-        as_.movsStore(m, XMM0, t->size == 4);
-    } else if (t->isAggregate()) {
-        if (m.rip) {
-            as_.lea(R10, m);
-            copyMem(R10, 0, RAX, 0, t->size);
-        } else {
-            copyMem(m.base, m.disp, RAX, 0, t->size);
-        }
-    } else {
-        as_.store(m, RAX, t->size);
-    }
+    if (t->isFloat()) as_.movsStore(m, XMM0, t->size == 4);
+    else if (t->isAggregate()) copyMem(m, Mem::at(RAX, 0), t->size);
+    else as_.store(m, RAX, t->size);
 }
 
-void CodeGen::copyMem(Reg dst, int32_t dstDisp, Reg src, int32_t srcDisp, uint32_t size) {
+void CodeGen::copyMem(const Mem& dstIn, const Mem& srcIn, uint32_t size) {
+    Mem dst = dstIn, src = srcIn;
+    // Indexed or RIP-relative operands: materialize the addresses first.
+    if (src.rip || src.hasIndex()) {
+        as_.lea(R11, src);
+        src = Mem::at(R11, 0);
+    }
+    if (dst.rip || dst.hasIndex()) {
+        as_.lea(R10, dst);
+        dst = Mem::at(R10, 0);
+    }
     if (size <= 128) {
+        Reg data = src.base == R11 || dst.base == R11 ? RDX : R11;
         uint32_t i = 0;
         for (unsigned chunk : {8u, 4u, 2u, 1u}) {
             for (; i + chunk <= size; i += chunk) {
-                as_.load(R11, Mem::at(src, srcDisp + static_cast<int32_t>(i)), chunk, false);
-                as_.store(Mem::at(dst, dstDisp + static_cast<int32_t>(i)), R11, chunk);
+                as_.load(data, Mem::at(src.base, src.disp + static_cast<int32_t>(i)), chunk, false);
+                as_.store(Mem::at(dst.base, dst.disp + static_cast<int32_t>(i)), data, chunk);
             }
         }
         return;
     }
+    as_.lea(R11, src);
+    as_.lea(R10, dst);
     as_.push(RSI);
     as_.push(RDI);
-    as_.lea(RSI, Mem::at(src, srcDisp));
-    as_.lea(RDI, Mem::at(dst, dstDisp));
+    as_.movRR(RSI, R11);
+    as_.movRR(RDI, R10);
     as_.movRI(RCX, size);
     as_.repMovsb();
     as_.pop(RDI);
     as_.pop(RSI);
 }
 
-void CodeGen::zeroMem(Reg base, int32_t disp, uint32_t size) {
+void CodeGen::zeroMem(const Mem& dstIn, uint32_t size) {
+    Mem dst = dstIn;
+    if (dst.rip || dst.hasIndex()) {
+        as_.lea(R10, dst);
+        dst = Mem::at(R10, 0);
+    }
     if (size <= 128) {
         as_.movRI(R11, 0);
         uint32_t i = 0;
         for (unsigned chunk : {8u, 4u, 2u, 1u})
-            for (; i + chunk <= size; i += chunk) as_.store(Mem::at(base, disp + static_cast<int32_t>(i)), R11, chunk);
+            for (; i + chunk <= size; i += chunk)
+                as_.store(Mem::at(dst.base, dst.disp + static_cast<int32_t>(i)), R11, chunk);
         return;
     }
+    as_.lea(R11, dst);
     as_.push(RDI);
-    as_.lea(RDI, Mem::at(base, disp));
+    as_.movRR(RDI, R11);
     as_.movRI(RCX, size);
     as_.movRI(RAX, 0);
     as_.repStosb();
@@ -417,27 +560,20 @@ bool CodeGen::simpleInto(Expr* e, Reg r) {
         as_.movRI(r, e->as<BoolLitExpr>()->value ? 1 : 0);
         return true;
     }
-    Type* loadType = e->type;
-    Expr* x = e;
-    // An implicit int widening of a variable is just a load with the source's extension.
-    if (e->kind == ExprKind::Cast && !e->as<CastExpr>()->target) {
-        Expr* op = e->as<CastExpr>()->operand;
-        if (op->type->isInt() && e->type->isInt() && op->type->size <= e->type->size &&
-            !(op->type->isSigned && !e->type->isSigned)) {
-            x = op;
-            loadType = op->type;
-        } else {
-            return false;
-        }
+    int vr = regOf(e);
+    if (vr >= 0) {
+        as_.movRR(r, static_cast<Reg>(vr));
+        return true;
     }
-    if (x->kind != ExprKind::Ident || !loadType->isScalar()) return false;
+    Expr* x = stripWidening(e);
+    if (x->kind != ExprKind::Ident || !x->type->isScalar()) return false;
     auto* id = x->as<IdentExpr>();
     if (id->local && !id->local->indirect) {
-        as_.load(r, localMem(id->local), loadType->size, isSignedInt(loadType));
+        as_.load(r, localMem(id->local), x->type->size, isSignedInt(x->type));
         return true;
     }
     if (id->global) {
-        as_.load(r, Mem::ripRel(Section::Data, id->global->dataOffset), loadType->size, isSignedInt(loadType));
+        as_.load(r, Mem::ripRel(Section::Data, id->global->dataOffset), x->type->size, isSignedInt(x->type));
         return true;
     }
     return false;
@@ -448,6 +584,11 @@ bool CodeGen::simpleFloatInto(Expr* e, Xmm x) {
     if (e->kind == ExprKind::FloatLit) {
         double v = e->as<FloatLitExpr>()->value;
         as_.movsLoad(x, Mem::ripRel(Section::Rdata, f32 ? addF32(static_cast<float>(v)) : addF64(v)), f32);
+        return true;
+    }
+    int vx = xmmOf(e);
+    if (vx >= 0) {
+        as_.movaps(x, static_cast<Xmm>(vx));
         return true;
     }
     if (e->kind == ExprKind::Ident) {
@@ -464,55 +605,317 @@ bool CodeGen::simpleFloatInto(Expr* e, Xmm x) {
     return false;
 }
 
-void CodeGen::genOperandsInt(Expr* lhs, Expr* rhs) {
+std::pair<Reg, Reg> CodeGen::genOperandsInt(Expr* lhs, Expr* rhs, bool lhsInAcc) {
+    int l = regOf(lhs);
+    int r = regOf(rhs);
+    if (!lhsInAcc && l >= 0) {
+        if (r >= 0) return {static_cast<Reg>(l), static_cast<Reg>(r)};
+        if (isSimple(rhs)) {
+            simpleInto(rhs, RCX);
+            return {static_cast<Reg>(l), RCX};
+        }
+        genExpr(rhs);
+        return {static_cast<Reg>(l), RAX};
+    }
+    if (r >= 0) {
+        genExpr(lhs);
+        return {RAX, static_cast<Reg>(r)};
+    }
+    if (isSimple(rhs)) {
+        genExpr(lhs);
+        simpleInto(rhs, RCX);
+        return {RAX, RCX};
+    }
+    if (l >= 0) {
+        genExpr(rhs);
+        as_.movRR(RCX, RAX);
+        as_.movRR(RAX, static_cast<Reg>(l));
+        return {RAX, RCX};
+    }
     genExpr(lhs);
-    if (simpleInto(rhs, RCX)) return;
     int32_t t = allocTemp8();
     as_.store(Mem::at(RBP, t), RAX, 8);
     genExpr(rhs);
     as_.movRR(RCX, RAX);
     as_.load(RAX, Mem::at(RBP, t), 8, false);
+    return {RAX, RCX};
 }
 
-void CodeGen::genOperandsFloat(Expr* lhs, Expr* rhs) {
-    genExpr(lhs);
-    if (simpleFloatInto(rhs, XMM1)) return;
+std::pair<Xmm, Xmm> CodeGen::genOperandsFloat(Expr* lhs, Expr* rhs, bool lhsInAcc) {
+    int l = xmmOf(lhs);
+    int r = xmmOf(rhs);
     bool f32 = lhs->type->size == 4;
+    if (!lhsInAcc && l >= 0) {
+        if (r >= 0) return {static_cast<Xmm>(l), static_cast<Xmm>(r)};
+        if (isSimpleFloat(rhs)) {
+            simpleFloatInto(rhs, XMM1);
+            return {static_cast<Xmm>(l), XMM1};
+        }
+        genExpr(rhs);
+        return {static_cast<Xmm>(l), XMM0};
+    }
+    if (r >= 0) {
+        genExpr(lhs);
+        return {XMM0, static_cast<Xmm>(r)};
+    }
+    if (isSimpleFloat(rhs)) {
+        genExpr(lhs);
+        simpleFloatInto(rhs, XMM1);
+        return {XMM0, XMM1};
+    }
+    if (l >= 0) {
+        genExpr(rhs);
+        as_.movaps(XMM1, XMM0);
+        as_.movaps(XMM0, static_cast<Xmm>(l));
+        return {XMM0, XMM1};
+    }
+    genExpr(lhs);
     int32_t t = allocTemp8();
     as_.movsStore(Mem::at(RBP, t), XMM0, f32);
     genExpr(rhs);
     as_.movaps(XMM1, XMM0);
     as_.movsLoad(XMM0, Mem::at(RBP, t), f32);
+    return {XMM0, XMM1};
 }
 
-void CodeGen::emitIntOp(BinaryOp op, Type* t) {
+void CodeGen::emitIntOp(BinaryOp op, Type* t, Reg rhs) {
     bool s = isSignedInt(t);
     switch (op) {
-    case BinaryOp::Add: as_.add(RAX, RCX); break;
-    case BinaryOp::Sub: as_.sub(RAX, RCX); break;
-    case BinaryOp::Mul: as_.imul(RAX, RCX); break;
+    case BinaryOp::Add: as_.add(RAX, rhs); break;
+    case BinaryOp::Sub: as_.sub(RAX, rhs); break;
+    case BinaryOp::Mul: as_.imul(RAX, rhs); break;
     case BinaryOp::Div:
     case BinaryOp::Mod:
         if (s) {
             as_.cqo();
-            as_.idiv(RCX);
+            as_.idiv(rhs);
         } else {
             as_.movRI(RDX, 0);
-            as_.div(RCX);
+            as_.div(rhs);
         }
         if (op == BinaryOp::Mod) as_.movRR(RAX, RDX);
         break;
-    case BinaryOp::BitAnd: as_.and_(RAX, RCX); break;
-    case BinaryOp::BitOr: as_.or_(RAX, RCX); break;
-    case BinaryOp::BitXor: as_.xor_(RAX, RCX); break;
-    case BinaryOp::Shl: as_.shlCl(RAX); break;
+    case BinaryOp::BitAnd: as_.and_(RAX, rhs); break;
+    case BinaryOp::BitOr: as_.or_(RAX, rhs); break;
+    case BinaryOp::BitXor: as_.xor_(RAX, rhs); break;
+    case BinaryOp::Shl:
     case BinaryOp::Shr:
-        if (s) as_.sarCl(RAX);
+        if (rhs != RCX) as_.movRR(RCX, rhs);
+        if (op == BinaryOp::Shl) as_.shlCl(RAX);
+        else if (s) as_.sarCl(RAX);
         else as_.shrCl(RAX);
         break;
     default: break;
     }
     normalize(t);
+}
+
+// dst op= literal, using immediate instruction forms. Returns false if not applicable.
+bool CodeGen::emitIntOpImm(BinaryOp op, Type* t, Reg dst, Expr* rhs) {
+    if (rhs->kind != ExprKind::IntLit) return false;
+    uint64_t v = rhs->as<IntLitExpr>()->value;
+    bool s = isSignedInt(t);
+    switch (op) {
+    case BinaryOp::Add:
+    case BinaryOp::Sub:
+    case BinaryOp::BitAnd:
+    case BinaryOp::BitOr:
+    case BinaryOp::BitXor:
+    case BinaryOp::Mul:
+        if (!fitsInt32(v)) return false;
+        break;
+    case BinaryOp::Shl:
+    case BinaryOp::Shr:
+        if (v >= 64) return false;
+        break;
+    default:
+        return false;
+    }
+    auto imm = static_cast<int32_t>(v);
+    switch (op) {
+    case BinaryOp::Add: as_.addImm(dst, imm); break;
+    case BinaryOp::Sub: as_.subImm(dst, imm); break;
+    case BinaryOp::BitAnd: as_.andImm(dst, imm); break;
+    case BinaryOp::BitOr: as_.orImm(dst, imm); break;
+    case BinaryOp::BitXor: as_.xorImm(dst, imm); break;
+    case BinaryOp::Mul: as_.imulImm(dst, dst, imm); break;
+    case BinaryOp::Shl: as_.shlImm(dst, static_cast<uint8_t>(v)); break;
+    case BinaryOp::Shr:
+        if (s) as_.sarImm(dst, static_cast<uint8_t>(v));
+        else as_.shrImm(dst, static_cast<uint8_t>(v));
+        break;
+    default: break;
+    }
+    normalize(t, dst);
+    return true;
+}
+
+void CodeGen::emitFloatOp(BinaryOp op, bool f32, Xmm dst, Xmm src) {
+    switch (op) {
+    case BinaryOp::Add: as_.addS(dst, src, f32); break;
+    case BinaryOp::Sub: as_.subS(dst, src, f32); break;
+    case BinaryOp::Mul: as_.mulS(dst, src, f32); break;
+    case BinaryOp::Div: as_.divS(dst, src, f32); break;
+    default: break;
+    }
+}
+
+// ───────────────────────────── Memory operands ─────────────────────────────
+
+bool CodeGen::stableMem(Expr* e, Mem& out) {
+    switch (e->kind) {
+    case ExprKind::Ident: {
+        auto* id = e->as<IdentExpr>();
+        if (id->local) {
+            if (id->local->reg >= 0 || id->local->indirect) return false;
+            out = localMem(id->local);
+            return true;
+        }
+        out = Mem::ripRel(Section::Data, id->global->dataOffset);
+        return true;
+    }
+    case ExprKind::Unary: {
+        auto* u = e->as<UnaryExpr>();
+        int r = u->op == UnaryOp::Deref ? regOf(u->operand) : -1;
+        if (r < 0) return false;
+        out = Mem::at(static_cast<Reg>(r), 0);
+        return true;
+    }
+    case ExprKind::Index: {
+        auto* ix = e->as<IndexExpr>();
+        Type* bt = ix->base->type;
+        uint32_t s = bt->elem->size;
+        Mem base;
+        if (bt->isArray()) {
+            if (!stableMem(ix->base, base) || base.hasIndex()) return false;
+        } else {
+            int r = regOf(ix->base);
+            if (r < 0) return false;
+            base = Mem::at(static_cast<Reg>(r), 0);
+        }
+        if (ix->index->kind == ExprKind::IntLit) {
+            int64_t off = static_cast<int64_t>(ix->index->as<IntLitExpr>()->value) * s;
+            if (off < INT32_MIN || off > INT32_MAX) return false;
+            out = base;
+            addDisp(out, static_cast<int32_t>(off));
+            return true;
+        }
+        int r = regOf(ix->index);
+        if (r < 0 || !scaleFor(s) || base.rip) return false;
+        out = Mem::indexed(base.base, static_cast<Reg>(r), static_cast<uint8_t>(s), base.disp);
+        return true;
+    }
+    case ExprKind::Member: {
+        auto* m = e->as<MemberExpr>();
+        if (m->throughPointer) {
+            int r = regOf(m->base);
+            if (r < 0) return false;
+            out = Mem::at(static_cast<Reg>(r), static_cast<int32_t>(m->offset));
+            return true;
+        }
+        if (!stableMem(m->base, out)) return false;
+        addDisp(out, static_cast<int32_t>(m->offset));
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+Mem CodeGen::genIndexMem(IndexExpr* e) {
+    Type* bt = e->base->type;
+    uint32_t s = bt->elem->size;
+    Mem base;
+    bool baseInRax = false;
+    if (bt->isArray()) {
+        if (stableMem(e->base, base) && !base.hasIndex() && !base.rip) {
+            // [rbp + offset] or [reg + offset]: no code needed
+        } else {
+            base = genMem(e->base);
+            if (base.hasIndex() || base.rip || base.base != RAX) {
+                as_.lea(RAX, base);
+                base = Mem::at(RAX, 0);
+            }
+            baseInRax = true;
+        }
+    } else {
+        int r = regOf(e->base);
+        if (r >= 0) {
+            base = Mem::at(static_cast<Reg>(r), 0);
+        } else {
+            genExpr(e->base);
+            base = Mem::at(RAX, 0);
+            baseInRax = true;
+        }
+    }
+
+    if (e->index->kind == ExprKind::IntLit) {
+        int64_t off = static_cast<int64_t>(e->index->as<IntLitExpr>()->value) * s;
+        if (off >= INT32_MIN && off <= INT32_MAX) {
+            base.disp += static_cast<int32_t>(off);
+            return base;
+        }
+    }
+    int ir = regOf(e->index);
+    if (ir >= 0 && scaleFor(s)) return Mem::indexed(base.base, static_cast<Reg>(ir), static_cast<uint8_t>(s), base.disp);
+
+    // Compute the index into RCX (keeping the base alive).
+    if (ir >= 0) {
+        as_.movRR(RCX, static_cast<Reg>(ir));
+    } else if (isSimple(e->index)) {
+        simpleInto(e->index, RCX);
+    } else if (baseInRax) {
+        int32_t t = allocTemp8();
+        as_.store(Mem::at(RBP, t), RAX, 8);
+        genExpr(e->index);
+        as_.movRR(RCX, RAX);
+        as_.load(RAX, Mem::at(RBP, t), 8, false);
+    } else {
+        genExpr(e->index);
+        as_.movRR(RCX, RAX);
+    }
+    if (scaleFor(s)) return Mem::indexed(base.base, RCX, static_cast<uint8_t>(s), base.disp);
+    as_.imulImm(RCX, RCX, static_cast<int32_t>(s));
+    return Mem::indexed(base.base, RCX, 1, base.disp);
+}
+
+Mem CodeGen::genMem(Expr* e) {
+    Mem m;
+    if (stableMem(e, m)) return m;
+    switch (e->kind) {
+    case ExprKind::Ident: {
+        auto* id = e->as<IdentExpr>();
+        as_.load(RAX, localMem(id->local), 8, false);   // indirect (large struct parameter)
+        return Mem::at(RAX, 0);
+    }
+    case ExprKind::Unary:
+        if (e->as<UnaryExpr>()->op == UnaryOp::Deref) {
+            genExpr(e->as<UnaryExpr>()->operand);
+            return Mem::at(RAX, 0);
+        }
+        break;
+    case ExprKind::Index:
+        return genIndexMem(e->as<IndexExpr>());
+    case ExprKind::Member: {
+        auto* mem = e->as<MemberExpr>();
+        if (mem->throughPointer) {
+            genExpr(mem->base);
+            return Mem::at(RAX, static_cast<int32_t>(mem->offset));
+        }
+        m = genMem(mem->base);
+        addDisp(m, static_cast<int32_t>(mem->offset));
+        return m;
+    }
+    default:
+        break;
+    }
+    genExpr(e);   // aggregate rvalues evaluate to the address of a temporary
+    return Mem::at(RAX, 0);
+}
+
+void CodeGen::genAddr(Expr* e) {
+    Mem m = genMem(e);
+    if (!(m.base == RAX && m.disp == 0 && !m.hasIndex() && !m.rip)) as_.lea(RAX, m);
 }
 
 // ───────────────────────────── Expressions ─────────────────────────────
@@ -538,12 +941,14 @@ void CodeGen::genExpr(Expr* e) {
         as_.movRI(RAX, 0);
         break;
     case ExprKind::Ident: {
-        auto* id = e->as<IdentExpr>();
-        if (id->local) {
-            if (id->local->indirect) as_.load(RAX, localMem(id->local), 8, false);
-            else loadValue(e->type, localMem(id->local));
+        LocalVar* v = e->as<IdentExpr>()->local;
+        if (v && v->reg >= 0) {
+            if (v->type->isFloat()) as_.movaps(XMM0, static_cast<Xmm>(v->reg));
+            else as_.movRR(RAX, static_cast<Reg>(v->reg));
+        } else if (v && v->indirect) {
+            as_.load(RAX, localMem(v), 8, false);
         } else {
-            loadValue(e->type, Mem::ripRel(Section::Data, id->global->dataOffset));
+            loadValue(e->type, genMem(e));
         }
         break;
     }
@@ -571,23 +976,23 @@ void CodeGen::genExpr(Expr* e) {
     case ExprKind::Call: {
         auto* c = e->as<CallExpr>();
         if (c->intrinsic == Intrinsic::SqrtF32 || c->intrinsic == Intrinsic::SqrtF64) {
-            genExpr(c->args[0]);
-            as_.sqrtS(XMM0, XMM0, c->intrinsic == Intrinsic::SqrtF32);
+            bool f32 = c->intrinsic == Intrinsic::SqrtF32;
+            int x = xmmOf(c->args[0]);
+            if (x >= 0) {
+                as_.sqrtS(XMM0, static_cast<Xmm>(x), f32);
+            } else {
+                genExpr(c->args[0]);
+                as_.sqrtS(XMM0, XMM0, f32);
+            }
         } else {
             genCallTo(c->func, c->args);
         }
         break;
     }
     case ExprKind::Index:
-        genIndexAddr(e->as<IndexExpr>());
-        loadValue(e->type, Mem::at(RAX, 0));
+    case ExprKind::Member:
+        loadValue(e->type, genMem(e));
         break;
-    case ExprKind::Member: {
-        auto* m = e->as<MemberExpr>();
-        genMemberBase(m);
-        loadValue(e->type, Mem::at(RAX, static_cast<int32_t>(m->offset)));
-        break;
-    }
     case ExprKind::Cast:
         genCast(e->as<CastExpr>());
         break;
@@ -600,79 +1005,27 @@ void CodeGen::genExpr(Expr* e) {
     }
 }
 
-void CodeGen::genAddr(Expr* e) {
-    switch (e->kind) {
-    case ExprKind::Ident: {
-        auto* id = e->as<IdentExpr>();
-        if (id->local) {
-            if (id->local->indirect) as_.load(RAX, localMem(id->local), 8, false);
-            else as_.lea(RAX, localMem(id->local));
-        } else {
-            as_.lea(RAX, Mem::ripRel(Section::Data, id->global->dataOffset));
-        }
-        break;
-    }
-    case ExprKind::Unary:
-        if (e->as<UnaryExpr>()->op == UnaryOp::Deref) {
-            genExpr(e->as<UnaryExpr>()->operand);
-            break;
-        }
-        genExpr(e);
-        break;
-    case ExprKind::Index:
-        genIndexAddr(e->as<IndexExpr>());
-        break;
-    case ExprKind::Member: {
-        auto* m = e->as<MemberExpr>();
-        genMemberBase(m);
-        as_.addImm(RAX, static_cast<int32_t>(m->offset));
-        break;
-    }
-    default:
-        genExpr(e);   // aggregate rvalues evaluate to the address of a temporary
-        break;
-    }
-}
-
-void CodeGen::genMemberBase(MemberExpr* m) {
-    if (m->throughPointer) genExpr(m->base);
-    else genAddr(m->base);
-}
-
-void CodeGen::genIndexAddr(IndexExpr* e) {
-    Type* bt = e->base->type;
-    uint32_t elemSize = bt->elem->size;
-    if (bt->isArray()) genAddr(e->base);
-    else genExpr(e->base);
-
-    if (e->index->kind == ExprKind::IntLit) {
-        int64_t off = static_cast<int64_t>(e->index->as<IntLitExpr>()->value) * elemSize;
-        if (off >= INT32_MIN && off <= INT32_MAX) {
-            as_.addImm(RAX, static_cast<int32_t>(off));
-            return;
-        }
-    }
-    if (!simpleInto(e->index, RCX)) {
-        int32_t t = allocTemp8();
-        as_.store(Mem::at(RBP, t), RAX, 8);
-        genExpr(e->index);
-        as_.movRR(RCX, RAX);
-        as_.load(RAX, Mem::at(RBP, t), 8, false);
-    }
-    if (elemSize != 1) as_.imulImm(RCX, RCX, static_cast<int32_t>(elemSize));
-    as_.add(RAX, RCX);
-}
-
 Cond CodeGen::genCompareFlags(BinaryExpr* e) {
     Type* t = e->lhs->type;
     if (t->isFloat()) {
-        genOperandsFloat(e->lhs, e->rhs);
-        as_.ucomis(XMM0, XMM1, t->size == 4);
+        auto [a, b] = genOperandsFloat(e->lhs, e->rhs, false);
+        as_.ucomis(a, b, t->size == 4);
         return condFor(e->op, false, true);
     }
-    genOperandsInt(e->lhs, e->rhs);
-    as_.cmp(RAX, RCX);
-    return condFor(e->op, isSignedInt(t), false);
+    bool s = isSignedInt(t);
+    if (e->rhs->kind == ExprKind::IntLit && fitsInt32(e->rhs->as<IntLitExpr>()->value)) {
+        auto imm = static_cast<int32_t>(e->rhs->as<IntLitExpr>()->value);
+        int l = regOf(e->lhs);
+        Reg a = RAX;
+        if (l >= 0) a = static_cast<Reg>(l);
+        else genExpr(e->lhs);
+        if (imm == 0 && (e->op == BinaryOp::Eq || e->op == BinaryOp::Ne)) as_.test(a, a);
+        else as_.cmpImm(a, imm);
+        return condFor(e->op, s, false);
+    }
+    auto [a, b] = genOperandsInt(e->lhs, e->rhs, false);
+    as_.cmp(a, b);
+    return condFor(e->op, s, false);
 }
 
 void CodeGen::genBinary(BinaryExpr* e) {
@@ -710,24 +1063,17 @@ void CodeGen::genBinary(BinaryExpr* e) {
 
     Type* t = e->type;
     if (t->isFloat()) {
-        genOperandsFloat(e->lhs, e->rhs);
-        bool f32 = t->size == 4;
-        switch (e->op) {
-        case BinaryOp::Add: as_.addS(XMM0, XMM1, f32); break;
-        case BinaryOp::Sub: as_.subS(XMM0, XMM1, f32); break;
-        case BinaryOp::Mul: as_.mulS(XMM0, XMM1, f32); break;
-        case BinaryOp::Div: as_.divS(XMM0, XMM1, f32); break;
-        default: break;
-        }
+        auto [a, b] = genOperandsFloat(e->lhs, e->rhs);
+        emitFloatOp(e->op, t->size == 4, a, b);
         return;
     }
 
     Type* lt = e->lhs->type;
     if (lt->isPointer()) {
-        genOperandsInt(e->lhs, e->rhs);
         uint32_t s = lt->elem->size;
         if (e->rhs->type->isPointer()) {   // ptr - ptr = element count
-            as_.sub(RAX, RCX);
+            auto [a, b] = genOperandsInt(e->lhs, e->rhs);
+            as_.sub(a, b);
             if (s != 1) {
                 as_.movRI(RCX, s);
                 as_.cqo();
@@ -735,14 +1081,35 @@ void CodeGen::genBinary(BinaryExpr* e) {
             }
             return;
         }
-        if (s != 1) as_.imulImm(RCX, RCX, static_cast<int32_t>(s));
-        if (e->op == BinaryOp::Add) as_.add(RAX, RCX);
-        else as_.sub(RAX, RCX);
+        if (e->rhs->kind == ExprKind::IntLit) {
+            int64_t off = static_cast<int64_t>(e->rhs->as<IntLitExpr>()->value) * s;
+            if (off >= INT32_MIN && off <= INT32_MAX) {
+                genExpr(e->lhs);
+                if (e->op == BinaryOp::Add) as_.addImm(RAX, static_cast<int32_t>(off));
+                else as_.subImm(RAX, static_cast<int32_t>(off));
+                return;
+            }
+        }
+        auto [a, b] = genOperandsInt(e->lhs, e->rhs);
+        if (s != 1) {
+            as_.imulImm(RCX, b, static_cast<int32_t>(s));
+            b = RCX;
+        }
+        if (e->op == BinaryOp::Add) as_.add(a, b);
+        else as_.sub(a, b);
         return;
     }
 
-    genOperandsInt(e->lhs, e->rhs);
-    emitIntOp(e->op, t);
+    if (e->rhs->kind == ExprKind::IntLit) {
+        genExpr(e->lhs);
+        if (emitIntOpImm(e->op, t, RAX, e->rhs)) return;
+        simpleInto(e->rhs, RCX);
+        emitIntOp(e->op, t, RCX);
+        return;
+    }
+    auto [a, b] = genOperandsInt(e->lhs, e->rhs);
+    (void)a;
+    emitIntOp(e->op, t, b);
 }
 
 void CodeGen::genUnary(UnaryExpr* e) {
@@ -776,8 +1143,7 @@ void CodeGen::genUnary(UnaryExpr* e) {
         genAddr(e->operand);
         return;
     case UnaryOp::Deref:
-        genExpr(e->operand);
-        loadValue(t, Mem::at(RAX, 0));
+        loadValue(t, genMem(e));
         return;
     default:
         genIncDec(e);
@@ -789,82 +1155,171 @@ void CodeGen::genIncDec(UnaryExpr* e) {
     Type* t = e->operand->type;
     bool inc = e->op == UnaryOp::PreInc || e->op == UnaryOp::PostInc;
     bool post = e->op == UnaryOp::PostInc || e->op == UnaryOp::PostDec;
-    genAddr(e->operand);
-    as_.movRR(R10, RAX);
+    int32_t step = t->isPointer() ? static_cast<int32_t>(t->elem->size) : 1;
+    bool f32 = t->size == 4;
+    auto one = [&] { return Mem::ripRel(Section::Rdata, f32 ? addF32(1.0f) : addF64(1.0)); };
+
+    // Register variable
+    LocalVar* v = e->operand->kind == ExprKind::Ident ? e->operand->as<IdentExpr>()->local : nullptr;
+    if (v && v->reg >= 0) {
+        if (t->isFloat()) {
+            auto x = static_cast<Xmm>(v->reg);
+            if (post) as_.movaps(XMM0, x);
+            as_.movsLoad(XMM1, one(), f32);
+            if (inc) as_.addS(x, XMM1, f32);
+            else as_.subS(x, XMM1, f32);
+            if (!post) as_.movaps(XMM0, x);
+            return;
+        }
+        auto r = static_cast<Reg>(v->reg);
+        if (post) as_.movRR(RAX, r);
+        if (inc) as_.addImm(r, step);
+        else as_.subImm(r, step);
+        normalize(t, r);
+        if (!post) as_.movRR(RAX, r);
+        return;
+    }
+
+    Mem m;
+    if (!stableMem(e->operand, m)) {
+        genAddr(e->operand);
+        as_.movRR(R10, RAX);
+        m = Mem::at(R10, 0);
+    }
     if (t->isFloat()) {
-        bool f32 = t->size == 4;
-        as_.movsLoad(XMM0, Mem::at(R10, 0), f32);
-        as_.movsLoad(XMM1, Mem::ripRel(Section::Rdata, f32 ? addF32(1.0f) : addF64(1.0)), f32);
+        as_.movsLoad(XMM0, m, f32);
+        as_.movsLoad(XMM1, one(), f32);
         if (post) as_.movaps(XMM2, XMM0);
         if (inc) as_.addS(XMM0, XMM1, f32);
         else as_.subS(XMM0, XMM1, f32);
-        as_.movsStore(Mem::at(R10, 0), XMM0, f32);
+        as_.movsStore(m, XMM0, f32);
         if (post) as_.movaps(XMM0, XMM2);
         return;
     }
-    int32_t step = t->isPointer() ? static_cast<int32_t>(t->elem->size) : 1;
-    as_.load(RAX, Mem::at(R10, 0), t->size, isSignedInt(t));
-    as_.movRR(RCX, RAX);
+    as_.load(RAX, m, t->size, isSignedInt(t));
+    as_.movRR(RDX, RAX);
     if (inc) as_.addImm(RAX, step);
     else as_.subImm(RAX, step);
     normalize(t);
-    as_.store(Mem::at(R10, 0), RAX, t->size);
-    if (post) as_.movRR(RAX, RCX);
+    as_.store(m, RAX, t->size);
+    if (post) as_.movRR(RAX, RDX);
 }
 
 void CodeGen::genAssign(AssignExpr* e) {
     Type* t = e->target->type;
+    bool f32 = t->size == 4;
 
-    // Fast path: plain assignment to a local variable.
-    if (!e->compound && e->target->kind == ExprKind::Ident) {
-        auto* id = e->target->as<IdentExpr>();
-        if (id->local && !id->local->indirect) {
-            genExpr(e->value);
-            storeValue(t, localMem(id->local));
-            if (t->isAggregate()) as_.lea(RAX, localMem(id->local));
+    // Target is a register variable.
+    LocalVar* v = e->target->kind == ExprKind::Ident ? e->target->as<IdentExpr>()->local : nullptr;
+    if (v && v->reg >= 0) {
+        if (t->isFloat()) {
+            auto x = static_cast<Xmm>(v->reg);
+            if (!e->compound) {
+                genExpr(e->value);
+                as_.movaps(x, XMM0);
+                return;
+            }
+            Xmm src;
+            int vx = xmmOf(e->value);
+            if (vx >= 0) {
+                src = static_cast<Xmm>(vx);
+            } else if (isSimpleFloat(e->value)) {
+                simpleFloatInto(e->value, XMM1);
+                src = XMM1;
+            } else {
+                genExpr(e->value);
+                src = XMM0;
+            }
+            emitFloatOp(e->op, f32, x, src);
+            as_.movaps(XMM0, x);
             return;
         }
+        auto r = static_cast<Reg>(v->reg);
+        if (!e->compound) {
+            genExpr(e->value);
+            as_.movRR(r, RAX);
+            return;
+        }
+        if (t->isPointer()) {
+            uint32_t s = t->elem->size;
+            genExpr(e->value);
+            if (s != 1) as_.imulImm(RAX, RAX, static_cast<int32_t>(s));
+            if (e->op == BinaryOp::Add) as_.add(r, RAX);
+            else as_.sub(r, RAX);
+            as_.movRR(RAX, r);
+            return;
+        }
+        if (emitIntOpImm(e->op, t, r, e->value)) {
+            as_.movRR(RAX, r);
+            return;
+        }
+        int vr = regOf(e->value);
+        bool simpleOp = e->op == BinaryOp::Add || e->op == BinaryOp::Sub || e->op == BinaryOp::BitAnd ||
+                        e->op == BinaryOp::BitOr || e->op == BinaryOp::BitXor || e->op == BinaryOp::Mul;
+        if (simpleOp) {
+            Reg src;
+            if (vr >= 0) {
+                src = static_cast<Reg>(vr);
+            } else {
+                genExpr(e->value);
+                src = RAX;
+            }
+            switch (e->op) {
+            case BinaryOp::Add: as_.add(r, src); break;
+            case BinaryOp::Sub: as_.sub(r, src); break;
+            case BinaryOp::BitAnd: as_.and_(r, src); break;
+            case BinaryOp::BitOr: as_.or_(r, src); break;
+            case BinaryOp::BitXor: as_.xor_(r, src); break;
+            default: as_.imul(r, src); break;
+            }
+            normalize(t, r);
+            as_.movRR(RAX, r);
+            return;
+        }
+        genExpr(e->value);
+        as_.movRR(RCX, RAX);
+        as_.movRR(RAX, r);
+        emitIntOp(e->op, t, RCX);
+        as_.movRR(r, RAX);
+        return;
     }
 
-    genAddr(e->target);
-    int32_t addrSlot = allocTemp8();
-    as_.store(Mem::at(RBP, addrSlot), RAX, 8);
-    genExpr(e->value);
+    // Stable memory target ([rbp+x], [reg+idx*s]): evaluate the value, then store directly.
+    Mem m;
+    bool stable = stableMem(e->target, m);
+    if (!stable) {
+        genAddr(e->target);
+        int32_t addrSlot = allocTemp8();
+        as_.store(Mem::at(RBP, addrSlot), RAX, 8);
+        genExpr(e->value);
+        as_.load(R10, Mem::at(RBP, addrSlot), 8, false);
+        m = Mem::at(R10, 0);
+    } else {
+        genExpr(e->value);
+    }
 
     if (!e->compound) {
-        as_.load(R10, Mem::at(RBP, addrSlot), 8, false);
-        storeValue(t, Mem::at(R10, 0));
-        if (t->isAggregate()) as_.movRR(RAX, R10);
+        storeValue(t, m);
+        if (t->isAggregate()) as_.lea(RAX, m);
         return;
     }
-
     if (t->isFloat()) {
-        bool f32 = t->size == 4;
         as_.movaps(XMM1, XMM0);
-        as_.load(R10, Mem::at(RBP, addrSlot), 8, false);
-        as_.movsLoad(XMM0, Mem::at(R10, 0), f32);
-        switch (e->op) {
-        case BinaryOp::Add: as_.addS(XMM0, XMM1, f32); break;
-        case BinaryOp::Sub: as_.subS(XMM0, XMM1, f32); break;
-        case BinaryOp::Mul: as_.mulS(XMM0, XMM1, f32); break;
-        case BinaryOp::Div: as_.divS(XMM0, XMM1, f32); break;
-        default: break;
-        }
-        as_.movsStore(Mem::at(R10, 0), XMM0, f32);
+        as_.movsLoad(XMM0, m, f32);
+        emitFloatOp(e->op, f32, XMM0, XMM1);
+        as_.movsStore(m, XMM0, f32);
         return;
     }
-
     as_.movRR(RCX, RAX);
-    as_.load(R10, Mem::at(RBP, addrSlot), 8, false);
-    as_.load(RAX, Mem::at(R10, 0), t->size, isSignedInt(t));
+    as_.load(RAX, m, t->size, isSignedInt(t));
     if (t->isPointer()) {
         if (t->elem->size != 1) as_.imulImm(RCX, RCX, static_cast<int32_t>(t->elem->size));
         if (e->op == BinaryOp::Add) as_.add(RAX, RCX);
         else as_.sub(RAX, RCX);
     } else {
-        emitIntOp(e->op, t);   // preserves R10 (div only clobbers RDX)
+        emitIntOp(e->op, t, RCX);   // only clobbers RDX besides RAX/RCX
     }
-    as_.store(Mem::at(R10, 0), RAX, t->size);
+    as_.store(m, RAX, t->size);
 }
 
 void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
@@ -875,10 +1330,17 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
 
     int32_t retSlot = hidden ? allocSlot(rt->size, std::max<uint32_t>(rt->align, 8)) : 0;
 
-    // Evaluate every argument into a temporary first (later arguments may contain calls).
-    std::vector<int32_t> slots(args.size());
+    // Arguments that can be re-read for free (literals, variables) are loaded
+    // straight into their argument register later; others are evaluated into
+    // temporaries first, since later arguments may contain calls.
+    std::vector<int32_t> slots(args.size(), 0);
+    std::vector<bool> deferred(args.size(), false);
     for (size_t i = 0; i < args.size(); ++i) {
         Type* pt = f->paramTypes[i];
+        if (pt->isFloat() ? isSimpleFloat(args[i]) : (pt->isScalar() && isSimple(args[i]))) {
+            deferred[i] = true;
+            continue;
+        }
         genExpr(args[i]);
         slots[i] = allocTemp8();
         Mem slot = Mem::at(RBP, slots[i]);
@@ -890,7 +1352,7 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
             } else {
                 // Large structs are passed as a pointer to a caller-owned copy.
                 int32_t copy = allocSlot(pt->size, std::max<uint32_t>(pt->align, 8));
-                copyMem(RBP, copy, RAX, 0, pt->size);
+                copyMem(Mem::at(RBP, copy), Mem::at(RAX, 0), pt->size);
                 as_.lea(RAX, Mem::at(RBP, copy));
             }
             as_.store(slot, RAX, 8);
@@ -899,16 +1361,34 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
         }
     }
 
-    for (size_t k = 0; k < n; ++k) {
+    // Stack arguments first: they go through RAX/XMM0, which hold register arguments later.
+    std::vector<size_t> order;
+    for (size_t k = 4; k < n; ++k) order.push_back(k);
+    for (size_t k = 0; k < n && k < 4; ++k) order.push_back(k);
+    for (size_t k : order) {
         if (hidden && k == 0) {
             as_.lea(RCX, Mem::at(RBP, retSlot));
             continue;
         }
         size_t i = k - (hidden ? 1 : 0);
         Type* pt = f->paramTypes[i];
+        bool f32 = pt->size == 4;
+        if (deferred[i]) {
+            if (k < 4) {
+                if (pt->isFloat()) simpleFloatInto(args[i], static_cast<Xmm>(k));
+                else simpleInto(args[i], kArgRegs[k]);
+            } else if (pt->isFloat()) {
+                simpleFloatInto(args[i], XMM0);
+                as_.movsStore(Mem::at(RSP, static_cast<int32_t>(8 * k)), XMM0, f32);
+            } else {
+                simpleInto(args[i], RAX);
+                as_.store(Mem::at(RSP, static_cast<int32_t>(8 * k)), RAX, 8);
+            }
+            continue;
+        }
         Mem slot = Mem::at(RBP, slots[i]);
         if (k < 4) {
-            if (pt->isFloat()) as_.movsLoad(static_cast<Xmm>(k), slot, pt->size == 4);
+            if (pt->isFloat()) as_.movsLoad(static_cast<Xmm>(k), slot, f32);
             else as_.load(kArgRegs[k], slot, 8, false);
         } else {
             as_.load(RAX, slot, 8, false);
@@ -934,18 +1414,26 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
 void CodeGen::genCast(CastExpr* e) {
     Type* from = e->operand->type;
     Type* to = e->type;
-    genExpr(e->operand);
-    if (from == to) return;
-
+    if (to->isFloat() && from->isFloat()) {
+        int x = xmmOf(e->operand);
+        if (x >= 0) as_.movaps(XMM0, static_cast<Xmm>(x));
+        else genExpr(e->operand);
+        if (from->size == 4 && to->size == 8) as_.cvtss2sd(XMM0, XMM0);
+        else if (from->size == 8 && to->size == 4) as_.cvtsd2ss(XMM0, XMM0);
+        return;
+    }
     if (to->isFloat()) {
-        if (from->isFloat()) {
-            if (from->size == 4 && to->size == 8) as_.cvtss2sd(XMM0, XMM0);
-            else if (from->size == 8 && to->size == 4) as_.cvtsd2ss(XMM0, XMM0);
+        int r = regOf(e->operand);
+        if (r >= 0) {
+            as_.cvtsi2s(XMM0, static_cast<Reg>(r), to->size == 4);
         } else {
+            genExpr(e->operand);
             as_.cvtsi2s(XMM0, RAX, to->size == 4);
         }
         return;
     }
+    genExpr(e->operand);
+    if (from == to) return;
     if (from->isFloat()) {
         if (to->isBool()) {
             as_.xorps(XMM1, XMM1);
@@ -971,8 +1459,11 @@ void CodeGen::genCast(CastExpr* e) {
 void CodeGen::genStructLit(StructLitExpr* e) {
     Type* t = e->type;
     int32_t slot = allocSlot(t->size, std::max<uint32_t>(t->align, 8));
-    zeroMem(RBP, slot, t->size);
     StructDecl* s = t->structDecl;
+    // Zero only when padding or omitted fields could stay uninitialized.
+    uint32_t covered = 0;
+    for (const FieldDecl& f : s->fields) covered += f.type ? f.type->size : 0;
+    if (e->fields.empty() || covered != t->size) zeroMem(Mem::at(RBP, slot), t->size);
     for (size_t i = 0; i < e->fields.size(); ++i) {
         genExpr(e->fields[i]);
         storeValue(s->fields[i].type, Mem::at(RBP, slot + static_cast<int32_t>(s->fields[i].offset)));

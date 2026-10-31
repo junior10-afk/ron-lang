@@ -20,8 +20,8 @@ void Assembler::patch32(uint32_t at, uint32_t v) {
 
 // REX prefix: 0100WRXB. `forceForByteRegs` is needed to address spl/bpl/sil/dil
 // instead of ah/ch/dh/bh when an 8-bit register operand is 4..7.
-void Assembler::rex(bool w, unsigned reg, unsigned base, bool forceForByteRegs) {
-    uint8_t r = 0x40 | (w ? 8 : 0) | ((reg & 8) ? 4 : 0) | ((base & 8) ? 1 : 0);
+void Assembler::rex(bool w, unsigned reg, unsigned base, bool forceForByteRegs, unsigned index) {
+    uint8_t r = 0x40 | (w ? 8 : 0) | ((reg & 8) ? 4 : 0) | ((index & 8) ? 2 : 0) | ((base & 8) ? 1 : 0);
     if (r != 0x40 || forceForByteRegs) byte(r);
 }
 
@@ -34,11 +34,17 @@ void Assembler::modrmMem(unsigned reg, const Mem& m) {
     }
     unsigned base = m.base & 7;
     uint8_t mod;
-    if (m.disp == 0 && base != RBP) mod = 0;
+    if (m.disp == 0 && base != RBP) mod = 0;   // rbp/r13 as base always need a displacement
     else if (m.disp >= -128 && m.disp <= 127) mod = 1;
     else mod = 2;
-    byte(static_cast<uint8_t>((mod << 6) | ((reg & 7) << 3) | base));
-    if (base == RSP) byte(0x24);   // SIB: no index, base = rsp/r12
+    if (m.hasIndex()) {
+        uint8_t ss = m.scale == 8 ? 3 : m.scale == 4 ? 2 : m.scale == 2 ? 1 : 0;
+        byte(static_cast<uint8_t>((mod << 6) | ((reg & 7) << 3) | 4));   // rm=100: SIB follows
+        byte(static_cast<uint8_t>((ss << 6) | ((m.index & 7) << 3) | base));
+    } else {
+        byte(static_cast<uint8_t>((mod << 6) | ((reg & 7) << 3) | base));
+        if (base == RSP) byte(0x24);   // SIB: no index, base = rsp/r12
+    }
     if (mod == 1) byte(static_cast<uint8_t>(static_cast<int8_t>(m.disp)));
     else if (mod == 2) dword(static_cast<uint32_t>(m.disp));
 }
@@ -46,7 +52,7 @@ void Assembler::modrmMem(unsigned reg, const Mem& m) {
 void Assembler::emitRM(uint8_t legacy, bool w, std::initializer_list<uint8_t> opcode, unsigned reg,
                        const Mem& m, bool byteRegs) {
     if (legacy) byte(legacy);
-    rex(w, reg, m.rip ? 0 : m.base, byteRegs && (reg & 7) >= 4 && reg < 8);
+    rex(w, reg, m.rip ? 0 : m.base, byteRegs && (reg & 7) >= 4 && reg < 8, m.hasIndex() ? m.index : 0);
     for (uint8_t b : opcode) byte(b);
     modrmMem(reg, m);
 }
@@ -235,6 +241,20 @@ void Assembler::cmpImm(Reg a, int32_t imm) {
     }
 }
 
+void Assembler::aluImm(unsigned ext, Reg dst, int32_t imm) {
+    if (imm >= -128 && imm <= 127) {
+        emitRR(0, true, {0x83}, ext, dst);
+        byte(static_cast<uint8_t>(static_cast<int8_t>(imm)));
+    } else {
+        emitRR(0, true, {0x81}, ext, dst);
+        dword(static_cast<uint32_t>(imm));
+    }
+}
+
+void Assembler::andImm(Reg dst, int32_t imm) { aluImm(4, dst, imm); }
+void Assembler::orImm(Reg dst, int32_t imm) { aluImm(1, dst, imm); }
+void Assembler::xorImm(Reg dst, int32_t imm) { aluImm(6, dst, imm); }
+
 void Assembler::xorImm8(Reg dst, int8_t imm) {
     emitRR(0, true, {0x83}, 6, dst);
     byte(static_cast<uint8_t>(imm));
@@ -252,6 +272,9 @@ void Assembler::not_(Reg r) { emitRR(0, true, {0xF7}, 2, r); }
 void Assembler::shlCl(Reg r) { emitRR(0, true, {0xD3}, 4, r); }
 void Assembler::shrCl(Reg r) { emitRR(0, true, {0xD3}, 5, r); }
 void Assembler::sarCl(Reg r) { emitRR(0, true, {0xD3}, 7, r); }
+void Assembler::shlImm(Reg r, uint8_t n) { emitRR(0, true, {0xC1}, 4, r); byte(n); }
+void Assembler::shrImm(Reg r, uint8_t n) { emitRR(0, true, {0xC1}, 5, r); byte(n); }
+void Assembler::sarImm(Reg r, uint8_t n) { emitRR(0, true, {0xC1}, 7, r); byte(n); }
 
 void Assembler::setcc(Cond c, Reg r) { emitRR(0, false, {0x0F, static_cast<uint8_t>(0x90 | c)}, 0, r, true); }
 
@@ -295,6 +318,8 @@ void Assembler::movsStore(const Mem& m, Xmm src, bool f32) { emitRM(f32 ? 0xF3 :
 void Assembler::movaps(Xmm dst, Xmm src) {
     if (dst != src) emitRR(0, false, {0x0F, 0x28}, dst, src);
 }
+void Assembler::movupsLoad(Xmm dst, const Mem& m) { emitRM(0, false, {0x0F, 0x10}, dst, m); }
+void Assembler::movupsStore(const Mem& m, Xmm src) { emitRM(0, false, {0x0F, 0x11}, src, m); }
 void Assembler::xorps(Xmm dst, Xmm src) { emitRR(0, false, {0x0F, 0x57}, dst, src); }
 void Assembler::addS(Xmm dst, Xmm src, bool f32) { emitRR(f32 ? 0xF3 : 0xF2, false, {0x0F, 0x58}, dst, src); }
 void Assembler::mulS(Xmm dst, Xmm src, bool f32) { emitRR(f32 ? 0xF3 : 0xF2, false, {0x0F, 0x59}, dst, src); }

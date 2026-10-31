@@ -1,0 +1,85 @@
+// CPU benchmark: recursion, integer loops, float math and memory access.
+// Run: ronc run examples/benchmark.ron
+
+import "std/io.ron";
+import "std/time.ron";
+import "std/math.ron";
+import "std/mem.ron";
+
+fn fib(int n) -> int {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+// Count primes below n with a sieve
+fn sieve(int n) -> int {
+    u8* composite = alloc(n as u64);
+    int count = 0;
+    for (int i = 2; i < n; i++) {
+        if (composite[i] != 0) continue;
+        count++;
+        for (int j = i * 2; j < n; j += i) composite[j] = 1;
+    }
+    free(composite);
+    return count;
+}
+
+// Simple n-body style float workload
+fn nbody(int steps) -> float {
+    Vec3[64] pos;
+    Vec3[64] vel;
+    for (int i = 0; i < 64; i++) {
+        float f = i as float;
+        pos[i] = vec3(sin(f) * 10.0, cos(f * 1.3) * 10.0, sin(f * 0.7) * 10.0);
+    }
+    for (int s = 0; s < steps; s++) {
+        for (int i = 0; i < 64; i++) {
+            float ax = 0.0;
+            float ay = 0.0;
+            float az = 0.0;
+            for (int j = 0; j < 64; j++) {
+                float dx = pos[j].x - pos[i].x;
+                float dy = pos[j].y - pos[i].y;
+                float dz = pos[j].z - pos[i].z;
+                float d2 = dx * dx + dy * dy + dz * dz + 0.01;
+                float inv = 1.0 / (d2 * sqrt(d2));
+                ax += dx * inv;
+                ay += dy * inv;
+                az += dz * inv;
+            }
+            vel[i].x += ax * 0.001;
+            vel[i].y += ay * 0.001;
+            vel[i].z += az * 0.001;
+        }
+        for (int i = 0; i < 64; i++) pos[i] = pos[i] + vel[i] * 0.01;
+    }
+    return pos[0].x;
+}
+
+fn report(u8* name, f64 seconds) {
+    print(name);
+    print(": ");
+    print((seconds * 1000.0) as i64);
+    println(" ms");
+}
+
+fn main() -> int {
+    f64 t0 = now();
+    int f = fib(32);
+    f64 t1 = now();
+    int primes = sieve(20000000);
+    f64 t2 = now();
+    float p = nbody(400);
+    f64 t3 = now();
+    report("fib(32)         ", t1 - t0);
+    report("sieve(20M)      ", t2 - t1);
+    report("nbody(64 x 400) ", t3 - t2);
+    report("total           ", t3 - t0);
+    print("checks: ");
+    print(f);
+    print(" ");
+    print(primes);
+    print(" ");
+    println(p as f64);
+    return 0;
+}

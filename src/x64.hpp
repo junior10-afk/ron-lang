@@ -27,16 +27,24 @@ inline Cond invert(Cond c) { return static_cast<Cond>(c ^ 1); }
 // Sections a RIP-relative operand can point into.
 enum class Section : uint8_t { Text, Rdata, Data, Import };
 
-// Memory operand: [base + disp] or [rip + target-in-section].
+constexpr uint8_t NO_INDEX = 0xFF;
+
+// Memory operand: [base + index*scale + disp] or [rip + target-in-section].
 struct Mem {
     bool rip = false;
     Reg base = RAX;
     int32_t disp = 0;
     Section section = Section::Rdata;
     uint32_t target = 0;   // offset in section (or import slot index)
+    uint8_t index = NO_INDEX;
+    uint8_t scale = 1;     // 1, 2, 4 or 8
 
     static Mem at(Reg base, int32_t disp = 0) { return Mem{false, base, disp, Section::Rdata, 0}; }
+    static Mem indexed(Reg base, Reg index, uint8_t scale, int32_t disp = 0) {
+        return Mem{false, base, disp, Section::Rdata, 0, static_cast<uint8_t>(index), scale};
+    }
     static Mem ripRel(Section s, uint32_t target) { return Mem{true, RAX, 0, s, target}; }
+    bool hasIndex() const { return index != NO_INDEX; }
 };
 
 // A RIP-relative disp32 to patch once section addresses are known.
@@ -88,6 +96,9 @@ public:
     void subImm(Reg dst, int32_t imm);
     void subImm32Patchable(Reg dst, uint32_t& immOffset);   // always uses a 32-bit immediate
     void cmpImm(Reg a, int32_t imm);
+    void andImm(Reg dst, int32_t imm);
+    void orImm(Reg dst, int32_t imm);
+    void xorImm(Reg dst, int32_t imm);
     void xorImm8(Reg dst, int8_t imm);
     void cqo();
     void idiv(Reg r);
@@ -97,6 +108,9 @@ public:
     void shlCl(Reg r);
     void shrCl(Reg r);
     void sarCl(Reg r);
+    void shlImm(Reg r, uint8_t n);
+    void shrImm(Reg r, uint8_t n);
+    void sarImm(Reg r, uint8_t n);
     void setcc(Cond c, Reg r);   // r8 = cond ? 1 : 0
     void testMem32(const Mem& m);   // test [m], eax (used for stack probes)
 
@@ -114,6 +128,8 @@ public:
     void movsLoad(Xmm dst, const Mem& m, bool f32);
     void movsStore(const Mem& m, Xmm src, bool f32);
     void movaps(Xmm dst, Xmm src);
+    void movupsLoad(Xmm dst, const Mem& m);     // full 128-bit (callee-saved xmm6-15)
+    void movupsStore(const Mem& m, Xmm src);
     void xorps(Xmm dst, Xmm src);
     void addS(Xmm dst, Xmm src, bool f32);
     void subS(Xmm dst, Xmm src, bool f32);
@@ -140,7 +156,8 @@ private:
         std::vector<uint32_t> refs;
     };
 
-    void rex(bool w, unsigned reg, unsigned base, bool forceForByteRegs);
+    void rex(bool w, unsigned reg, unsigned base, bool forceForByteRegs, unsigned index = 0);
+    void aluImm(unsigned ext, Reg dst, int32_t imm);
     void modrmMem(unsigned reg, const Mem& m);
     void emitRM(uint8_t legacy, bool w, std::initializer_list<uint8_t> opcode, unsigned reg, const Mem& m,
                 bool byteRegs = false);

@@ -73,12 +73,24 @@ private:
     void genCast(CastExpr* e);
     void genStructLit(StructLitExpr* e);
     void genIncDec(UnaryExpr* e);
-    void genIndexAddr(IndexExpr* e);
-    void genMemberBase(MemberExpr* e);
+    Mem genMem(Expr* e);                              // lvalue / aggregate → memory operand
+    Mem genIndexMem(IndexExpr* e);
+    bool stableMem(Expr* e, Mem& out);                // address without emitting code, if possible
     x64::Cond genCompareFlags(BinaryExpr* e);
-    void genOperandsInt(Expr* lhs, Expr* rhs);       // lhs → RAX, rhs → RCX
-    void genOperandsFloat(Expr* lhs, Expr* rhs);     // lhs → XMM0, rhs → XMM1
-    void emitIntOp(BinaryOp op, Type* t);            // RAX = RAX op RCX
+    // Evaluate both operands; returns the registers holding them. With lhsInAcc the
+    // left operand is in RAX / XMM0 (ready to be overwritten by the result).
+    std::pair<Reg, Reg> genOperandsInt(Expr* lhs, Expr* rhs, bool lhsInAcc = true);
+    std::pair<Xmm, Xmm> genOperandsFloat(Expr* lhs, Expr* rhs, bool lhsInAcc = true);
+    void emitIntOp(BinaryOp op, Type* t, Reg rhs);   // RAX = RAX op rhs
+    void emitFloatOp(BinaryOp op, bool f32, Xmm dst, Xmm src);
+    bool emitIntOpImm(BinaryOp op, Type* t, Reg dst, Expr* rhs);   // dst op= literal, if encodable
+
+    // Register allocation
+    void allocateRegisters(FuncDecl* f);
+    int regOf(Expr* e) const;      // GPR holding this integer/pointer variable, or -1
+    int xmmOf(Expr* e) const;      // XMM register holding this float variable, or -1
+    bool isSimple(Expr* e) const;
+    bool isSimpleFloat(Expr* e) const;
 
     // Helpers
     bool simpleInto(Expr* e, Reg r);    // load trivially computable operands without temporaries
@@ -86,9 +98,13 @@ private:
     void loadValue(Type* t, const Mem& m);           // into RAX / XMM0 / address in RAX
     void storeValue(Type* t, const Mem& m);          // from RAX / XMM0 / address in RAX
     void normalize(Type* t, Reg r = x64::RAX);       // re-extend a narrow integer after arithmetic
-    void copyMem(Reg dst, int32_t dstDisp, Reg src, int32_t srcDisp, uint32_t size);
-    void zeroMem(Reg base, int32_t disp, uint32_t size);
+    void copyMem(const Mem& dst, const Mem& src, uint32_t size);
+    void zeroMem(const Mem& dst, uint32_t size);
     Mem localMem(LocalVar* v) const { return Mem::at(x64::RBP, v->frameOffset); }
+    static void addDisp(Mem& m, int32_t d) {
+        if (m.rip) m.target += static_cast<uint32_t>(d);
+        else m.disp += d;
+    }
     static bool isRegSize(uint32_t size) { return size == 1 || size == 2 || size == 4 || size == 8; }
     static bool passedByRef(Type* t) { return t->isAggregate() && !isRegSize(t->size); }
     static x64::Cond condFor(BinaryOp op, bool isSigned, bool isFloat);
@@ -111,6 +127,8 @@ private:
     int32_t maxOutgoing_ = 32;
     x64::Label epilogue_ = 0;
     bool hiddenReturn_ = false;
+    std::vector<std::pair<Reg, int32_t>> savedGprs_;   // callee-saved registers and their save slots
+    std::vector<std::pair<Xmm, int32_t>> savedXmms_;
     struct Loop {
         x64::Label breakLabel;
         x64::Label continueLabel;
