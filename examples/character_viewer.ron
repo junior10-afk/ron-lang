@@ -1,0 +1,51 @@
+// Shows the rigged glTF character playing its idle, walk and run animations,
+// plus a fourth copy that continuously cross-fades between walk and run.
+// Run from the repository root:  ronc run examples/character_viewer.ron
+
+import "std/engine.ron";
+import "std/io.ron";
+
+fn main() -> int {
+    if (!engine_init(1280, 720, "Ron - character viewer")) return 1;
+    int model = engine_model_load("assets/character.glb");
+    if (model < 0) model = engine_model_load("../assets/character.glb");
+    if (model < 0) model = engine_model_load("../../assets/character.glb");
+    if (model < 0) {
+        println("assets/character.glb not found");
+        return 1;
+    }
+    int idle = engine_model_find_animation(model, "idle");
+    int walk = engine_model_find_animation(model, "walk");
+    int run = engine_model_find_animation(model, "run");
+    int floor_mesh = engine_mesh_plane(30.0);
+    int pedestal = engine_mesh_cube();
+
+    OrbitCamera cam = orbit_camera(vec3(0.0, 0.9, 0.0), 5.5);
+    cam.yaw = 0.35;
+    cam.pitch = 0.12;
+    engine_set_light(-0.4, -1.0, -0.6, 2.4);
+
+    while (engine_running()) {
+        float t = engine_time() as float;
+        cam.update();
+        cam.apply();
+        if (engine_begin_frame(0.45, 0.55, 0.7)) {
+            Mat4 ground = mat4_identity();
+            engine_draw_checker(floor_mesh, &ground, 0.6, 0.6, 0.62);
+
+            for (int i = 0; i < 4; i++) {
+                float x = -2.4 + (i as float) * 1.6;
+                Mat4 base = mat4_translate(vec3(x, 0.05, 0.0)) * mat4_scale(vec3(1.0, 0.1, 1.0));
+                draw(pedestal, base, material(rgb(0.3, 0.32, 0.36), 0.4, 1.0));
+                Mat4 m = mat4_translate(vec3(x, 0.1, 0.0)) * mat4_rotate_y(0.4);
+                if (i == 0) engine_draw_model(model, &m, idle, t);
+                if (i == 1) engine_draw_model(model, &m, walk, t);
+                if (i == 2) engine_draw_model(model, &m, run, t);
+                if (i == 3) engine_draw_model_blend(model, &m, walk, t, run, t * 1.6, sin(t) * 0.5 + 0.5);
+            }
+            engine_end_frame();
+        }
+    }
+    engine_shutdown();
+    return 0;
+}

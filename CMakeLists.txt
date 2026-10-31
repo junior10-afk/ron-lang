@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(Ron LANGUAGES CXX)
+enable_testing()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,7 +52,6 @@ else()
 endif()
 
 # ─── Tests ───
-enable_testing()
 add_executable(ron_tests
     tests/test_main.cpp
     tests/lexer_tests.cpp

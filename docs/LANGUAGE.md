@@ -104,6 +104,31 @@ Overloadable: `+ - * / % == != < <= > >= & | ^`. Compound assignments (`+=` …)
 
 Built-in intrinsic: `sqrt(x)` compiles to a single SSE instruction.
 
+## Generics
+
+Structs and functions can take type parameters. Each combination of type arguments is
+compiled to its own specialized code (monomorphization), so generic code runs as fast as
+hand-written code.
+
+```ron
+struct Pair<A, B> { A first; B second; }
+struct Node<T> { T value; Node<T>* next; }       // recursive through a pointer
+
+fn swap<T>(T* a, T* b) { T t = *a; *a = *b; *b = t; }
+fn max_of<T>(T a, T b) -> T { return a > b ? a : b; }
+
+Pair<int, float> p;
+swap(&x, &y);                        // T is deduced from the arguments
+int m = max_of(4, 9);
+List<List<int>> grid;                // nested instances
+float z = zero::<float>();           // explicit type arguments when nothing can be deduced
+Pair<int, float> q = Pair::<int, float>{1, 2.5};
+```
+
+A generic body is checked when it is instantiated, so it may use any operation the type
+arguments support (`a > b` works for numbers and for structs that overload `>`). When both a
+generic and a non-generic function match equally well, the non-generic one wins.
+
 ## Structs
 
 ```ron
@@ -192,15 +217,17 @@ as C does.
 
 | Module | Contents |
 |--------|----------|
-| `std/io.ron` | `print`, `println` (strings, integers, floats, bools), `read_file` |
-| `std/string.ron` | `strlen`, `streq`, number formatting, `StrBuf` string builder |
+| `std/io.ron` | `print`, `println` (strings, `String`, integers, floats, bools), `read_file` |
+| `std/string.ron` | growable `String` (`+`, `==`, `append`, `find`, `substring`, `to_upper`, `parse_int`), `strlen`, `streq`, number formatting, `StrBuf` |
+| `std/list.ron` | `List<T>`: `push`, `pop`, `insert`, `remove_at`, `remove_swap`, `sort`, `index_of`, `contains` |
+| `std/map.ron` | `Map<K, V>` hash map: `put`, `get`, `has`, `remove` (integer, pointer and `String` keys) |
 | `std/mem.ron` | `alloc`, `realloc`, `free`, `memcpy`, `memset` |
 | `std/math.ron` | `sin cos tan atan atan2 floor ceil fmod abs min max clamp lerp smoothstep`, `Vec2 Vec3 Vec4 Mat4` with operators, `dot cross normalize length distance`, `mat4_perspective mat4_look_at mat4_trs`... |
 | `std/time.ron` | `now()` (seconds, high resolution), `sleep_ms` |
 | `std/random.ron` | `random()`, `random_range`, `random_int`, `seed_random` |
 | `std/physics.ron` | rigid bodies (spheres, boxes), gravity, collisions, contact events |
 | `std/ecs.ron` | entity component system: `World`, `spawn`, components, systems |
-| `std/engine.ron` | window, input, Vulkan rendering, camera helpers |
+| `std/engine.ron` | window, input, Vulkan rendering, PBR `Material`s, textures (PNG or procedural `Image`), glTF models, `Animator` (cross-faded skeletal animation), noise, camera helpers |
 | `std/audio.ron` | synthesized sound effects and notes |
 | `std/win32.ron` | raw Windows API imports |
 

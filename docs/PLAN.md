@@ -25,15 +25,18 @@ source.ron ─► Lexer ─► Parser ─► AST ─► Sema (types) ─► x86-
 | 7 | Vulkan engine | `ron_engine.dll`: window, swapchain, depth, MSAA, shadows, lit meshes, camera, input | done |
 | 8 | Game features | ECS, physics (gravity, AABB/sphere collisions), audio, `ronc run --watch` live reload | done |
 
-## Next steps
+| 9 | Performance | Register allocation (callee-saved GPR/XMM), SIB addressing, immediates, branch fusion | done |
+| 10 | Generics & containers | Monomorphized generic structs/functions, `List<T>`, `Map<K, V>`, `String` | done |
+| 11 | Materials & textures | PBR (GGX), PNG decoder, mipmapped textures, world-space UVs | done |
+| 12 | Animation | glTF 2.0 loader, GPU skinning, keyframe sampling, cross-fade blending | done |
 
-- **Performance**: register allocation, keeping locals in registers, SIMD for vector math.
-- **Language**: generics (for containers), slices and dynamic strings, `defer`, closures,
-  namespaces per module.
-- **Engine**: textures and materials (PBR), glTF model loading, skeletal animation,
-  instanced rendering, post-processing (bloom, SSAO), a UI layer.
-- **Tooling**: debug info (PDB) for stepping through Ron code, a language server for editors,
-  state-preserving hot reload.
+## Further work
+
+- **Compiler**: SIMD code generation for vector math, inlining, debug info (PDB) to step through
+  Ron code in a debugger, a language server for editors.
+- **Language**: slices, `defer`, closures, namespaces per module.
+- **Engine**: normal maps, image-based lighting, instanced rendering, post-processing (bloom,
+  SSAO), cascaded shadows, a UI layer, state-preserving hot reload.
 
 ## Key design decisions
 

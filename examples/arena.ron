@@ -1,10 +1,11 @@
 // Ron Arena: a small 3D physics game written entirely in Ron.
 //
-//   WASD / arrows  move          Space  jump        Shift  sprint
-//   F              shoot a ball  R      reset       Esc    quit
+//   WASD / arrows  move          Space  jump        Shift  run
+//   F / left click shoot a ball  R      reset       Esc    quit
 //   Right mouse    orbit camera  Wheel  zoom        Q / E  rotate camera
 //
-// Collect the spinning gold cubes while balls rain from the sky.
+// An animated glTF character (idle / walk / run, cross-faded) collects gold
+// cubes while balls rain from the sky. Textures are generated in Ron at startup.
 // Build & run:  ronc run examples/arena.ron
 
 import "std/engine.ron";
@@ -18,34 +19,104 @@ import "std/io.ron";
 const int TAG_WALL = 1;
 const int TAG_BALL = 2;
 const int TAG_PICKUP = 3;
-const int TAG_PLAYER = 4;
 
 const int MAX_ENTITIES = 512;
 const int PICKUP_COUNT = 8;
 const float ARENA = 18.0;
 
+struct Textures {
+    int stone, brick, marble, metal;
+}
+
 struct Game {
     World world;
     PhysicsWorld physics;
+    Textures tex;
     int cube, sphere, plane;
-    int player;
     int player_body;
+    Animator anim;
+    int idle, walk, run;
+    float facing;
     OrbitCamera cam;
     int score;
     float spawn_timer;
     float title_timer;
 }
 
-fn add_block(Game* g, Vec3 pos, Vec3 half, Color c) {
+// ───────────── Procedural textures ─────────────
+
+fn stone_texture() -> int {
+    Image img = image(256, 256);
+    for (int y = 0; y < 256; y++) {
+        for (int x = 0; x < 256; x++) {
+            float u = (x as float) / 64.0;
+            float v = (y as float) / 64.0;
+            // 4x4 flagstones with dark grout and noisy surface
+            float gx = abs(fmod(u, 1.0) - 0.5);
+            float gy = abs(fmod(v, 1.0) - 0.5);
+            float grout = smoothstep(0.47, 0.5, max(gx, gy));
+            float n = fbm(u * 2.0, v * 2.0, 8);
+            float tone = 0.45 + 0.35 * n - grout * 0.3;
+            int tile = (floor(u) as int) * 7 + (floor(v) as int) * 13;
+            float tint = ((tile % 5) as float) * 0.03;
+            img.set_pixel(x, y, rgb(tone + tint, tone + tint * 0.5, tone * 0.92));
+        }
+    }
+    return make_texture(&img);
+}
+
+fn brick_texture() -> int {
+    Image img = image(256, 128);
+    for (int y = 0; y < 128; y++) {
+        for (int x = 0; x < 256; x++) {
+            int row = y / 32;
+            int shifted = x + (row % 2) * 32;
+            bool mortar = y % 32 < 3 || shifted % 64 < 3;
+            float n = fbm((x as float) / 16.0, (y as float) / 16.0, 16);
+            Color c = mortar ? rgb(0.62, 0.6, 0.55) : rgb(0.55 + n * 0.25, 0.25 + n * 0.12, 0.18 + n * 0.08);
+            img.set_pixel(x, y, c);
+        }
+    }
+    return make_texture(&img);
+}
+
+fn marble_texture() -> int {
+    Image img = image(128, 128);
+    for (int y = 0; y < 128; y++) {
+        for (int x = 0; x < 128; x++) {
+            float u = (x as float) / 32.0;
+            float v = (y as float) / 32.0;
+            float vein = abs(sin(u * 3.0 + fbm(u, v, 4) * 6.0));
+            float t = 0.75 + 0.2 * smoothstep(0.0, 0.25, vein);
+            img.set_pixel(x, y, rgb(t, t * 0.97, t * 0.92));
+        }
+    }
+    return make_texture(&img);
+}
+
+fn metal_texture() -> int {
+    Image img = image(64, 64);
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            float n = value_noise((x as float) / 2.0, (y as float) / 32.0, 32);   // brushed streaks
+            float t = 0.8 + 0.2 * n;
+            img.set_pixel(x, y, rgb(t, t, t));
+        }
+    return make_texture(&img);
+}
+
+// ───────────── Level ─────────────
+
+fn add_block(Game* g, Vec3 pos, Vec3 half, Material m) {
     int e = g.world.spawn();
     g.world.set_position(e, pos);
     g.world.set_scale(e, half * 2.0);
-    g.world.set_render(e, g.cube, c);
+    g.world.set_render(e, g.cube, m);
     g.world.set_body(e, g.physics.add_box(pos, half, 0.0));
     g.world.set_tag(e, TAG_WALL);
 }
 
-fn spawn_ball(Game* g, Vec3 pos, Vec3 velocity, float radius, Color c) {
+fn spawn_ball(Game* g, Vec3 pos, Vec3 velocity, float radius, Material m) {
     int e = g.world.spawn();
     if (e < 0) return;
     int b = g.physics.add_sphere(pos, radius, radius * 4.0);
@@ -58,19 +129,22 @@ fn spawn_ball(Game* g, Vec3 pos, Vec3 velocity, float radius, Color c) {
     body.restitution = 0.7;
     g.world.set_position(e, pos);
     g.world.set_scale(e, vec3(radius, radius, radius) * 2.0);
-    g.world.set_render(e, g.sphere, c);
+    g.world.set_render(e, g.sphere, m);
     g.world.set_body(e, b);
     g.world.set_lifetime(e, 14.0);
     g.world.set_tag(e, TAG_BALL);
 }
 
-fn random_color() -> Color {
-    int pick = random_int(0, 4);
-    if (pick == 0) return rgb(0.9, 0.2, 0.15);
-    if (pick == 1) return rgb(0.15, 0.55, 0.95);
-    if (pick == 2) return rgb(0.2, 0.8, 0.3);
-    if (pick == 3) return rgb(0.95, 0.5, 0.1);
-    return rgb(0.7, 0.3, 0.9);
+fn random_ball_material(Game* g) -> Material {
+    int pick = random_int(0, 5);
+    if (pick == 0) return material(rgb(0.9, 0.15, 0.1), 0.35, 0.0);    // glossy red plastic
+    if (pick == 1) return material(rgb(0.1, 0.45, 0.95), 0.2, 0.0);    // shiny blue
+    if (pick == 2) return material(rgb(0.95, 0.75, 0.3), 0.25, 1.0);   // gold
+    if (pick == 3) return material(rgb(0.95, 0.95, 0.95), 0.15, 1.0);  // chrome
+    if (pick == 4) return material(rgb(0.2, 0.75, 0.3), 0.7, 0.0);     // matte green
+    Material copper = material(rgb(0.95, 0.6, 0.45), 0.35, 1.0);
+    copper.texture = g.tex.metal;
+    return copper;
 }
 
 fn random_spot(float height) -> Vec3 {
@@ -82,8 +156,9 @@ fn place_pickup(Game* g, int e) {
 }
 
 fn build_level(Game* g) {
-    Color wall = rgb(0.55, 0.5, 0.45);
-    Color stone = rgb(0.45, 0.47, 0.52);
+    Material wall = tiled(g.tex.brick, 0.85, 0.5);
+    Material stone = tiled(g.tex.stone, 0.9, 0.25);
+    Material marble = tiled(g.tex.marble, 0.3, 0.5);
     // Arena walls
     add_block(g, vec3(0.0, 1.0, -ARENA), vec3(ARENA, 1.0, 0.5), wall);
     add_block(g, vec3(0.0, 1.0, ARENA), vec3(ARENA, 1.0, 0.5), wall);
@@ -94,23 +169,32 @@ fn build_level(Game* g) {
         float f = i as float;
         add_block(g, vec3(-10.0 + f * 2.2, 0.4 + f * 0.6, -8.0), vec3(1.1, 0.4 + f * 0.6, 1.1), stone);
     }
-    // Pillars
+    // Marble pillars
     for (int i = 0; i < 6; i++) {
         float a = (i as float) * TAU / 6.0;
-        add_block(g, vec3(cos(a) * 9.0, 2.0, sin(a) * 9.0 + 4.0), vec3(0.6, 2.0, 0.6), rgb(0.75, 0.72, 0.65));
+        add_block(g, vec3(cos(a) * 9.0, 2.0, sin(a) * 9.0 + 4.0), vec3(0.6, 2.0, 0.6), marble);
     }
-    // A big ramp-like block in the middle
-    add_block(g, vec3(6.0, 0.75, -2.0), vec3(2.5, 0.75, 2.5), rgb(0.35, 0.4, 0.5));
+    // A big metal block in the middle
+    Material steel = tiled(g.tex.metal, 0.35, 0.5);
+    steel.color = rgb(0.75, 0.77, 0.8);
+    steel.metallic = 1.0;
+    add_block(g, vec3(6.0, 0.75, -2.0), vec3(2.5, 0.75, 2.5), steel);
 
-    // Gold pickups
+    // Gold pickups (metallic and slightly glowing)
+    Material gold = material(rgb(1.0, 0.78, 0.3), 0.25, 1.0);
+    gold.emissive = 0.25;
     for (int i = 0; i < PICKUP_COUNT; i++) {
         int e = g.world.spawn();
         g.world.set_scale(e, vec3(0.6, 0.6, 0.6));
-        g.world.set_render(e, g.cube, rgb(1.0, 0.78, 0.2));
+        g.world.set_render(e, g.cube, gold);
         g.world.set_spin(e, vec3(1.3, 2.1, 0.0));
         g.world.set_tag(e, TAG_PICKUP);
         place_pickup(g, e);
     }
+
+    // Stone floor: a render-only entity
+    int ground = g.world.spawn();
+    g.world.set_render(ground, g.plane, tiled(g.tex.stone, 0.95, 0.125));
 }
 
 fn reset_player(Game* g) {
@@ -118,6 +202,12 @@ fn reset_player(Game* g) {
     b.position = vec3(0.0, 2.0, 6.0);
     b.velocity = vec3(0.0, 0.0, 0.0);
     g.score = 0;
+}
+
+// Shortest signed difference between two angles.
+fn angle_delta(float from, float to) -> float {
+    float d = fmod(to - from + PI, TAU) - PI;
+    return d;
 }
 
 fn update_player(Game* g, float dt) {
@@ -132,7 +222,7 @@ fn update_player(Game* g, float dt) {
     if (engine_key_down(KEY_S) || engine_key_down(KEY_DOWN)) input = input - forward;
     if (engine_key_down(KEY_D) || engine_key_down(KEY_RIGHT)) input = input + right;
     if (engine_key_down(KEY_A) || engine_key_down(KEY_LEFT)) input = input - right;
-    float speed = engine_key_down(KEY_SHIFT) ? 11.0 : 7.0;
+    float speed = engine_key_down(KEY_SHIFT) ? 7.5 : 3.5;
     Vec3 target = normalize(input) * speed;
 
     // Accelerate towards the target velocity (less control in the air)
@@ -142,12 +232,29 @@ fn update_player(Game* g, float dt) {
     b.velocity.z = lerp(b.velocity.z, target.z, k);
 
     if (engine_key_pressed(KEY_SPACE) && b.grounded) {
-        b.velocity.y = 9.5;
+        b.velocity.y = 8.5;
         sfx_jump();
     }
-    if (engine_key_pressed(KEY_F)) {
+
+    // Face the direction of motion and pick the animation from the speed.
+    float ground_speed = length(vec3(b.velocity.x, 0.0, b.velocity.z));
+    if (ground_speed > 0.3) g.facing += angle_delta(g.facing, atan2(b.velocity.x, b.velocity.z)) * min(1.0, 12.0 * dt);
+    if (ground_speed < 0.4) {
+        g.anim.play(g.idle);
+        g.anim.speed = 1.0;
+    } else if (ground_speed < 5.0) {
+        g.anim.play(g.walk);
+        g.anim.speed = ground_speed / 3.5;
+    } else {
+        g.anim.play(g.run);
+        g.anim.speed = ground_speed / 7.5;
+    }
+    g.anim.update(dt);
+
+    if (engine_key_pressed(KEY_F) || engine_mouse_pressed(MOUSE_LEFT)) {
         Vec3 dir = normalize(forward + vec3(0.0, 0.25, 0.0));
-        spawn_ball(g, b.position + forward * 1.2 + vec3(0.0, 0.6, 0.0), dir * 24.0, 0.35, rgb(0.95, 0.95, 0.95));
+        Material white = material(rgb(0.95, 0.95, 0.95), 0.1, 1.0);
+        spawn_ball(g, b.position + forward * 1.2 + vec3(0.0, 0.8, 0.0), dir * 24.0, 0.35, white);
         engine_play_sweep(900.0, 200.0, 0.15, 0.2, WAVE_SAW);
     }
     if (engine_key_pressed(KEY_R)) reset_player(g);
@@ -156,7 +263,8 @@ fn update_player(Game* g, float dt) {
     // Collect pickups
     for (int e = 0; e < g.world.count; e++) {
         if (!g.world.has(e, HAS_TAG) || g.world.tags[e] != TAG_PICKUP) continue;
-        if (distance(g.world.transforms[e].position, b.position) < 1.1) {
+        Vec3 p = g.world.transforms[e].position;
+        if (distance(p, b.position + vec3(0.0, 0.4, 0.0)) < 1.2) {
             g.score++;
             sfx_pickup();
             place_pickup(g, e);
@@ -165,14 +273,21 @@ fn update_player(Game* g, float dt) {
 }
 
 fn update_title(Game* g) {
-    StrBuf sb;
-    sb.clear();
-    sb.append("Ron Arena  |  Score: ");
-    sb.append(g.score);
-    sb.append("  |  Entities: ");
-    sb.append(g.world.alive);
-    sb.append("  |  WASD move, Space jump, F shoot, right-drag camera");
-    engine_set_title(sb.text());
+    String s = string("Ron Arena  |  Score: ");
+    s.append(g.score);
+    s.append("  |  Entities: ");
+    s.append(g.world.alive);
+    s.append("  |  WASD move, Shift run, Space jump, click shoot, right-drag camera");
+    engine_set_title(s.c_str());
+    s.free_string();
+}
+
+fn load_character() -> int {
+    // Works when run from the repository root, examples/ or a build folder.
+    int m = engine_model_load("assets/character.glb");
+    if (m < 0) m = engine_model_load("../assets/character.glb");
+    if (m < 0) m = engine_model_load("../../assets/character.glb");
+    return m;
 }
 
 fn main() -> int {
@@ -180,7 +295,7 @@ fn main() -> int {
         println("could not start the engine (is a Vulkan GPU available?)");
         return 1;
     }
-    engine_set_light(-0.5, -1.0, -0.35, 1.8);
+    engine_set_light(-0.5, -1.0, -0.35, 2.2);
     engine_set_fog(0.45, 0.55, 0.7, 0.012);
     seed_random(engine_time() as u64 * 1000 + 7);
 
@@ -189,30 +304,30 @@ fn main() -> int {
     g.world = world_create(MAX_ENTITIES);
     g.physics = physics_world(MAX_ENTITIES);
     g.cube = engine_mesh_cube();
-    g.sphere = engine_mesh_sphere(24, 32);
+    g.sphere = engine_mesh_sphere(32, 48);
     g.plane = engine_mesh_plane(80.0);
-    g.cam = orbit_camera(vec3(0.0, 1.0, 6.0), 14.0);
+    g.tex = Textures{stone_texture(), brick_texture(), marble_texture(), metal_texture()};
+    g.cam = orbit_camera(vec3(0.0, 1.0, 6.0), 9.0);
+
+    int model = load_character();
+    if (model < 0) {
+        println("assets/character.glb not found (run from the repository root)");
+        return 1;
+    }
+    g.idle = engine_model_find_animation(model, "idle");
+    g.walk = engine_model_find_animation(model, "walk");
+    g.run = engine_model_find_animation(model, "run");
+    g.anim = animator(model, g.idle);
 
     build_level(g);
 
-    // The player: an entity with a sphere body
-    g.player = g.world.spawn();
+    // The player: a physics sphere carrying the animated character
     g.player_body = g.physics.add_sphere(vec3(0.0, 2.0, 6.0), 0.5, 2.0);
     g.physics.body(g.player_body).restitution = 0.0;
-    g.world.set_scale(g.player, vec3(1.0, 1.0, 1.0));
-    g.world.set_render(g.player, g.sphere, rgb(0.2, 0.45, 0.95));
-    g.world.set_body(g.player, g.player_body);
-    g.world.set_tag(g.player, TAG_PLAYER);
-
-    // Ground: a render-only entity drawn with the checkerboard material
-    int ground = g.world.spawn();
-    g.world.set_render(ground, g.plane, rgb(0.62, 0.62, 0.6));
-    g.world.renders[ground].checker = true;
 
     while (engine_running()) {
         float dt = engine_delta();
 
-        // Camera controls
         if (engine_key_down(KEY_Q)) g.cam.yaw += 2.0 * dt;
         if (engine_key_down(KEY_E)) g.cam.yaw -= 2.0 * dt;
         g.cam.update();
@@ -224,7 +339,7 @@ fn main() -> int {
         if (g.spawn_timer <= 0.0) {
             g.spawn_timer = 0.45;
             spawn_ball(g, random_spot(14.0), vec3(random_range(-2.0, 2.0), 0.0, random_range(-2.0, 2.0)),
-                       random_range(0.3, 0.7), random_color());
+                       random_range(0.3, 0.7), random_ball_material(g));
         }
 
         g.physics.step(dt);
@@ -244,7 +359,7 @@ fn main() -> int {
         system_movement(&g.world, dt);
 
         Body* pb = g.physics.body(g.player_body);
-        g.cam.target = lerp(g.cam.target, pb.position + vec3(0.0, 0.8, 0.0), min(1.0, 8.0 * dt));
+        g.cam.target = lerp(g.cam.target, pb.position + vec3(0.0, 0.9, 0.0), min(1.0, 8.0 * dt));
         g.cam.apply();
 
         g.title_timer -= dt;
@@ -255,6 +370,8 @@ fn main() -> int {
 
         if (engine_begin_frame(0.45, 0.55, 0.7)) {
             system_render(&g.world);
+            Mat4 body = mat4_translate(pb.position - vec3(0.0, 0.5, 0.0)) * mat4_rotate_y(g.facing);
+            g.anim.draw(body);
             engine_end_frame();
         }
     }

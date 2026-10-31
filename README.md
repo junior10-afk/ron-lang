@@ -5,25 +5,26 @@
 ![Ron Arena, a physics game written in Ron](docs/images/arena.png)
 
 `ronc` turns `.ron` source files into native Windows x86-64 executables. There is no LLVM,
-no external assembler and no external linker: the compiler encodes every machine instruction
-itself and writes the PE (`.exe`) file byte by byte. Games link against `ron_engine.dll`, a
-Vulkan renderer with shadows, MSAA and tone mapping.
+no external assembler and no external linker: the compiler allocates registers, encodes every
+machine instruction itself and writes the PE (`.exe`) file byte by byte. Games link against
+`ron_engine.dll`, a Vulkan renderer with physically based materials, textures, shadows and
+skeletal animation.
 
 ```ron
 import "std/engine.ron";
 
 fn main() -> int {
     engine_init(1280, 720, "Hello Ron");
-    int cube = engine_mesh_cube();
-    OrbitCamera cam = orbit_camera(vec3(0.0, 0.0, 0.0), 5.0);
+    int hero = engine_model_load("assets/character.glb");       // glTF with skeleton + animations
+    Animator anim = animator(hero, engine_model_find_animation(hero, "walk"));
+    OrbitCamera cam = orbit_camera(vec3(0.0, 1.0, 0.0), 4.0);
 
     while (engine_running()) {
         cam.update();
         cam.apply();
-        float t = engine_time() as float;
+        anim.update(engine_delta());
         if (engine_begin_frame(0.45, 0.55, 0.7)) {
-            Mat4 model = mat4_rotate_y(t) * mat4_rotate_x(t * 0.5);
-            engine_draw(cube, &model, 0.9, 0.35, 0.2);
+            anim.draw(mat4_identity());
             engine_end_frame();
         }
     }
@@ -32,31 +33,41 @@ fn main() -> int {
 }
 ```
 
+![The rigged character playing idle, walk, run and a walk/run blend](docs/images/character.png)
+
 ## Features
 
-**Language**: C-style syntax, structs, enums, pointers, fixed arrays, function overloading,
-operator overloading, method-call syntax (`v.length()`), untyped numeric literals, `const`,
-modules with `import`, direct calls into any Windows DLL. See the
-[language reference](docs/LANGUAGE.md).
+**Language** ([reference](docs/LANGUAGE.md)): C-style syntax, structs, enums, pointers, fixed
+arrays, **generics** (`List<T>`, `fn max<T>(T a, T b)`), function and operator overloading,
+method-call syntax (`v.length()`), untyped numeric literals, `const`, modules, and direct calls
+into any Windows DLL.
 
-**Compiler** (`src/`, ~5k lines of C++20, no dependencies):
-- lexer with UTF-8 identifiers and precise diagnostics (`file:line:col` + caret)
-- recursive-descent parser with error recovery
-- semantic analysis: type checking, overload resolution, implicit conversions, constant folding
-- x86-64 machine code encoder and code generator (Win64 ABI, SSE floating point)
-- PE32+ writer with import tables: a complete game is a ~40 KB `.exe`
+**Compiler** (`src/`, C++20, no dependencies):
+- lexer, recursive-descent parser with error recovery, precise diagnostics (`file:line:col` + caret)
+- semantic analysis: type checking, overload resolution, generic instantiation with type deduction,
+  implicit conversions, constant folding
+- **register allocation** (callee-saved GPR and XMM registers, loop-weighted), SIB addressing,
+  immediate operands, compare-and-branch fusion, loop rotation
+- x86-64 machine code encoder and PE32+ writer: a complete game is a ~50 KB `.exe`
 - dead-code elimination and live reload (`ronc run --watch`)
 
-**Engine** (`engine/`, C++ + Vulkan):
-- forward renderer, 4x MSAA, depth buffer, directional shadow mapping with PCF
-- hemispheric ambient + Blinn-Phong lighting, fog, ACES tone mapping, sRGB output
-- procedural meshes (cube, sphere, plane) and custom meshes
-- keyboard and mouse input, GPU screenshots
-- software audio synthesizer (sine / square / saw / noise voices)
+| benchmark (`examples/benchmark.ron`) | Ron | C, MSVC `/O2` |
+|---|---|---|
+| fib(32) + sieve(20M) + n-body | 233 ms | 183 ms |
 
-**Standard library** (`std/`, written in Ron): I/O, strings, memory, math with vectors
-and matrices, random numbers, time, rigid-body physics, an entity component system and
-sound effects.
+**Engine** (`engine/`, C++ + Vulkan):
+- forward renderer, 4x MSAA, directional shadow mapping with PCF
+- physically based shading (GGX / Smith / Schlick), metallic-roughness materials, emissive,
+  sky/ground environment reflections, fog, ACES tone mapping
+- textures with mipmaps and anisotropic filtering, a PNG decoder written from scratch (inflate
+  included), world-space UV projection
+- **glTF 2.0 loader** (`.glb` / `.gltf`), **GPU skinning**, keyframe animation with
+  interpolation and cross-fade blending
+- keyboard and mouse input, GPU screenshots, software audio synthesizer
+
+**Standard library** (`std/`, written in Ron): `String`, `List<T>`, `Map<K, V>`, I/O, memory,
+math with vectors and matrices, random numbers, noise, time, rigid-body physics, an entity
+component system, an animator and sound effects.
 
 ## Getting started
 
@@ -64,12 +75,14 @@ Requirements: Windows 10/11 x64, Visual Studio 2022 Build Tools (MSVC + CMake),
 the [Vulkan SDK](https://vulkan.lunarg.com/) for the engine.
 
 ```powershell
-.\build.ps1 -Release                                   # builds ronc, the engine and runs the tests
-.\build\Release\ronc.exe run examples\arena.ron        # play the demo game
+.\build.ps1 -Release                                      # builds ronc, the engine and runs all tests
+.\build\Release\ronc.exe run examples\arena.ron           # play the demo game (from the repository root)
+.\build\Release\ronc.exe run examples\character_viewer.ron
+.\build\Release\ronc.exe run examples\benchmark.ron
 ```
 
-Arena controls: WASD to move, Space to jump, Shift to sprint, F to shoot, right mouse to orbit
-the camera, mouse wheel to zoom, R to reset, Esc to quit.
+Arena controls: WASD to move, Shift to run, Space to jump, left click or F to shoot, right mouse
+to orbit the camera, mouse wheel to zoom, R to reset, Esc to quit.
 
 ## ronc
 
@@ -83,30 +96,25 @@ ronc tokens game.ron                        print the lexer's tokens
 ## Project layout
 
 ```
-src/        compiler: lexer, parser, sema, x86-64 encoder, codegen, PE writer, driver
-engine/     ron_engine.dll: window, input, Vulkan renderer, shaders, audio
+src/        compiler: lexer, parser, sema, register allocator + x86-64 codegen, PE writer, driver
+engine/     ron_engine.dll: window, input, Vulkan renderer, shaders, PNG + glTF loaders, audio
 std/        standard library, written in Ron
-examples/   spinning_cube.ron, arena.ron
-tests/      unit + end-to-end tests (compile Ron programs, run them, check the output)
-docs/       language reference, implementation plan
+examples/   arena.ron, character_viewer.ron, spinning_cube.ron, benchmark.ron
+assets/     character.glb (generated by tools/make_character.cpp)
+tools/      asset generators
+tests/      unit, end-to-end and asset tests
+docs/       language reference, design notes
 ```
 
 ## How it works
 
 ```
-source.ron ─► Lexer ─► Parser ─► AST ─► Sema ─► x86-64 CodeGen ─► PE writer ─► game.exe
-                                                                                  │
-                                    ron_engine.dll (C++ / Vulkan) ◄── imports ────┘
+source.ron ─► Lexer ─► Parser ─► AST ─► Sema ─► Register allocation + x86-64 CodeGen ─► PE writer ─► game.exe
+                                                                                                       │
+                                               ron_engine.dll (C++ / Vulkan) ◄────── imports ─────────┘
 ```
 
-The code generator is a single pass over the typed AST. Expression results live in `rax`
-or `xmm0`, temporaries in stack slots, and every call follows the Windows x64 calling
-convention, so Ron functions, the engine and Windows itself call each other directly.
-See [docs/PLAN.md](docs/PLAN.md) for the design decisions.
-
-## Status and limits
-
-Ron 0.1 is a working foundation, not a finished AAA toolchain. The code generator does no
-register allocation or optimization beyond constant folding, so it is slower than C. The
-language has no generics, closures or dynamic strings yet, and the renderer has no textures,
-skeletal animation or PBR materials. These are the natural next steps.
+Sema produces a fully typed AST (generic code is instantiated per type). The code generator
+keeps hot variables in callee-saved registers, evaluates expressions into `rax` / `xmm0`, spills
+temporaries to stack slots and follows the Windows x64 calling convention, so Ron functions, the
+engine and Windows itself call each other directly. See [docs/PLAN.md](docs/PLAN.md).

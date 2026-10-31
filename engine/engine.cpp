@@ -1,15 +1,23 @@
-// ron_engine: window, input and a forward Vulkan renderer (MSAA, depth,
-// hemispheric ambient + directional light + specular, fog, ACES tone mapping).
+// ron_engine: window, input and a forward Vulkan renderer.
+//
+// Rendering: 4x MSAA, depth, directional shadow map with PCF, physically based
+// materials (GGX), textures with mipmaps (bindless-style array), GPU skinning,
+// glTF models with keyframe animation and blending, fog, ACES tone mapping.
 
 #include "ron_engine.h"
+
+#include "gltf.hpp"
+#include "png.hpp"
 
 #include <windows.h>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,7 +38,13 @@ const uint32_t kShadowVertSpv[] = {
 
 constexpr int kFramesInFlight = 2;
 constexpr uint32_t kShadowMapSize = 2048;
-constexpr float kShadowExtent = 18.0f;   // half-size of the light's orthographic box
+constexpr float kShadowExtent = 18.0f;    // half-size of the light's orthographic box
+constexpr uint32_t kMaxTextures = 256;    // must match textures[] in mesh.frag
+constexpr uint32_t kMaxJoints = 4096;     // joint matrices per frame
+constexpr int kFlagChecker = 1;
+constexpr int kFlagSkinned = 2;
+
+using Vertex = ron::gltf::Vertex;
 
 struct Mesh {
     VkBuffer vertexBuffer = VK_NULL_HANDLE;
@@ -40,7 +54,14 @@ struct Mesh {
     uint32_t indexCount = 0;
 };
 
+struct Texture {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
 struct SceneUniforms {
+    float viewProj[16];
     float lightViewProj[16];
     float lightDir[4];
     float lightColor[4];
@@ -51,13 +72,14 @@ struct SceneUniforms {
 };
 
 struct PushConstants {
-    float mvp[16];
     float model0[4];
     float model1[4];
     float model2[4];
     float color[4];
+    float material[4];   // roughness, metallic, emissive, unused
+    int32_t info[4];     // texture, flags, first joint, unused
 };
-static_assert(sizeof(PushConstants) == 128, "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(PushConstants) == 96, "push constants must stay within the guaranteed 128 bytes");
 
 // Draws are queued during the frame and recorded at the end, so the shadow pass
 // can render every object before the main pass.
@@ -65,6 +87,16 @@ struct DrawCommand {
     int32_t mesh;
     float model[16];
     float color[4];
+    float material[4];
+    int32_t texture;
+    int32_t flags;
+    int32_t jointBase;
+};
+
+struct Model {
+    ron::gltf::Model data;
+    std::vector<std::vector<int32_t>> primitiveMeshes;   // [mesh][primitive] -> engine mesh id
+    std::vector<int32_t> imageTextures;                   // [image] -> engine texture id
 };
 
 struct Engine {
@@ -80,6 +112,7 @@ struct Engine {
     bool keys[256] = {};
     bool prevKeys[256] = {};
     bool mouse[3] = {};
+    bool prevMouse[3] = {};
     bool haveLastMouse = false;
     int lastMouseX = 0, lastMouseY = 0;
     float accDx = 0, accDy = 0, accWheel = 0;
@@ -100,6 +133,7 @@ struct Engine {
     uint32_t queueFamily = 0;
     VkQueue queue = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps{};
+    float maxAnisotropy = 1.0f;
 
     // Swapchain and targets
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -118,8 +152,9 @@ struct Engine {
     VkImage depthImage = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
     VkImageView depthView = VK_NULL_HANDLE;
+    bool canCopySwapchain = false;
 
-    // Pipeline
+    // Pipelines (both share one layout and descriptor set)
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -133,10 +168,11 @@ struct Engine {
     VkSampler shadowSampler = VK_NULL_HANDLE;
     VkRenderPass shadowPass = VK_NULL_HANDLE;
     VkFramebuffer shadowFramebuffer = VK_NULL_HANDLE;
-    VkPipelineLayout shadowLayout = VK_NULL_HANDLE;
     VkPipeline shadowPipeline = VK_NULL_HANDLE;
-    std::vector<DrawCommand> draws;
-    float clearColor[3] = {};
+
+    // Textures
+    VkSampler textureSampler = VK_NULL_HANDLE;
+    std::vector<Texture> textures;
 
     // Per frame in flight
     VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -146,6 +182,10 @@ struct Engine {
     VkBuffer uniformBuffers[kFramesInFlight] = {};
     VkDeviceMemory uniformMemory[kFramesInFlight] = {};
     void* uniformMapped[kFramesInFlight] = {};
+    VkBuffer jointBuffers[kFramesInFlight] = {};
+    VkDeviceMemory jointMemory[kFramesInFlight] = {};
+    float* jointMapped[kFramesInFlight] = {};
+    uint32_t jointCursor = 0;
     VkDescriptorSet descriptorSets[kFramesInFlight] = {};
 
     uint32_t frame = 0;
@@ -157,12 +197,14 @@ struct Engine {
     std::string screenshotPath;
     int screenshotAtFrame = -1;   // from RON_SCREENSHOT_FRAME
     uint64_t frameCounter = 0;
-    bool canCopySwapchain = false;
 
     std::vector<Mesh> meshes;
+    std::vector<std::unique_ptr<Model>> models;
+    std::vector<DrawCommand> draws;
+    float clearColor[3] = {};
+    float material[4] = {0.6f, 0.0f, 0.0f, 0.0f};   // default roughness, metallic, emissive, world UV scale
     float view[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     float proj[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    float viewProj[16] = {};
     SceneUniforms scene{};
 };
 
@@ -296,13 +338,14 @@ bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyF
     return true;
 }
 
-bool createImage(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkSampleCountFlagBits samples,
-                 VkImageAspectFlags aspect, VkImage& image, VkDeviceMemory& memory, VkImageView& view) {
+bool createImage(uint32_t w, uint32_t h, uint32_t mips, VkFormat format, VkImageUsageFlags usage,
+                 VkSampleCountFlagBits samples, VkImageAspectFlags aspect, VkImage& image, VkDeviceMemory& memory,
+                 VkImageView& view) {
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
     ii.extent = {w, h, 1};
-    ii.mipLevels = 1;
+    ii.mipLevels = mips;
     ii.arrayLayers = 1;
     ii.samples = samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -320,7 +363,7 @@ bool createImage(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usag
     vi.image = image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = format;
-    vi.subresourceRange = {aspect, 0, 1, 0, 1};
+    vi.subresourceRange = {aspect, 0, mips, 0, 1};
     return check(vkCreateImageView(g.device, &vi, nullptr, &view), "vkCreateImageView");
 }
 
@@ -333,13 +376,61 @@ void destroyImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view) {
     memory = VK_NULL_HANDLE;
 }
 
+void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess,
+                  VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+                  uint32_t baseMip = 0, uint32_t mipCount = 1) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, baseMip, mipCount, 0, 1};
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// One-off command buffer for uploads (waits for completion).
+VkCommandBuffer beginOneShot() {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = g.commandPool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(g.device, &ai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    return cmd;
+}
+
+void endOneShot(VkCommandBuffer cmd) {
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g.queue);
+    vkFreeCommandBuffers(g.device, g.commandPool, 1, &cmd);
+}
+
+VkShaderModule shaderModule(const uint32_t* code, size_t bytes) {
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = bytes;
+    ci.pCode = code;
+    VkShaderModule m = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(g.device, &ci, nullptr, &m), "vkCreateShaderModule");
+    return m;
+}
+
 // ───────────────────────────── Vulkan setup ─────────────────────────────
 
 bool createInstance() {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = g.title.c_str();
     app.pEngineName = "Ron Engine";
-    app.engineVersion = VK_MAKE_VERSION(0, 1, 0);
+    app.engineVersion = VK_MAKE_VERSION(0, 2, 0);
     app.apiVersion = VK_API_VERSION_1_1;
 
     const char* extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
@@ -379,7 +470,9 @@ bool pickDevice() {
         bool hasSwapchain = std::any_of(exts.begin(), exts.end(), [](const VkExtensionProperties& e) {
             return std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0;
         });
-        if (!hasSwapchain) continue;
+        VkPhysicalDeviceFeatures features;
+        vkGetPhysicalDeviceFeatures(gpu, &features);
+        if (!hasSwapchain || !features.shaderSampledImageArrayDynamicIndexing) continue;
 
         for (uint32_t q = 0; q < qcount; ++q) {
             VkBool32 present = VK_FALSE;
@@ -408,6 +501,7 @@ bool pickDevice() {
     g.samples = (counts & VK_SAMPLE_COUNT_4_BIT) ? VK_SAMPLE_COUNT_4_BIT
               : (counts & VK_SAMPLE_COUNT_2_BIT) ? VK_SAMPLE_COUNT_2_BIT
                                                  : VK_SAMPLE_COUNT_1_BIT;
+    g.maxAnisotropy = std::min(8.0f, props.limits.maxSamplerAnisotropy);
     std::fprintf(stderr, "ron_engine: GPU '%s', %dx MSAA\n", props.deviceName, static_cast<int>(g.samples));
 
     // Surface format: prefer an sRGB swapchain so shading happens in linear space.
@@ -434,12 +528,19 @@ bool createDevice() {
     qi.queueFamilyIndex = g.queueFamily;
     qi.queueCount = 1;
     qi.pQueuePriorities = &priority;
+    VkPhysicalDeviceFeatures available;
+    vkGetPhysicalDeviceFeatures(g.gpu, &available);
+    VkPhysicalDeviceFeatures features{};
+    features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    features.samplerAnisotropy = available.samplerAnisotropy;
+    if (!available.samplerAnisotropy) g.maxAnisotropy = 1.0f;
     const char* exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
     di.enabledExtensionCount = 1;
     di.ppEnabledExtensionNames = exts;
+    di.pEnabledFeatures = &features;
     if (!check(vkCreateDevice(g.gpu, &di, nullptr, &g.device), "vkCreateDevice")) return false;
     vkGetDeviceQueue(g.device, g.queueFamily, 0, &g.queue);
     return true;
@@ -513,40 +614,40 @@ bool createRenderPass() {
     return check(vkCreateRenderPass(g.device, &rp, nullptr, &g.renderPass), "vkCreateRenderPass");
 }
 
-VkShaderModule shaderModule(const uint32_t* code, size_t bytes) {
-    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    ci.codeSize = bytes;
-    ci.pCode = code;
-    VkShaderModule m = VK_NULL_HANDLE;
-    check(vkCreateShaderModule(g.device, &ci, nullptr, &m), "vkCreateShaderModule");
-    return m;
-}
-
-bool createPipeline() {
-    VkDescriptorSetLayoutBinding bindings[2] = {};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+bool createLayout() {
+    VkDescriptorSetLayoutBinding b[4] = {};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[2] = {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextures, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sl.bindingCount = 2;
-    sl.pBindings = bindings;
+    sl.bindingCount = 4;
+    sl.pBindings = b;
     if (!check(vkCreateDescriptorSetLayout(g.device, &sl, nullptr, &g.setLayout), "vkCreateDescriptorSetLayout"))
         return false;
-
     VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &g.setLayout;
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &push;
-    if (!check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g.pipelineLayout), "vkCreatePipelineLayout"))
-        return false;
+    return check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g.pipelineLayout), "vkCreatePipelineLayout");
+}
 
+// Vertex layout shared by both pipelines (shadow uses a subset).
+void vertexInput(VkVertexInputBindingDescription& binding, std::vector<VkVertexInputAttributeDescription>& attrs,
+                 bool shadow) {
+    binding = {0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    attrs.push_back({0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)});
+    if (!shadow) {
+        attrs.push_back({1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)});
+        attrs.push_back({2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)});
+    }
+    attrs.push_back({3, 0, VK_FORMAT_R8G8B8A8_UINT, offsetof(Vertex, joints)});
+    attrs.push_back({4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, weights)});
+}
+
+bool createPipeline() {
     VkShaderModule vert = shaderModule(kVertSpv, sizeof(kVertSpv));
     VkShaderModule frag = shaderModule(kFragSpv, sizeof(kFragSpv));
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -554,45 +655,37 @@ bool createPipeline() {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr},
     };
 
-    VkVertexInputBindingDescription vb{0, 6 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attrs[2] = {
-        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
-        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3 * sizeof(float)},
-    };
+    VkVertexInputBindingDescription vb;
+    std::vector<VkVertexInputAttributeDescription> attrs;
+    vertexInput(vb, attrs, false);
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &vb;
-    vi.vertexAttributeDescriptionCount = 2;
-    vi.pVertexAttributeDescriptions = attrs;
+    vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
+    vi.pVertexAttributeDescriptions = attrs.data();
 
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1;
     vp.scissorCount = 1;
-
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;   // the shader flips normals of back faces
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
-
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = g.samples;
-
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = VK_TRUE;
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;
-
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
                            VK_COLOR_COMPONENT_A_BIT;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1;
     cb.pAttachments = &blend;
-
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = 2;
@@ -619,7 +712,7 @@ bool createPipeline() {
 }
 
 bool createShadowResources() {
-    if (!createImage(kShadowMapSize, kShadowMapSize, VK_FORMAT_D32_SFLOAT,
+    if (!createImage(kShadowMapSize, kShadowMapSize, 1, VK_FORMAT_D32_SFLOAT,
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT,
                      VK_IMAGE_ASPECT_DEPTH_BIT, g.shadowImage, g.shadowMemory, g.shadowView))
         return false;
@@ -680,23 +773,17 @@ bool createShadowResources() {
     if (!check(vkCreateFramebuffer(g.device, &fi, nullptr, &g.shadowFramebuffer), "vkCreateFramebuffer (shadow)"))
         return false;
 
-    VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, 64};
-    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pl.pushConstantRangeCount = 1;
-    pl.pPushConstantRanges = &push;
-    if (!check(vkCreatePipelineLayout(g.device, &pl, nullptr, &g.shadowLayout), "vkCreatePipelineLayout (shadow)"))
-        return false;
-
     VkShaderModule vert = shaderModule(kShadowVertSpv, sizeof(kShadowVertSpv));
     VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
                                           VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
-    VkVertexInputBindingDescription vb{0, 6 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attr{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+    VkVertexInputBindingDescription vb;
+    std::vector<VkVertexInputAttributeDescription> attrs;
+    vertexInput(vb, attrs, true);
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1;
     vi.pVertexBindingDescriptions = &vb;
-    vi.vertexAttributeDescriptionCount = 1;
-    vi.pVertexAttributeDescriptions = &attr;
+    vi.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
+    vi.pVertexAttributeDescriptions = attrs.data();
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport viewport{0, 0, static_cast<float>(kShadowMapSize), static_cast<float>(kShadowMapSize), 0, 1};
@@ -730,12 +817,94 @@ bool createShadowResources() {
     pi.pMultisampleState = &ms;
     pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb;
-    pi.layout = g.shadowLayout;
+    pi.layout = g.pipelineLayout;
     pi.renderPass = g.shadowPass;
     bool ok = check(vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadowPipeline),
                     "vkCreateGraphicsPipelines (shadow)");
     vkDestroyShaderModule(g.device, vert, nullptr);
     return ok;
+}
+
+// Points every texture slot of both descriptor sets at `textureId` (slot `slot`).
+void writeTextureSlot(uint32_t slot, int32_t textureId) {
+    VkDescriptorImageInfo info{g.textureSampler, g.textures[textureId].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    for (int f = 0; f < kFramesInFlight; ++f) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = g.descriptorSets[f];
+        w.dstBinding = 2;
+        w.dstArrayElement = slot;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &info;
+        vkUpdateDescriptorSets(g.device, 1, &w, 0, nullptr);
+    }
+}
+
+// Uploads RGBA8 pixels as an sRGB texture with a full mip chain; returns its id or -1.
+int32_t createTexture(uint32_t w, uint32_t h, const uint8_t* rgba) {
+    if (g.textures.size() >= kMaxTextures || w == 0 || h == 0) return -1;
+    uint32_t mips = 1;
+    while ((std::max(w, h) >> mips) > 0) ++mips;
+
+    VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4;
+    VkBuffer staging;
+    VkDeviceMemory stagingMemory;
+    if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory))
+        return -1;
+    void* p;
+    vkMapMemory(g.device, stagingMemory, 0, bytes, 0, &p);
+    std::memcpy(p, rgba, bytes);
+    vkUnmapMemory(g.device, stagingMemory);
+
+    Texture t;
+    if (!createImage(w, h, mips, VK_FORMAT_R8G8B8A8_SRGB,
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT, t.image, t.memory, t.view))
+        return -1;
+
+    VkCommandBuffer cmd = beginOneShot();
+    imageBarrier(cmd, t.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, mips);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(cmd, staging, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Mip chain: each level is a linear blit of the previous one.
+    int32_t mw = static_cast<int32_t>(w), mh = static_cast<int32_t>(h);
+    for (uint32_t level = 1; level < mips; ++level) {
+        imageBarrier(cmd, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, level - 1, 1);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+        blit.srcOffsets[1] = {mw, mh, 1};
+        int32_t nw = std::max(1, mw / 2), nh = std::max(1, mh / 2);
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        blit.dstOffsets[1] = {nw, nh, 1};
+        vkCmdBlitImage(cmd, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+        imageBarrier(cmd, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, level - 1, 1);
+        mw = nw;
+        mh = nh;
+    }
+    imageBarrier(cmd, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, mips - 1, 1);
+    endOneShot(cmd);
+    vkDestroyBuffer(g.device, staging, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+
+    g.textures.push_back(t);
+    auto id = static_cast<int32_t>(g.textures.size() - 1);
+    if (g.descriptorSets[0]) {
+        vkDeviceWaitIdle(g.device);   // descriptor sets may be in use by frames in flight
+        writeTextureSlot(static_cast<uint32_t>(id), id);
+    }
+    return id;
 }
 
 bool createFrameResources() {
@@ -749,11 +918,25 @@ bool createFrameResources() {
     ca.commandBufferCount = kFramesInFlight;
     if (!check(vkAllocateCommandBuffers(g.device, &ca, g.commands), "vkAllocateCommandBuffers")) return false;
 
-    VkDescriptorPoolSize poolSizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight}};
+    // Texture sampler (trilinear + anisotropic, repeating) and the default white texture.
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = VK_FILTER_LINEAR;
+    si.minFilter = VK_FILTER_LINEAR;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    si.anisotropyEnable = g.maxAnisotropy > 1.0f;
+    si.maxAnisotropy = g.maxAnisotropy;
+    si.maxLod = VK_LOD_CLAMP_NONE;
+    if (!check(vkCreateSampler(g.device, &si, nullptr, &g.textureSampler), "vkCreateSampler (textures)")) return false;
+    const uint8_t white[4] = {255, 255, 255, 255};
+    if (createTexture(1, 1, white) != 0) return false;
+
+    VkDescriptorPoolSize poolSizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * (1 + kMaxTextures)},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight}};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = kFramesInFlight;
-    dp.poolSizeCount = 2;
+    dp.poolSizeCount = 3;
     dp.pPoolSizes = poolSizes;
     if (!check(vkCreateDescriptorPool(g.device, &dp, nullptr, &g.descriptorPool), "vkCreateDescriptorPool"))
         return false;
@@ -765,31 +948,50 @@ bool createFrameResources() {
     da.pSetLayouts = layouts;
     if (!check(vkAllocateDescriptorSets(g.device, &da, g.descriptorSets), "vkAllocateDescriptorSets")) return false;
 
+    VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     for (int i = 0; i < kFramesInFlight; ++i) {
-        if (!createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                          g.uniformBuffers[i], g.uniformMemory[i]))
+        if (!createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, host, g.uniformBuffers[i],
+                          g.uniformMemory[i]) ||
+            !createBuffer(kMaxJoints * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.jointBuffers[i], g.jointMemory[i]))
             return false;
         vkMapMemory(g.device, g.uniformMemory[i], 0, sizeof(SceneUniforms), 0, &g.uniformMapped[i]);
-        VkDescriptorBufferInfo bi{g.uniformBuffers[i], 0, sizeof(SceneUniforms)};
-        VkDescriptorImageInfo ii{g.shadowSampler, g.shadowView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-        w[0].dstSet = g.descriptorSets[i];
-        w[0].dstBinding = 0;
-        w[0].descriptorCount = 1;
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w[0].pBufferInfo = &bi;
-        w[1].dstSet = g.descriptorSets[i];
-        w[1].dstBinding = 1;
-        w[1].descriptorCount = 1;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[1].pImageInfo = &ii;
-        vkUpdateDescriptorSets(g.device, 2, w, 0, nullptr);
+        void* jm;
+        vkMapMemory(g.device, g.jointMemory[i], 0, kMaxJoints * 64, 0, &jm);
+        g.jointMapped[i] = static_cast<float*>(jm);
+        // Joint 0 is the identity (used by static meshes, harmless if read).
+        static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        std::memcpy(g.jointMapped[i], identity, 64);
 
-        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkDescriptorBufferInfo ub{g.uniformBuffers[i], 0, sizeof(SceneUniforms)};
+        VkDescriptorBufferInfo jb{g.jointBuffers[i], 0, kMaxJoints * 64};
+        VkDescriptorImageInfo shadow{g.shadowSampler, g.shadowView, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+        std::vector<VkDescriptorImageInfo> texInfos(kMaxTextures,
+                                                    {g.textureSampler, g.textures[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+        VkWriteDescriptorSet w[4] = {};
+        for (auto& x : w) {
+            x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            x.dstSet = g.descriptorSets[i];
+            x.descriptorCount = 1;
+        }
+        w[0].dstBinding = 0;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].pBufferInfo = &ub;
+        w[1].dstBinding = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[1].pImageInfo = &shadow;
+        w[2].dstBinding = 2;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[2].descriptorCount = kMaxTextures;
+        w[2].pImageInfo = texInfos.data();
+        w[3].dstBinding = 3;
+        w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[3].pBufferInfo = &jb;
+        vkUpdateDescriptorSets(g.device, 4, w, 0, nullptr);
+
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        if (!check(vkCreateSemaphore(g.device, &si, nullptr, &g.imageAvailable[i]), "vkCreateSemaphore") ||
+        if (!check(vkCreateSemaphore(g.device, &sci, nullptr, &g.imageAvailable[i]), "vkCreateSemaphore") ||
             !check(vkCreateFence(g.device, &fi, nullptr, &g.inFlight[i]), "vkCreateFence"))
             return false;
     }
@@ -856,12 +1058,12 @@ bool createSwapchain() {
     vkGetSwapchainImagesKHR(g.device, g.swapchain, &count, g.images.data());
 
     bool msaa = g.samples != VK_SAMPLE_COUNT_1_BIT;
-    if (msaa && !createImage(extent.width, extent.height, g.colorFormat,
+    if (msaa && !createImage(extent.width, extent.height, 1, g.colorFormat,
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, g.samples,
                              VK_IMAGE_ASPECT_COLOR_BIT, g.msaaImage, g.msaaMemory, g.msaaView))
         return false;
-    if (!createImage(extent.width, extent.height, g.depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, g.samples,
-                     VK_IMAGE_ASPECT_DEPTH_BIT, g.depthImage, g.depthMemory, g.depthView))
+    if (!createImage(extent.width, extent.height, 1, g.depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                     g.samples, VK_IMAGE_ASPECT_DEPTH_BIT, g.depthImage, g.depthMemory, g.depthView))
         return false;
 
     for (VkImage img : g.images) {
@@ -902,9 +1104,10 @@ bool recreateSwapchain() {
     return createSwapchain();
 }
 
-int32_t uploadMesh(const std::vector<float>& vertices, const std::vector<uint32_t>& indices) {
+int32_t uploadMesh(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices) {
+    if (vertices.empty() || indices.empty()) return -1;
     Mesh m;
-    VkDeviceSize vbytes = vertices.size() * sizeof(float);
+    VkDeviceSize vbytes = vertices.size() * sizeof(Vertex);
     VkDeviceSize ibytes = indices.size() * sizeof(uint32_t);
     VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if (!createBuffer(vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, host, m.vertexBuffer, m.vertexMemory) ||
@@ -922,32 +1125,178 @@ int32_t uploadMesh(const std::vector<float>& vertices, const std::vector<uint32_
     return static_cast<int32_t>(g.meshes.size() - 1);
 }
 
+Vertex makeVertex(float px, float py, float pz, float nx, float ny, float nz, float u, float v) {
+    Vertex vx{};
+    vx.position[0] = px; vx.position[1] = py; vx.position[2] = pz;
+    vx.normal[0] = nx; vx.normal[1] = ny; vx.normal[2] = nz;
+    vx.uv[0] = u; vx.uv[1] = v;
+    vx.weights[0] = 1.0f;
+    return vx;
+}
+
 void setDefaultScene() {
     float lx = -0.45f, ly = -1.0f, lz = -0.3f;
     float len = std::sqrt(lx * lx + ly * ly + lz * lz);
-    g.scene = SceneUniforms{
-        {},
-        {lx / len, ly / len, lz / len, 1.6f},
-        {1.0f, 0.93f, 0.8f, 1.0f},
-        {0.22f, 0.28f, 0.38f, 1.0f},
-        {0.1f, 0.08f, 0.06f, 1.0f},
-        {0.0f, 0.0f, 0.0f, 1.0f},
-        {0.45f, 0.55f, 0.7f, 0.018f},
-    };
+    g.scene = SceneUniforms{};
+    float dir[4] = {lx / len, ly / len, lz / len, 1.6f};
+    float color[4] = {1.0f, 0.93f, 0.8f, 1.0f};
+    float sky[4] = {0.22f, 0.28f, 0.38f, 1.0f};
+    float ground[4] = {0.1f, 0.08f, 0.06f, 1.0f};
+    float fog[4] = {0.45f, 0.55f, 0.7f, 0.018f};
+    std::memcpy(g.scene.lightDir, dir, 16);
+    std::memcpy(g.scene.lightColor, color, 16);
+    std::memcpy(g.scene.skyColor, sky, 16);
+    std::memcpy(g.scene.groundColor, ground, 16);
+    std::memcpy(g.scene.fog, fog, 16);
 }
 
-void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess,
-                  VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.oldLayout = from;
-    b.newLayout = to;
-    b.srcAccessMask = srcAccess;
-    b.dstAccessMask = dstAccess;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+// Copies joint matrices into this frame's storage buffer; returns the first index or -1.
+int32_t pushJoints(const float* matrices, int32_t count) {
+    if (count <= 0 || g.jointCursor + static_cast<uint32_t>(count) > kMaxJoints) return -1;
+    std::memcpy(g.jointMapped[g.frame] + g.jointCursor * 16, matrices, static_cast<size_t>(count) * 64);
+    auto base = static_cast<int32_t>(g.jointCursor);
+    g.jointCursor += static_cast<uint32_t>(count);
+    return base;
+}
+
+void queueDraw(int32_t mesh, const float* model, int32_t texture, float r, float g2, float b, float roughness,
+               float metallic, float emissive, int32_t flags, int32_t jointBase, float uvScale = 0.0f) {
+    if (!g.frameActive || mesh < 0 || mesh >= static_cast<int32_t>(g.meshes.size())) return;
+    if (texture < 0 || texture >= static_cast<int32_t>(g.textures.size())) texture = 0;
+    DrawCommand d;
+    d.mesh = mesh;
+    std::memcpy(d.model, model, sizeof(d.model));
+    d.color[0] = r;
+    d.color[1] = g2;
+    d.color[2] = b;
+    d.color[3] = 1.0f;
+    d.material[0] = roughness;
+    d.material[1] = metallic;
+    d.material[2] = emissive;
+    d.material[3] = uvScale;
+    d.texture = texture;
+    d.flags = flags;
+    d.jointBase = jointBase;
+    g.draws.push_back(d);
+}
+
+void bindMesh(VkCommandBuffer cmd, const Mesh& m) {
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &m.vertexBuffer, &offset);
+    vkCmdBindIndexBuffer(cmd, m.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+}
+
+void pushConstantsFor(const DrawCommand& d, PushConstants& pc) {
+    for (int row = 0; row < 3; ++row) {
+        float* dst = row == 0 ? pc.model0 : row == 1 ? pc.model1 : pc.model2;
+        for (int col = 0; col < 4; ++col) dst[col] = d.model[col * 4 + row];
+    }
+    std::memcpy(pc.color, d.color, sizeof(pc.color));
+    std::memcpy(pc.material, d.material, sizeof(pc.material));
+    pc.info[0] = d.texture;
+    pc.info[1] = d.flags;
+    pc.info[2] = d.jointBase;
+    pc.info[3] = 0;
+}
+
+// Orthographic light camera covering a box around the point the camera looks at.
+void computeLightViewProj(float* out) {
+    // Camera forward is the negated third row of the view matrix.
+    float fx = -g.view[2], fy = -g.view[6], fz = -g.view[10];
+    float cx = g.scene.cameraPos[0] + fx * kShadowExtent * 0.6f;
+    float cy = g.scene.cameraPos[1] + fy * kShadowExtent * 0.6f;
+    float cz = g.scene.cameraPos[2] + fz * kShadowExtent * 0.6f;
+    cy = std::max(cy, 0.0f);
+
+    const float* L = g.scene.lightDir;
+    float upx = 0, upy = 1, upz = 0;
+    if (std::fabs(L[1]) > 0.99f) { upy = 0; upz = 1; }
+    float rx = L[1] * upz - L[2] * upy, ry = L[2] * upx - L[0] * upz, rz = L[0] * upy - L[1] * upx;
+    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
+    rx /= rl; ry /= rl; rz /= rl;
+    float ux = ry * L[2] - rz * L[1], uy = rz * L[0] - rx * L[2], uz = rx * L[1] - ry * L[0];
+
+    // Snap the center to shadow-map texels so shadows do not shimmer when the camera moves.
+    float texel = 2.0f * kShadowExtent / static_cast<float>(kShadowMapSize);
+    float pr = std::floor((rx * cx + ry * cy + rz * cz) / texel) * texel;
+    float pu = std::floor((ux * cx + uy * cy + uz * cz) / texel) * texel;
+    float pf = L[0] * cx + L[1] * cy + L[2] * cz;
+
+    const float depth = 80.0f;
+    float view[16] = {rx, ux, L[0], 0, ry, uy, L[1], 0, rz, uz, L[2], 0, -pr, -pu, -pf, 1};
+    float proj[16] = {};
+    proj[0] = 1.0f / kShadowExtent;
+    proj[5] = 1.0f / kShadowExtent;
+    proj[10] = 1.0f / (2.0f * depth);
+    proj[14] = 0.5f;
+    proj[15] = 1.0f;
+    mat4Mul(proj, view, out);
+}
+
+void recordFrame(VkCommandBuffer cmd) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    // 1) Shadow map
+    VkClearValue shadowClear;
+    shadowClear.depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo sp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    sp.renderPass = g.shadowPass;
+    sp.framebuffer = g.shadowFramebuffer;
+    sp.renderArea = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
+    sp.clearValueCount = 1;
+    sp.pClearValues = &shadowClear;
+    vkCmdBeginRenderPass(cmd, &sp, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadowPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipelineLayout, 0, 1, &g.descriptorSets[g.frame],
+                            0, nullptr);
+    for (const DrawCommand& d : g.draws) {
+        if (d.flags & kFlagChecker) continue;   // ground planes do not cast shadows
+        PushConstants pc;
+        pushConstantsFor(d, pc);
+        const Mesh& m = g.meshes[d.mesh];
+        bindMesh(cmd, m);
+        vkCmdPushConstants(cmd, g.pipelineLayout, stages, 0, sizeof(pc), &pc);
+        vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
+    }
+    vkCmdEndRenderPass(cmd);
+
+    // 2) Main pass
+    VkClearValue clears[3];
+    clears[0].color = {{g.clearColor[0], g.clearColor[1], g.clearColor[2], 1.0f}};
+    clears[1].depthStencil = {1.0f, 0};
+    clears[2].color = clears[0].color;
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = g.renderPass;
+    rp.framebuffer = g.framebuffers[g.imageIndex];
+    rp.renderArea = {{0, 0}, g.extent};
+    rp.clearValueCount = g.samples != VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
+    rp.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport viewport{0, 0, static_cast<float>(g.extent.width), static_cast<float>(g.extent.height), 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, g.extent};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipelineLayout, 0, 1, &g.descriptorSets[g.frame],
+                            0, nullptr);
+    for (const DrawCommand& d : g.draws) {
+        PushConstants pc;
+        pushConstantsFor(d, pc);
+        const Mesh& m = g.meshes[d.mesh];
+        bindMesh(cmd, m);
+        vkCmdPushConstants(cmd, g.pipelineLayout, stages, 0, sizeof(pc), &pc);
+        vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
+    }
+    vkCmdEndRenderPass(cmd);
+}
+
+constexpr float kExposure = 0.6f;   // must match EXPOSURE in mesh.frag
+float aces(float x) {
+    x *= kExposure;
+    return std::clamp((x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f), 0.0f, 1.0f);
 }
 
 // Writes a 24-bit BMP from 4-byte pixels (BGRA or RGBA swapchain formats).
@@ -980,7 +1329,7 @@ void writeBmp(const std::string& path, const uint8_t* pixels, uint32_t w, uint32
     std::fclose(f);
 }
 
-// Records a copy of the current swapchain image into a host buffer, then saves it.
+// Records a copy of the current swapchain image into a host buffer.
 void captureFrame(VkCommandBuffer cmd, VkBuffer& buffer, VkDeviceMemory& memory) {
     VkDeviceSize bytes = static_cast<VkDeviceSize>(g.extent.width) * g.extent.height * 4;
     if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -998,129 +1347,52 @@ void captureFrame(VkCommandBuffer cmd, VkBuffer& buffer, VkDeviceMemory& memory)
                  VK_ACCESS_TRANSFER_READ_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 }
 
-void queueDraw(int32_t mesh, const float* model, float r, float g2, float b, float flags) {
-    if (!g.frameActive || mesh < 0 || mesh >= static_cast<int32_t>(g.meshes.size())) return;
-    DrawCommand d;
-    d.mesh = mesh;
-    std::memcpy(d.model, model, sizeof(d.model));
-    d.color[0] = r;
-    d.color[1] = g2;
-    d.color[2] = b;
-    d.color[3] = flags;
-    g.draws.push_back(d);
-}
+// Draws every mesh node of a model with the given pose.
+void drawModel(int32_t id, const float* transform, int32_t anim, float time, int32_t animB, float timeB, float weight) {
+    if (id < 0 || id >= static_cast<int32_t>(g.models.size()) || !g.frameActive) return;
+    Model& model = *g.models[id];
+    const ron::gltf::Model& m = model.data;
+    std::vector<ron::gltf::Mat4> local, global;
+    ron::gltf::samplePose(m, anim, time, animB, timeB, weight, local);
+    ron::gltf::globalTransforms(m, local, global);
+    ron::gltf::Mat4 user;
+    std::memcpy(user.data(), transform, 64);
 
-void bindMesh(VkCommandBuffer cmd, const Mesh& m) {
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m.vertexBuffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-}
-
-// Orthographic light camera covering a box around the point the camera looks at.
-void computeLightViewProj(float* out) {
-    // Camera forward is the negated third row of the view matrix.
-    float fx = -g.view[2], fy = -g.view[6], fz = -g.view[10];
-    float cx = g.scene.cameraPos[0] + fx * kShadowExtent * 0.6f;
-    float cy = g.scene.cameraPos[1] + fy * kShadowExtent * 0.6f;
-    float cz = g.scene.cameraPos[2] + fz * kShadowExtent * 0.6f;
-    cy = std::max(cy, 0.0f);
-
-    const float* L = g.scene.lightDir;
-    // Light basis: forward = L, right = normalize(L x up), up = right x L
-    float upx = 0, upy = 1, upz = 0;
-    if (std::fabs(L[1]) > 0.99f) { upy = 0; upz = 1; }
-    float rx = L[1] * upz - L[2] * upy, ry = L[2] * upx - L[0] * upz, rz = L[0] * upy - L[1] * upx;
-    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
-    rx /= rl; ry /= rl; rz /= rl;
-    float ux = ry * L[2] - rz * L[1], uy = rz * L[0] - rx * L[2], uz = rx * L[1] - ry * L[0];
-
-    // Snap the center to shadow-map texels so shadows do not shimmer when the camera moves.
-    float texel = 2.0f * kShadowExtent / static_cast<float>(kShadowMapSize);
-    float pr = std::floor((rx * cx + ry * cy + rz * cz) / texel) * texel;
-    float pu = std::floor((ux * cx + uy * cy + uz * cz) / texel) * texel;
-    float pf = L[0] * cx + L[1] * cy + L[2] * cz;
-
-    const float depth = 80.0f;
-    float view[16] = {rx, ux, L[0], 0, ry, uy, L[1], 0, rz, uz, L[2], 0, -pr, -pu, -pf, 1};
-    // Ortho: x,y in [-E, E] -> [-1, 1]; z (along L) in [-depth, depth] -> [0, 1]
-    float proj[16] = {};
-    proj[0] = 1.0f / kShadowExtent;
-    proj[5] = 1.0f / kShadowExtent;
-    proj[10] = 1.0f / (2.0f * depth);
-    proj[14] = 0.5f;
-    proj[15] = 1.0f;
-    mat4Mul(proj, view, out);
-}
-
-void recordFrame(VkCommandBuffer cmd) {
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
-    // 1) Shadow map
-    float lightVP[16];
-    std::memcpy(lightVP, g.scene.lightViewProj, sizeof(lightVP));
-    VkClearValue shadowClear;
-    shadowClear.depthStencil = {1.0f, 0};
-    VkRenderPassBeginInfo sp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    sp.renderPass = g.shadowPass;
-    sp.framebuffer = g.shadowFramebuffer;
-    sp.renderArea = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
-    sp.clearValueCount = 1;
-    sp.pClearValues = &shadowClear;
-    vkCmdBeginRenderPass(cmd, &sp, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadowPipeline);
-    for (const DrawCommand& d : g.draws) {
-        if (d.color[3] > 0.5f) continue;   // ground planes do not cast shadows
-        float mvp[16];
-        mat4Mul(lightVP, d.model, mvp);
-        const Mesh& m = g.meshes[d.mesh];
-        bindMesh(cmd, m);
-        vkCmdPushConstants(cmd, g.shadowLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
-        vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
-    }
-    vkCmdEndRenderPass(cmd);
-
-    // 2) Main pass
-    VkClearValue clears[3];
-    clears[0].color = {{g.clearColor[0], g.clearColor[1], g.clearColor[2], 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
-    clears[2].color = clears[0].color;
-    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rp.renderPass = g.renderPass;
-    rp.framebuffer = g.framebuffers[g.imageIndex];
-    rp.renderArea = {{0, 0}, g.extent};
-    rp.clearValueCount = g.samples != VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
-    rp.pClearValues = clears;
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport viewport{0, 0, static_cast<float>(g.extent.width), static_cast<float>(g.extent.height), 0.0f, 1.0f};
-    VkRect2D scissor{{0, 0}, g.extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipelineLayout, 0, 1, &g.descriptorSets[g.frame],
-                            0, nullptr);
-    for (const DrawCommand& d : g.draws) {
-        PushConstants pc;
-        mat4Mul(g.viewProj, d.model, pc.mvp);
-        for (int row = 0; row < 3; ++row) {
-            float* dst = row == 0 ? pc.model0 : row == 1 ? pc.model1 : pc.model2;
-            for (int col = 0; col < 4; ++col) dst[col] = d.model[col * 4 + row];
+    for (size_t n = 0; n < m.nodes.size(); ++n) {
+        const ron::gltf::Node& node = m.nodes[n];
+        if (node.mesh < 0 || static_cast<size_t>(node.mesh) >= m.meshes.size()) continue;
+        int32_t jointBase = -1;
+        if (node.skin >= 0 && static_cast<size_t>(node.skin) < m.skins.size()) {
+            // Skinned: vertices are moved by joint matrices (global joint * inverse bind).
+            const ron::gltf::Skin& skin = m.skins[node.skin];
+            std::vector<float> palette(skin.joints.size() * 16);
+            for (size_t j = 0; j < skin.joints.size(); ++j) {
+                ron::gltf::Mat4 jm = ron::gltf::multiply(global[skin.joints[j]], skin.inverseBind[j]);
+                std::memcpy(&palette[j * 16], jm.data(), 64);
+            }
+            jointBase = pushJoints(palette.data(), static_cast<int32_t>(skin.joints.size()));
         }
-        std::memcpy(pc.color, d.color, sizeof(pc.color));
-        const Mesh& m = g.meshes[d.mesh];
-        bindMesh(cmd, m);
-        vkCmdPushConstants(cmd, g.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(pc), &pc);
-        vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
+        ron::gltf::Mat4 world = jointBase >= 0 ? user : ron::gltf::multiply(user, global[n]);
+        const auto& prims = m.meshes[node.mesh].primitives;
+        for (size_t p = 0; p < prims.size(); ++p) {
+            int32_t mesh = model.primitiveMeshes[node.mesh][p];
+            float color[4] = {1, 1, 1, 1};
+            int32_t texture = 0;
+            float roughness = 0.8f, metallic = 0.0f;
+            if (prims[p].material >= 0 && static_cast<size_t>(prims[p].material) < m.materials.size()) {
+                const auto& mat = m.materials[prims[p].material];
+                std::memcpy(color, mat.baseColor, 16);
+                roughness = mat.roughness;
+                metallic = mat.metallic;
+                if (mat.image >= 0 && static_cast<size_t>(mat.image) < model.imageTextures.size())
+                    texture = model.imageTextures[mat.image];
+            }
+            bool skinned = jointBase >= 0 && prims[p].skinned;
+            queueDraw(mesh, world.data(), texture, color[0], color[1], color[2], roughness, metallic, 0.0f,
+                      skinned ? kFlagSkinned : 0, skinned ? jointBase : 0);
+        }
     }
-    vkCmdEndRenderPass(cmd);
 }
-
-constexpr float kExposure = 0.6f;   // must match EXPOSURE in mesh.frag
-float aces(float x) {
-    x *= kExposure;
-    return std::clamp((x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f), 0.0f, 1.0f); }
 
 } // namespace
 
@@ -1139,8 +1411,8 @@ RE_API bool engine_init(int32_t width, int32_t height, const char* title) {
     si.hwnd = g.hwnd;
     if (!check(vkCreateWin32SurfaceKHR(g.instance, &si, nullptr, &g.surface), "vkCreateWin32SurfaceKHR")) return false;
 
-    if (!pickDevice() || !createDevice() || !createRenderPass() || !createShadowResources() || !createPipeline() ||
-        !createFrameResources())
+    if (!pickDevice() || !createDevice() || !createRenderPass() || !createLayout() || !createShadowResources() ||
+        !createPipeline() || !createFrameResources())
         return false;
     createSwapchain();
     setDefaultScene();
@@ -1168,18 +1440,23 @@ RE_API void engine_shutdown() {
         vkFreeMemory(g.device, m.indexMemory, nullptr);
     }
     g.meshes.clear();
+    for (Texture& t : g.textures) destroyImage(t.image, t.memory, t.view);
+    g.textures.clear();
+    g.models.clear();
     destroySwapchain();
     for (int i = 0; i < kFramesInFlight; ++i) {
         vkDestroySemaphore(g.device, g.imageAvailable[i], nullptr);
         vkDestroyFence(g.device, g.inFlight[i], nullptr);
         vkDestroyBuffer(g.device, g.uniformBuffers[i], nullptr);
         vkFreeMemory(g.device, g.uniformMemory[i], nullptr);
+        vkDestroyBuffer(g.device, g.jointBuffers[i], nullptr);
+        vkFreeMemory(g.device, g.jointMemory[i], nullptr);
     }
     vkDestroyPipeline(g.device, g.shadowPipeline, nullptr);
-    vkDestroyPipelineLayout(g.device, g.shadowLayout, nullptr);
     vkDestroyFramebuffer(g.device, g.shadowFramebuffer, nullptr);
     vkDestroyRenderPass(g.device, g.shadowPass, nullptr);
     vkDestroySampler(g.device, g.shadowSampler, nullptr);
+    vkDestroySampler(g.device, g.textureSampler, nullptr);
     destroyImage(g.shadowImage, g.shadowMemory, g.shadowView);
     vkDestroyCommandPool(g.device, g.commandPool, nullptr);
     vkDestroyDescriptorPool(g.device, g.descriptorPool, nullptr);
@@ -1196,6 +1473,7 @@ RE_API void engine_shutdown() {
 
 RE_API bool engine_running() {
     std::memcpy(g.prevKeys, g.keys, sizeof(g.keys));
+    std::memcpy(g.prevMouse, g.mouse, sizeof(g.mouse));
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
@@ -1254,6 +1532,7 @@ RE_API bool engine_begin_frame(float r, float gg, float b) {
     g.clearColor[1] = aces(gg);
     g.clearColor[2] = aces(b);
     g.draws.clear();
+    g.jointCursor = 1;   // joint 0 stays the identity
     g.frameActive = true;
     return true;
 }
@@ -1262,7 +1541,7 @@ RE_API void engine_end_frame() {
     if (!g.frameActive) return;
     g.frameActive = false;
     VkCommandBuffer cmd = g.commands[g.frame];
-    mat4Mul(g.proj, g.view, g.viewProj);
+    mat4Mul(g.proj, g.view, g.scene.viewProj);
     computeLightViewProj(g.scene.lightViewProj);
     std::memcpy(g.uniformMapped[g.frame], &g.scene, sizeof(g.scene));
     vkResetCommandBuffer(cmd, 0);
@@ -1313,10 +1592,7 @@ RE_API void engine_end_frame() {
     g.frame = (g.frame + 1) % kFramesInFlight;
 }
 
-RE_API void engine_set_title(const char* title) {
-    g.title = title ? title : "";
-}
-
+RE_API void engine_set_title(const char* title) { g.title = title ? title : ""; }
 RE_API int32_t engine_width() { return g.width; }
 RE_API int32_t engine_height() { return g.height; }
 RE_API float engine_aspect() { return g.height > 0 ? static_cast<float>(g.width) / static_cast<float>(g.height) : 1.0f; }
@@ -1347,6 +1623,12 @@ RE_API void engine_set_light(float dx, float dy, float dz, float intensity) {
     g.scene.lightDir[3] = intensity;
 }
 
+RE_API void engine_set_light_color(float r, float gg, float b) {
+    g.scene.lightColor[0] = r;
+    g.scene.lightColor[1] = gg;
+    g.scene.lightColor[2] = b;
+}
+
 RE_API void engine_set_ambient(float sr, float sg, float sb, float gr, float gg, float gb) {
     g.scene.skyColor[0] = sr;
     g.scene.skyColor[1] = sg;
@@ -1363,23 +1645,30 @@ RE_API void engine_set_fog(float r, float gg, float b, float density) {
     g.scene.fog[3] = density;
 }
 
+RE_API void engine_set_material(float roughness, float metallic, float emissive, float worldUvScale) {
+    g.material[0] = roughness;
+    g.material[1] = metallic;
+    g.material[2] = emissive;
+    g.material[3] = worldUvScale;
+}
+
+// ───────────── Meshes ─────────────
+
 RE_API int32_t engine_mesh_cube() {
-    // 6 faces x 4 vertices, each face with its own normal.
+    // 6 faces x 4 vertices, each face with its own normal and full 0..1 UVs.
     static const float n[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    std::vector<float> v;
+    std::vector<Vertex> v;
     std::vector<uint32_t> idx;
     for (int f = 0; f < 6; ++f) {
         float nx = n[f][0], ny = n[f][1], nz = n[f][2];
-        // Two axes spanning the face
-        float ux = ny, uy = nz, uz = nx;    // a vector perpendicular to n
+        float ux = ny, uy = nz, uz = nx;                                                   // perpendicular to n
         float vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;   // n x u
-        uint32_t base = static_cast<uint32_t>(v.size() / 6);
+        auto base = static_cast<uint32_t>(v.size());
         const float corners[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
         for (auto& c : corners) {
-            float px = 0.5f * (nx + c[0] * ux + c[1] * vx);
-            float py = 0.5f * (ny + c[0] * uy + c[1] * vy);
-            float pz = 0.5f * (nz + c[0] * uz + c[1] * vz);
-            v.insert(v.end(), {px, py, pz, nx, ny, nz});
+            v.push_back(makeVertex(0.5f * (nx + c[0] * ux + c[1] * vx), 0.5f * (ny + c[0] * uy + c[1] * vy),
+                                   0.5f * (nz + c[0] * uz + c[1] * vz), nx, ny, nz, (c[0] + 1) * 0.5f,
+                                   (c[1] + 1) * 0.5f));
         }
         idx.insert(idx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
     }
@@ -1389,20 +1678,20 @@ RE_API int32_t engine_mesh_cube() {
 RE_API int32_t engine_mesh_sphere(int32_t rings, int32_t segments) {
     rings = std::max(3, rings);
     segments = std::max(3, segments);
-    std::vector<float> v;
+    std::vector<Vertex> v;
     std::vector<uint32_t> idx;
     const float pi = 3.14159265358979f;
     for (int r = 0; r <= rings; ++r) {
         float phi = pi * static_cast<float>(r) / static_cast<float>(rings);
         for (int s = 0; s <= segments; ++s) {
             float theta = 2.0f * pi * static_cast<float>(s) / static_cast<float>(segments);
-            float x = std::sin(phi) * std::cos(theta);
-            float y = std::cos(phi);
-            float z = std::sin(phi) * std::sin(theta);
-            v.insert(v.end(), {0.5f * x, 0.5f * y, 0.5f * z, x, y, z});
+            float x = std::sin(phi) * std::cos(theta), y = std::cos(phi), z = std::sin(phi) * std::sin(theta);
+            v.push_back(makeVertex(0.5f * x, 0.5f * y, 0.5f * z, x, y, z,
+                                   static_cast<float>(s) / static_cast<float>(segments),
+                                   static_cast<float>(r) / static_cast<float>(rings)));
         }
     }
-    uint32_t stride = static_cast<uint32_t>(segments + 1);
+    auto stride = static_cast<uint32_t>(segments + 1);
     for (uint32_t r = 0; r < static_cast<uint32_t>(rings); ++r)
         for (uint32_t s = 0; s < static_cast<uint32_t>(segments); ++s) {
             uint32_t a = r * stride + s, b = a + stride;
@@ -1413,29 +1702,142 @@ RE_API int32_t engine_mesh_sphere(int32_t rings, int32_t segments) {
 
 RE_API int32_t engine_mesh_plane(float size) {
     float h = size * 0.5f;
-    std::vector<float> v = {-h, 0, -h, 0, 1, 0, h, 0, -h, 0, 1, 0, h, 0, h, 0, 1, 0, -h, 0, h, 0, 1, 0};
+    float t = size * 0.25f;   // UVs repeat every 4 units
+    std::vector<Vertex> v = {makeVertex(-h, 0, -h, 0, 1, 0, 0, 0), makeVertex(h, 0, -h, 0, 1, 0, t, 0),
+                             makeVertex(h, 0, h, 0, 1, 0, t, t), makeVertex(-h, 0, h, 0, 1, 0, 0, t)};
     std::vector<uint32_t> idx = {0, 2, 1, 0, 3, 2};
     return uploadMesh(v, idx);
 }
 
+// vertices: 8 floats each (position, normal, uv)
 RE_API int32_t engine_mesh_create(const float* vertices, int32_t vertexCount, const uint32_t* indices, int32_t indexCount) {
     if (!vertices || !indices || vertexCount <= 0 || indexCount <= 0) return -1;
-    std::vector<float> v(vertices, vertices + vertexCount * 6);
+    std::vector<Vertex> v;
+    for (int32_t i = 0; i < vertexCount; ++i) {
+        const float* s = vertices + i * 8;
+        v.push_back(makeVertex(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]));
+    }
     std::vector<uint32_t> idx(indices, indices + indexCount);
+    for (uint32_t& i : idx)
+        if (i >= static_cast<uint32_t>(vertexCount)) i = 0;
     return uploadMesh(v, idx);
 }
 
+// vertices: 16 floats each (position, normal, uv, 4 joint indices, 4 weights)
+RE_API int32_t engine_mesh_create_skinned(const float* vertices, int32_t vertexCount, const uint32_t* indices,
+                                          int32_t indexCount) {
+    if (!vertices || !indices || vertexCount <= 0 || indexCount <= 0) return -1;
+    std::vector<Vertex> v;
+    for (int32_t i = 0; i < vertexCount; ++i) {
+        const float* s = vertices + i * 16;
+        Vertex vx = makeVertex(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+        for (int k = 0; k < 4; ++k) {
+            vx.joints[k] = static_cast<uint8_t>(std::clamp(s[8 + k], 0.0f, 255.0f));
+            vx.weights[k] = s[12 + k];
+        }
+        v.push_back(vx);
+    }
+    std::vector<uint32_t> idx(indices, indices + indexCount);
+    for (uint32_t& i : idx)
+        if (i >= static_cast<uint32_t>(vertexCount)) i = 0;
+    return uploadMesh(v, idx);
+}
+
+// ───────────── Textures ─────────────
+
+RE_API int32_t engine_texture_create(int32_t width, int32_t height, const uint8_t* rgba) {
+    if (!rgba || width <= 0 || height <= 0) return -1;
+    return createTexture(static_cast<uint32_t>(width), static_cast<uint32_t>(height), rgba);
+}
+
+RE_API int32_t engine_texture_load(const char* path) {
+    ron::png::Image img;
+    std::string error;
+    if (!path || !ron::png::load(path, img, error)) {
+        std::fprintf(stderr, "ron_engine: texture '%s': %s\n", path ? path : "(null)", error.c_str());
+        return -1;
+    }
+    return createTexture(img.width, img.height, img.rgba.data());
+}
+
+// ───────────── Drawing ─────────────
+
 RE_API void engine_draw(int32_t mesh, const float* model16, float r, float gg, float b) {
-    queueDraw(mesh, model16, r, gg, b, 0.0f);
+    queueDraw(mesh, model16, 0, r, gg, b, g.material[0], g.material[1], g.material[2], 0, 0, g.material[3]);
 }
 
 RE_API void engine_draw_checker(int32_t mesh, const float* model16, float r, float gg, float b) {
-    queueDraw(mesh, model16, r, gg, b, 1.0f);
+    queueDraw(mesh, model16, 0, r, gg, b, g.material[0], g.material[1], g.material[2], kFlagChecker, 0, g.material[3]);
 }
+
+RE_API void engine_draw_textured(int32_t mesh, const float* model16, int32_t texture, float r, float gg, float b) {
+    queueDraw(mesh, model16, texture, r, gg, b, g.material[0], g.material[1], g.material[2], 0, 0, g.material[3]);
+}
+
+RE_API void engine_draw_skinned(int32_t mesh, const float* model16, const float* joints16, int32_t jointCount,
+                                int32_t texture, float r, float gg, float b) {
+    if (!g.frameActive) return;   // the joint buffer of an inactive frame may still be read by the GPU
+    int32_t base = pushJoints(joints16, jointCount);
+    if (base < 0) return;
+    queueDraw(mesh, model16, texture, r, gg, b, g.material[0], g.material[1], g.material[2], kFlagSkinned, base, g.material[3]);
+}
+
+// ───────────── Models (glTF) ─────────────
+
+RE_API int32_t engine_model_load(const char* path) {
+    if (!g.initialized || !path) return -1;
+    auto model = std::make_unique<Model>();
+    std::string error;
+    if (!ron::gltf::load(path, model->data, error)) {
+        std::fprintf(stderr, "ron_engine: model '%s': %s\n", path, error.c_str());
+        return -1;
+    }
+    for (const auto& img : model->data.images) model->imageTextures.push_back(createTexture(img.width, img.height, img.rgba.data()));
+    for (const auto& mesh : model->data.meshes) {
+        std::vector<int32_t> ids;
+        for (const auto& prim : mesh.primitives) ids.push_back(uploadMesh(prim.vertices, prim.indices));
+        model->primitiveMeshes.push_back(std::move(ids));
+    }
+    g.models.push_back(std::move(model));
+    return static_cast<int32_t>(g.models.size() - 1);
+}
+
+RE_API int32_t engine_model_animation_count(int32_t model) {
+    if (model < 0 || model >= static_cast<int32_t>(g.models.size())) return 0;
+    return static_cast<int32_t>(g.models[model]->data.animations.size());
+}
+
+RE_API float engine_model_animation_duration(int32_t model, int32_t anim) {
+    if (model < 0 || model >= static_cast<int32_t>(g.models.size())) return 0;
+    const auto& anims = g.models[model]->data.animations;
+    return anim >= 0 && anim < static_cast<int32_t>(anims.size()) ? anims[anim].duration : 0.0f;
+}
+
+RE_API int32_t engine_model_find_animation(int32_t model, const char* name) {
+    if (model < 0 || model >= static_cast<int32_t>(g.models.size()) || !name) return -1;
+    const auto& anims = g.models[model]->data.animations;
+    for (size_t i = 0; i < anims.size(); ++i)
+        if (anims[i].name == name) return static_cast<int32_t>(i);
+    return -1;
+}
+
+RE_API void engine_draw_model(int32_t model, const float* transform16, int32_t anim, float time) {
+    drawModel(model, transform16, anim, time, -1, 0.0f, 0.0f);
+}
+
+RE_API void engine_draw_model_blend(int32_t model, const float* transform16, int32_t animA, float timeA, int32_t animB,
+                                    float timeB, float weight) {
+    drawModel(model, transform16, animA, timeA, animB, timeB, weight);
+}
+
+// ───────────── Input ─────────────
 
 RE_API bool engine_key_down(int32_t key) { return key >= 0 && key < 256 && g.keys[key]; }
 RE_API bool engine_key_pressed(int32_t key) { return key >= 0 && key < 256 && g.keys[key] && !g.prevKeys[key]; }
 RE_API bool engine_mouse_down(int32_t button) { return button >= 0 && button < 3 && g.mouse[button]; }
+RE_API bool engine_mouse_pressed(int32_t button) {
+    return button >= 0 && button < 3 && g.mouse[button] && !g.prevMouse[button];
+}
 RE_API float engine_mouse_dx() { return g.mouseDx; }
 RE_API float engine_mouse_dy() { return g.mouseDy; }
 RE_API float engine_mouse_wheel() { return g.wheel; }

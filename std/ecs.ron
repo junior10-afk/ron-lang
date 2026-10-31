@@ -27,6 +27,11 @@ struct Render {
     int mesh;
     Color color;
     bool checker;
+    int texture;      // 0 = none
+    float roughness;
+    float metallic;
+    float emissive;
+    float uv_scale;
 }
 
 struct World {
@@ -91,7 +96,12 @@ fn set_velocity(World* w, int e, Vec3 v) {
 }
 
 fn set_render(World* w, int e, int mesh, Color c) {
-    w.renders[e] = Render{mesh, c, false};
+    w.renders[e] = Render{mesh, c, false, 0, 0.6, 0.0, 0.0, 0.0};
+    w.masks[e] |= HAS_RENDER;
+}
+
+fn set_render(World* w, int e, int mesh, Material m) {
+    w.renders[e] = Render{mesh, m.color, false, m.texture, m.roughness, m.metallic, m.emissive, m.uv_scale};
     w.masks[e] |= HAS_RENDER;
 }
 
@@ -156,7 +166,9 @@ fn system_render(World* w) {
         if ((w.masks[e] & (HAS_RENDER | HAS_TRANSFORM)) != (HAS_RENDER | HAS_TRANSFORM)) continue;
         Mat4 m = model_matrix(&w.transforms[e]);
         Render* r = &w.renders[e];
+        engine_set_material(r.roughness, r.metallic, r.emissive, r.uv_scale);
         if (r.checker) engine_draw_checker(r.mesh, &m, r.color.r, r.color.g, r.color.b);
-        else engine_draw(r.mesh, &m, r.color.r, r.color.g, r.color.b);
+        else engine_draw_textured(r.mesh, &m, r.texture, r.color.r, r.color.g, r.color.b);
     }
+    engine_set_material(0.6, 0.0, 0.0, 0.0);
 }

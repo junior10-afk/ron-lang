@@ -1,30 +1,18 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
-
-layout(push_constant) uniform Push {
-    mat4 mvp;
-    vec4 model0;
-    vec4 model1;
-    vec4 model2;
-    vec4 color;    // rgb, w = material flags (1 = checkerboard)
-} pc;
-
-layout(set = 0, binding = 0) uniform Scene {
-    mat4 lightViewProj;
-    vec4 lightDir;     // xyz = direction the light travels, w = intensity
-    vec4 lightColor;
-    vec4 skyColor;     // ambient from above
-    vec4 groundColor;  // ambient from below
-    vec4 cameraPos;
-    vec4 fog;          // rgb = color, w = density
-} scene;
+layout(location = 2) in vec2 vUv;
 
 layout(set = 0, binding = 1) uniform sampler2DShadow shadowMap;
+layout(set = 0, binding = 2) uniform sampler2D textures[256];
 
 layout(location = 0) out vec4 outColor;
 
+const float PI = 3.14159265;
 const float EXPOSURE = 0.6;   // must match kExposure in engine.cpp
 
 vec3 aces(vec3 x) {
@@ -47,30 +35,73 @@ float shadow(vec3 worldPos, vec3 n, vec3 L) {
     return sum / 9.0;
 }
 
+// Cook-Torrance microfacet BRDF: GGX distribution, Smith-Schlick geometry, Schlick Fresnel.
+float distributionGGX(float ndh, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+float geometrySmith(float ndv, float ndl, float roughness) {
+    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    return (ndv / (ndv * (1.0 - k) + k)) * (ndl / (ndl * (1.0 - k) + k));
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
 void main() {
     vec3 n = normalize(vNormal);
     if (!gl_FrontFacing) n = -n;
-    vec3 albedo = pc.color.rgb;
 
-    // Procedural checkerboard for ground-like surfaces
-    if (pc.color.w > 0.5) {
-        vec2 cell = floor(vWorldPos.xz);
-        float c = mod(cell.x + cell.y, 2.0);
-        albedo *= mix(0.72, 1.0, c);
+    // World-space (box-projected) UVs keep texel density constant on stretched boxes.
+    vec2 uv = vUv;
+    if (pc.material.w > 0.0) {
+        vec3 an = abs(n);
+        vec3 wp = vWorldPos * pc.material.w;
+        uv = an.x > an.y && an.x > an.z ? wp.zy : (an.y > an.z ? wp.xz : wp.xy);
     }
+    vec4 tex = texture(textures[pc.info.x], uv);
+    vec3 albedo = pc.color.rgb * tex.rgb;
+    if ((pc.info.y & FLAG_CHECKER) != 0) {
+        vec2 cell = floor(vWorldPos.xz);
+        albedo *= mix(0.72, 1.0, mod(cell.x + cell.y, 2.0));
+    }
+    float roughness = clamp(pc.material.x, 0.04, 1.0);
+    float metallic = clamp(pc.material.y, 0.0, 1.0);
 
     vec3 L = normalize(-scene.lightDir.xyz);
     vec3 V = normalize(scene.cameraPos.xyz - vWorldPos);
     vec3 H = normalize(L + V);
-
     float ndl = max(dot(n, L), 0.0);
-    float sh = ndl > 0.0 ? shadow(vWorldPos, n, L) : 0.0;
-    float spec = pow(max(dot(n, H), 0.0), 64.0) * 0.4 * step(0.0, ndl);
-    float hemi = n.y * 0.5 + 0.5;
-    vec3 ambient = mix(scene.groundColor.rgb, scene.skyColor.rgb, hemi);
+    float ndv = max(dot(n, V), 1e-4);
+    float ndh = max(dot(n, H), 0.0);
 
-    vec3 direct = scene.lightColor.rgb * scene.lightDir.w * sh;
-    vec3 lit = albedo * (ambient + direct * ndl) + direct * spec;
+    vec3 f0 = mix(vec3(0.04), albedo, metallic);
+    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), f0);
+    float D = distributionGGX(ndh, roughness);
+    float G = geometrySmith(ndv, ndl, roughness);
+    vec3 specular = D * G * F / max(4.0 * ndv * ndl, 1e-4);
+    vec3 kd = (1.0 - F) * (1.0 - metallic);
+
+    float sh = ndl > 0.0 ? shadow(vWorldPos, n, L) : 0.0;
+    vec3 radiance = scene.lightColor.rgb * scene.lightDir.w;
+    vec3 direct = (kd * albedo + specular * PI) * radiance * ndl * sh;
+
+    // Image-free ambient: hemispheric diffuse + a sky/ground "environment" reflection.
+    float hemi = n.y * 0.5 + 0.5;
+    vec3 ambientDiffuse = mix(scene.groundColor.rgb, scene.skyColor.rgb, hemi);
+    // Reflections see a bright horizon/sky (the fog color) above and the lit ground below.
+    vec3 R = reflect(-V, n);
+    vec3 skyReflect = mix(scene.fog.rgb * 1.6, scene.skyColor.rgb * 2.5, clamp(R.y, 0.0, 1.0));
+    vec3 groundReflect = scene.groundColor.rgb * 2.5 + scene.lightColor.rgb * scene.lightDir.w * 0.08;
+    vec3 envColor = mix(groundReflect, skyReflect, smoothstep(-0.15, 0.15, R.y));
+    vec3 Fa = f0 + (max(vec3(1.0 - roughness), f0) - f0) * pow(1.0 - ndv, 5.0);
+    vec3 ambient = (1.0 - Fa) * (1.0 - metallic) * albedo * ambientDiffuse + Fa * envColor * (1.0 - roughness * 0.7);
+
+    vec3 lit = direct + ambient + albedo * pc.material.z;
 
     float dist = length(scene.cameraPos.xyz - vWorldPos);
     float fogAmount = 1.0 - exp(-pow(dist * scene.fog.w, 2.0));
