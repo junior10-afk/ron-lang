@@ -1,0 +1,38 @@
+// Null-terminated byte strings (u8*).
+
+fn strlen(u8* s) -> u64 {
+    u64 n = 0;
+    while (s[n] != 0) n++;
+    return n;
+}
+
+fn streq(u8* a, u8* b) -> bool {
+    u64 i = 0;
+    while (a[i] != 0 && a[i] == b[i]) i++;
+    return a[i] == b[i];
+}
+
+// Writes the decimal digits of `v` into `buf` (at least 21 bytes); returns the length.
+fn u64_to_str(u64 v, u8* buf) -> u64 {
+    u8[24] tmp;
+    u64 n = 0;
+    if (v == 0) {
+        tmp[0] = '0';
+        n = 1;
+    }
+    while (v > 0) {
+        tmp[n] = ('0' + v % 10) as u8;
+        v /= 10;
+        n++;
+    }
+    for (u64 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    buf[n] = 0;
+    return n;
+}
+
+fn i64_to_str(i64 v, u8* buf) -> u64 {
+    if (v >= 0) return u64_to_str(v as u64, buf);
+    buf[0] = '-';
+    u64 magnitude = ~(v as u64) + 1;   // works for i64 min too
+    return 1 + u64_to_str(magnitude, buf + 1);
+}

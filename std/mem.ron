@@ -1,0 +1,36 @@
+// Heap memory. Allocations are zero-initialized.
+
+import "std/win32.ron";
+
+fn alloc(u64 bytes) -> void* {
+    return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes);
+}
+
+fn realloc(void* mem, u64 bytes) -> void* {
+    if (mem == null) return alloc(bytes);
+    return HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, mem, bytes);
+}
+
+fn free(void* mem) {
+    if (mem != null) HeapFree(GetProcessHeap(), 0, mem);
+}
+
+fn memcpy(void* dst, void* src, u64 bytes) {
+    u8* d = dst;
+    u8* s = src;
+    u64 i = 0;
+    // 8 bytes at a time, then the tail
+    while (i + 8 <= bytes) {
+        *((d + i) as u64*) = *((s + i) as u64*);
+        i += 8;
+    }
+    while (i < bytes) {
+        d[i] = s[i];
+        i++;
+    }
+}
+
+fn memset(void* dst, u8 value, u64 bytes) {
+    u8* d = dst;
+    for (u64 i = 0; i < bytes; i++) d[i] = value;
+}

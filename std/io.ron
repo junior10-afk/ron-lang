@@ -1,0 +1,83 @@
+// Console output and file reading.
+
+import "std/win32.ron";
+import "std/string.ron";
+import "std/mem.ron";
+
+void* __stdout = null;
+
+fn __out() -> void* {
+    if (__stdout == null) {
+        __stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleOutputCP(65001);   // UTF-8
+    }
+    return __stdout;
+}
+
+fn write_bytes(u8* bytes, u64 count) {
+    u32 written = 0;
+    WriteFile(__out(), bytes, count as u32, &written, null);
+}
+
+fn print(u8* s) { write_bytes(s, strlen(s)); }
+
+fn print(i64 v) {
+    u8[24] buf;
+    u64 n = i64_to_str(v, &buf[0]);
+    write_bytes(&buf[0], n);
+}
+
+fn print_u64(u64 v) {
+    u8[24] buf;
+    u64 n = u64_to_str(v, &buf[0]);
+    write_bytes(&buf[0], n);
+}
+
+fn print(bool b) { print(b ? "true" : "false"); }
+
+// Prints with up to 6 decimals, trailing zeros removed: 3.25, -0.5, 100.0
+fn print(f64 v) {
+    if (v != v) { print("nan"); return; }
+    if (v < 0.0) {
+        print("-");
+        v = -v;
+    }
+    if (v > 1.0e18) { print("inf"); return; }
+    u64 whole = v as u64;
+    u64 frac = ((v - (whole as f64)) * 1000000.0 + 0.5) as u64;
+    if (frac >= 1000000) {
+        whole++;
+        frac -= 1000000;
+    }
+    print_u64(whole);
+    u8[8] digits;
+    for (int i = 5; i >= 0; i--) {
+        digits[i] = ('0' + frac % 10) as u8;
+        frac /= 10;
+    }
+    int len = 6;
+    while (len > 1 && digits[len - 1] == '0') len--;
+    print(".");
+    write_bytes(&digits[0], len as u64);
+}
+
+fn println() { print("\n"); }
+fn println(u8* s) { print(s); print("\n"); }
+fn println(i64 v) { print(v); print("\n"); }
+fn println(f64 v) { print(v); print("\n"); }
+fn println(bool v) { print(v); print("\n"); }
+
+// Reads a whole file into a new zero-terminated buffer (free it with free()).
+// Returns null if the file cannot be read.
+fn read_file(u8* path, u64* size) -> u8* {
+    void* f = CreateFileA(path, GENERIC_READ, 1, null, OPEN_EXISTING, 0, null);
+    if (f as u64 == 0xFFFFFFFFFFFFFFFF) return null;
+    i64 len = 0;
+    GetFileSizeEx(f, &len);
+    u8* data = alloc((len + 1) as u64);
+    u32 got = 0;
+    ReadFile(f, data, len as u32, &got, null);
+    CloseHandle(f);
+    if (size != null) *size = got as u64;
+    return data;
+}

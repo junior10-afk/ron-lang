@@ -1,0 +1,28 @@
+// Raw Windows API imports used by the standard library.
+
+extern "kernel32.dll" {
+    fn GetStdHandle(u32 which) -> void*;
+    fn WriteFile(void* file, void* buffer, u32 bytes, u32* written, void* overlapped) -> i32;
+    fn ReadFile(void* file, void* buffer, u32 bytes, u32* read, void* overlapped) -> i32;
+    fn CreateFileA(u8* name, u32 access, u32 share, void* security, u32 creation, u32 flags, void* template) -> void*;
+    fn GetFileSizeEx(void* file, i64* size) -> i32;
+    fn CloseHandle(void* handle) -> i32;
+    fn ExitProcess(u32 code);
+    fn GetProcessHeap() -> void*;
+    fn HeapAlloc(void* heap, u32 flags, u64 bytes) -> void*;
+    fn HeapReAlloc(void* heap, u32 flags, void* mem, u64 bytes) -> void*;
+    fn HeapFree(void* heap, u32 flags, void* mem) -> i32;
+    fn QueryPerformanceCounter(i64* count) -> i32;
+    fn QueryPerformanceFrequency(i64* freq) -> i32;
+    fn Sleep(u32 ms);
+    fn SetConsoleOutputCP(u32 codepage) -> i32;
+    fn GetTickCount64() -> u64;
+}
+
+const u32 STD_INPUT_HANDLE = 4294967286;    // (DWORD)-10
+const u32 STD_OUTPUT_HANDLE = 4294967285;   // (DWORD)-11
+const u32 GENERIC_READ = 0x80000000;
+const u32 GENERIC_WRITE = 0x40000000;
+const u32 OPEN_EXISTING = 3;
+const u32 CREATE_ALWAYS = 2;
+const u32 HEAP_ZERO_MEMORY = 8;
