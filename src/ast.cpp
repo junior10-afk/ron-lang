@@ -152,7 +152,13 @@ Expr* cloneExpr(AstArena& a, Expr* e) {
         auto* c = a.make<StructLitExpr>(e->loc);
         c->typeName = src->typeName;
         c->typeArgs = src->typeArgs;
+        c->fieldNames = src->fieldNames;
         for (Expr* f : src->fields) c->fields.push_back(cloneExpr(a, f));
+        return c;
+    }
+    case ExprKind::ArrayLit: {
+        auto* c = a.make<ArrayLitExpr>(e->loc);
+        for (Expr* x : e->as<ArrayLitExpr>()->elems) c->elems.push_back(cloneExpr(a, x));
         return c;
     }
     }
@@ -193,6 +199,33 @@ Stmt* cloneStmt(AstArena& a, Stmt* s) {
         auto* c = a.make<WhileStmt>(s->loc);
         c->cond = cloneExpr(a, s->as<WhileStmt>()->cond);
         c->body = cloneStmt(a, s->as<WhileStmt>()->body);
+        c->label = s->as<WhileStmt>()->label;
+        return c;
+    }
+    case StmtKind::DoWhile: {
+        auto* c = a.make<DoWhileStmt>(s->loc);
+        c->body = cloneStmt(a, s->as<DoWhileStmt>()->body);
+        c->cond = cloneExpr(a, s->as<DoWhileStmt>()->cond);
+        c->label = s->as<DoWhileStmt>()->label;
+        return c;
+    }
+    case StmtKind::Switch: {
+        auto* src = s->as<SwitchStmt>();
+        auto* c = a.make<SwitchStmt>(s->loc);
+        c->subject = cloneExpr(a, src->subject);
+        for (const SwitchCase& sc : src->cases) {
+            SwitchCase copy;
+            copy.loc = sc.loc;
+            copy.isDefault = sc.isDefault;
+            for (Expr* v : sc.values) copy.values.push_back(cloneExpr(a, v));
+            for (Stmt* st : sc.body) copy.body.push_back(cloneStmt(a, st));
+            c->cases.push_back(std::move(copy));
+        }
+        return c;
+    }
+    case StmtKind::Defer: {
+        auto* c = a.make<DeferStmt>(s->loc);
+        c->body = cloneStmt(a, s->as<DeferStmt>()->body);
         return c;
     }
     case StmtKind::For: {
@@ -202,6 +235,7 @@ Stmt* cloneStmt(AstArena& a, Stmt* s) {
         c->cond = cloneExpr(a, src->cond);
         c->step = cloneExpr(a, src->step);
         c->body = cloneStmt(a, src->body);
+        c->label = src->label;
         return c;
     }
     case StmtKind::Return: {
@@ -209,10 +243,16 @@ Stmt* cloneStmt(AstArena& a, Stmt* s) {
         c->value = cloneExpr(a, s->as<ReturnStmt>()->value);
         return c;
     }
-    case StmtKind::Break:
-        return a.make<BreakStmt>(s->loc);
-    case StmtKind::Continue:
-        return a.make<ContinueStmt>(s->loc);
+    case StmtKind::Break: {
+        auto* c = a.make<BreakStmt>(s->loc);
+        c->label = s->as<BreakStmt>()->label;
+        return c;
+    }
+    case StmtKind::Continue: {
+        auto* c = a.make<ContinueStmt>(s->loc);
+        c->label = s->as<ContinueStmt>()->label;
+        return c;
+    }
     }
     return nullptr;
 }

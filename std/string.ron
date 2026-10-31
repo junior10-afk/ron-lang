@@ -218,10 +218,10 @@ fn substring(String s, int start, int count) -> String {
 fn find(String s, u8* needle) -> int {
     int n = strlen(needle) as int;
     for (int i = 0; i + n <= s.len; i++) {
-        bool match = true;
-        for (int j = 0; j < n && match; j++)
-            if (s.data[i + j] != needle[j]) match = false;
-        if (match) return i;
+        bool found = true;
+        for (int j = 0; j < n && found; j++)
+            if (s.data[i + j] != needle[j]) found = false;
+        if (found) return i;
     }
     return -1;
 }

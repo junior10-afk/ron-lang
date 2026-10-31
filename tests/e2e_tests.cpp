@@ -369,6 +369,70 @@ TEST(e2e_list_map_string) {
     )", "100\n9801\n9801\ntrue\n1550\n1000\n250.0\nfalse\nfalse\n2\nScore: 42 / 3.25\n17\n7\nSCORE\n-1233\nfalse\n"));
 }
 
+TEST(e2e_syntax_v01) {
+    CHECK(prints("syntax01", R"(
+        import "std/io.ron";
+        enum Dir { North, East, South, West }
+        fn name(Dir d) -> u8* {
+            switch (d) {
+            case Dir::North: return "N";
+            case Dir::East: return "E";
+            case Dir::South, Dir::West: return "SW";
+            }
+        }
+        struct V { float x, y, z; }
+        var counter = 10;
+        fn work(int n) -> int {
+            defer println("leave work");
+            for (var i = 0; i < 3; i++) {
+                defer print("d");
+                if (i == n) return i * 100;
+            }
+            println("");
+            return -1;
+        }
+        fn main() -> int {
+            var a = 5;
+            var f = 2.5;
+            const k = 3;
+            println(a + k);
+            println(f * 2.0);
+            println(name(Dir::West));
+            switch (a) {
+            case 1, 2: println("small");
+            case 5:
+                println("five");
+                break;
+            default: println("other");
+            }
+            var arr = [1, 2, 3, 4];
+            int[6] b = [7, 8];
+            println(arr[3] + b[1] + b[5] + arr.len);
+            V v = V{y: 2.0};
+            println(v.x + v.y + v.z);
+            println(work(1));
+            println(work(9));
+            int found = -1;
+            outer: for (var i = 0; i < 5; i++) {
+                for (var j = 0; j < 5; j++) {
+                    if (i * j == 6) {
+                        found = i * 10 + j;
+                        break outer;
+                    }
+                    if (j > i) continue outer;
+                }
+            }
+            println(found);
+            var n = 0;
+            do { n += 3; } while (n < 10);
+            println(n);
+            counter += 1;
+            println(counter);
+            return 0;
+        }
+    )", "8\n5.0\nSW\nfive\n16\n2.0\nddleave work\n100\nddd\nleave work\n-1\n23\n12\n11\n"));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

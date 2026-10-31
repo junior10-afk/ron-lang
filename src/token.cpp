@@ -29,6 +29,17 @@ const char* tokenKindName(TokenKind kind) {
     case TokenKind::KwTrue:        return "true";
     case TokenKind::KwFalse:       return "false";
     case TokenKind::KwNull:        return "null";
+    case TokenKind::KwVar:         return "var";
+    case TokenKind::KwSwitch:      return "switch";
+    case TokenKind::KwCase:        return "case";
+    case TokenKind::KwDefault:     return "default";
+    case TokenKind::KwDefer:       return "defer";
+    case TokenKind::KwDo:          return "do";
+    case TokenKind::KwMatch:       return "match";
+    case TokenKind::KwIn:          return "in";
+    case TokenKind::KwPrivate:     return "private";
+    case TokenKind::DotDot:        return "..";
+    case TokenKind::FatArrow:      return "=>";
     case TokenKind::LParen:        return "(";
     case TokenKind::RParen:        return ")";
     case TokenKind::LBrace:        return "{";

@@ -208,6 +208,7 @@ void CodeGen::genFunction(FuncDecl* f) {
     maxFrame_ = 0;
     maxOutgoing_ = 32;
     loops_.clear();
+    deferFrames_.clear();
     savedGprs_.clear();
     savedXmms_.clear();
     hiddenReturn_ = passedByRef(f->returnType);
@@ -289,8 +290,66 @@ void CodeGen::genFunction(FuncDecl* f) {
 void CodeGen::genStmt(Stmt* s) {
     switch (s->kind) {
     case StmtKind::Block:
-        for (Stmt* c : s->as<BlockStmt>()->stmts) genStmt(c);
+        genScope(s->as<BlockStmt>()->stmts);
         break;
+    case StmtKind::Defer:
+        // Nothing runs now: the statement is replayed on every exit of the enclosing block.
+        if (!deferFrames_.empty()) deferFrames_.back().push_back(s->as<DeferStmt>()->body);
+        break;
+    case StmtKind::Switch: {
+        auto* sw = s->as<SwitchStmt>();
+        int32_t mark = frameSize_;
+        int vr = regOf(sw->subject);
+        Reg subject = RAX;
+        if (vr >= 0) subject = static_cast<Reg>(vr);
+        else genExpr(sw->subject);
+        // Compare-and-branch chain to each case
+        Label end = as_.newLabel();
+        Label defaultLabel = end;
+        std::vector<Label> caseLabels;
+        for (const SwitchCase& c : sw->cases) {
+            Label l = as_.newLabel();
+            caseLabels.push_back(l);
+            if (c.isDefault) defaultLabel = l;
+            for (Expr* v : c.values) {
+                uint64_t value = v->as<IntLitExpr>()->value;
+                if (fitsInt32(value)) {
+                    as_.cmpImm(subject, static_cast<int32_t>(value));
+                } else {
+                    as_.movRI(RCX, value);
+                    as_.cmp(subject, RCX);
+                }
+                as_.jcc(CC_E, l);
+            }
+        }
+        as_.jmp(defaultLabel);
+        frameSize_ = mark;
+        loops_.push_back({end, 0, "", deferFrames_.size(), true});
+        for (size_t i = 0; i < sw->cases.size(); ++i) {
+            as_.bind(caseLabels[i]);
+            genScope(sw->cases[i].body);
+            as_.jmp(end);
+        }
+        loops_.pop_back();
+        as_.bind(end);
+        break;
+    }
+    case StmtKind::DoWhile: {
+        auto* d = s->as<DoWhileStmt>();
+        Label body = as_.newLabel();
+        Label cond = as_.newLabel();
+        Label end = as_.newLabel();
+        as_.bind(body);
+        loops_.push_back({end, cond, d->label, deferFrames_.size(), false});
+        genStmt(d->body);
+        loops_.pop_back();
+        as_.bind(cond);
+        int32_t mark = frameSize_;
+        genBranch(d->cond, body, true);
+        frameSize_ = mark;
+        as_.bind(end);
+        break;
+    }
     case StmtKind::VarDecl: {
         auto* v = s->as<VarDeclStmt>();
         LocalVar* var = v->var;
@@ -348,7 +407,7 @@ void CodeGen::genStmt(Stmt* s) {
         Label end = as_.newLabel();
         as_.jmp(cond);
         as_.bind(body);
-        loops_.push_back({end, cond});
+        loops_.push_back({end, cond, w->label, deferFrames_.size(), false});
         genStmt(w->body);
         loops_.pop_back();
         as_.bind(cond);
@@ -367,7 +426,7 @@ void CodeGen::genStmt(Stmt* s) {
         Label end = as_.newLabel();
         as_.jmp(cond);
         as_.bind(body);
-        loops_.push_back({end, cont});
+        loops_.push_back({end, cont, f->label, deferFrames_.size(), false});
         genStmt(f->body);
         loops_.pop_back();
         as_.bind(cont);
@@ -400,16 +459,65 @@ void CodeGen::genStmt(Stmt* s) {
         } else if (func_->returnType->isInt()) {
             as_.movRI(RAX, 0);
         }
+        bool pending = false;
+        for (const auto& frame : deferFrames_) pending |= !frame.empty();
+        if (pending) {
+            // Keep the return value safe while the deferred statements run.
+            int32_t mark = frameSize_;
+            int32_t save = allocTemp8();
+            bool isFloat = func_->returnType->isFloat();
+            if (isFloat) as_.movsStore(Mem::at(RBP, save), XMM0, false);
+            else as_.store(Mem::at(RBP, save), RAX, 8);
+            emitDefers(0);
+            if (isFloat) as_.movsLoad(XMM0, Mem::at(RBP, save), false);
+            else as_.load(RAX, Mem::at(RBP, save), 8, false);
+            frameSize_ = mark;
+        }
         as_.jmp(epilogue_);
         break;
     }
-    case StmtKind::Break:
-        as_.jmp(loops_.back().breakLabel);
-        break;
-    case StmtKind::Continue:
-        as_.jmp(loops_.back().continueLabel);
+    case StmtKind::Break: {
+        int i = findLoop(s->as<BreakStmt>()->label, false);
+        emitDefers(loops_[i].deferDepth);
+        as_.jmp(loops_[i].breakLabel);
         break;
     }
+    case StmtKind::Continue: {
+        int i = findLoop(s->as<ContinueStmt>()->label, true);
+        emitDefers(loops_[i].deferDepth);
+        as_.jmp(loops_[i].continueLabel);
+        break;
+    }
+    }
+}
+
+void CodeGen::genScope(const std::vector<Stmt*>& stmts) {
+    deferFrames_.emplace_back();
+    for (Stmt* c : stmts) genStmt(c);
+    // Normal exit: run this block's defers in reverse order.
+    std::vector<Stmt*> pending = deferFrames_.back();
+    deferFrames_.pop_back();
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) genStmt(*it);
+}
+
+void CodeGen::emitDefers(size_t downTo) {
+    // Copy first: generating a deferred statement may push frames of its own.
+    std::vector<Stmt*> toRun;
+    for (size_t f = deferFrames_.size(); f > downTo; --f)
+        for (auto it = deferFrames_[f - 1].rbegin(); it != deferFrames_[f - 1].rend(); ++it) toRun.push_back(*it);
+    for (Stmt* s : toRun) genStmt(s);
+}
+
+int CodeGen::findLoop(const std::string& label, bool isContinue) const {
+    for (int i = static_cast<int>(loops_.size()) - 1; i >= 0; --i) {
+        const Loop& l = loops_[i];
+        if (!label.empty()) {
+            if (!l.isSwitch && l.label == label) return i;
+        } else if (!isContinue || !l.isSwitch) {
+            return i;
+        }
+    }
+    return static_cast<int>(loops_.size()) - 1;   // sema guarantees a target exists
 }
 
 void CodeGen::genBranch(Expr* cond, Label target, bool jumpWhen) {
@@ -999,6 +1107,9 @@ void CodeGen::genExpr(Expr* e) {
     case ExprKind::StructLit:
         genStructLit(e->as<StructLitExpr>());
         break;
+    case ExprKind::ArrayLit:
+        genArrayLit(e->as<ArrayLitExpr>());
+        break;
     case ExprKind::Path:
     case ExprKind::Sizeof:
         break;   // folded away by sema
@@ -1456,6 +1567,18 @@ void CodeGen::genCast(CastExpr* e) {
     // pointer <-> pointer, array -> pointer, null -> pointer: the bits are unchanged
 }
 
+void CodeGen::genArrayLit(ArrayLitExpr* e) {
+    Type* t = e->type;
+    Type* elem = t->elem;
+    int32_t slot = allocSlot(t->size, std::max<uint32_t>(t->align, 8));
+    if (e->elems.size() < t->count) zeroMem(Mem::at(RBP, slot), t->size);
+    for (size_t i = 0; i < e->elems.size(); ++i) {
+        genExpr(e->elems[i]);
+        storeValue(elem, Mem::at(RBP, slot + static_cast<int32_t>(i * elem->size)));
+    }
+    as_.lea(RAX, Mem::at(RBP, slot));
+}
+
 void CodeGen::genStructLit(StructLitExpr* e) {
     Type* t = e->type;
     int32_t slot = allocSlot(t->size, std::max<uint32_t>(t->align, 8));
@@ -1463,8 +1586,11 @@ void CodeGen::genStructLit(StructLitExpr* e) {
     // Zero only when padding or omitted fields could stay uninitialized.
     uint32_t covered = 0;
     for (const FieldDecl& f : s->fields) covered += f.type ? f.type->size : 0;
-    if (e->fields.empty() || covered != t->size) zeroMem(Mem::at(RBP, slot), t->size);
+    bool omitted = false;
+    for (Expr* f : e->fields) omitted |= f == nullptr;
+    if (e->fields.empty() || omitted || covered != t->size) zeroMem(Mem::at(RBP, slot), t->size);
     for (size_t i = 0; i < e->fields.size(); ++i) {
+        if (!e->fields[i]) continue;   // named initializer left this field out: zero
         genExpr(e->fields[i]);
         storeValue(s->fields[i].type, Mem::at(RBP, slot + static_cast<int32_t>(s->fields[i].offset)));
     }

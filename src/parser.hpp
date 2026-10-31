@@ -37,7 +37,7 @@ private:
     void parseExternBlock(Program& program);
     StructDecl* parseStruct();
     EnumDecl* parseEnum();
-    GlobalVar* parseGlobal(bool isConst);
+    GlobalVar* parseGlobal(bool isConst, bool inferred);
     void synchronizeDecl();
 
     // Types
@@ -51,7 +51,7 @@ private:
     // Statements
     Stmt* parseStmt();
     BlockStmt* parseBlock();
-    Stmt* parseVarDecl(bool isConst);
+    Stmt* parseVarDecl(bool isConst, bool inferred);
     Stmt* parseSimpleStmt();      // declaration or expression, without the `;`
     void synchronizeStmt();
 

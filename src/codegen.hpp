@@ -132,8 +132,17 @@ private:
     struct Loop {
         x64::Label breakLabel;
         x64::Label continueLabel;
+        std::string label;
+        size_t deferDepth;   // defer frames that were active when the loop started
+        bool isSwitch;       // switches accept `break` but not `continue`
     };
     std::vector<Loop> loops_;
+    // One frame per block being generated; each holds its `defer` statements in order.
+    std::vector<std::vector<Stmt*>> deferFrames_;
+    void emitDefers(size_t downTo);                 // runs pending defers of frames above `downTo`
+    void genScope(const std::vector<Stmt*>& stmts);  // a block: own defer frame
+    int findLoop(const std::string& label, bool isContinue) const;
+    void genArrayLit(ArrayLitExpr* e);
 };
 
 } // namespace ron

@@ -149,7 +149,8 @@ void Parser::synchronizeDecl() {
     while (!check(TokenKind::EndOfFile)) {
         TokenKind k = peek().kind;
         if (depth == 0 && (k == TokenKind::KwFn || k == TokenKind::KwStruct || k == TokenKind::KwEnum ||
-                           k == TokenKind::KwImport || k == TokenKind::KwExtern || k == TokenKind::KwConst))
+                           k == TokenKind::KwImport || k == TokenKind::KwExtern || k == TokenKind::KwConst ||
+                           k == TokenKind::KwVar || k == TokenKind::KwPrivate))
             return;
         advance();
         if (k == TokenKind::LBrace) ++depth;
@@ -182,9 +183,12 @@ Decl* Parser::parseDecl() {
         return parseEnum();
     case TokenKind::KwConst:
         advance();
-        return parseGlobal(true);
+        return parseGlobal(true, check(TokenKind::Identifier) && peek(1).is(TokenKind::Eq));
+    case TokenKind::KwVar:
+        advance();
+        return parseGlobal(false, true);
     case TokenKind::Identifier:
-        return parseGlobal(false);
+        return parseGlobal(false, false);
     default:
         fail(t, "expected a declaration (fn, struct, enum, const, import, extern or a global variable)");
     }
@@ -277,13 +281,13 @@ EnumDecl* Parser::parseEnum() {
     return e;
 }
 
-GlobalVar* Parser::parseGlobal(bool isConst) {
+GlobalVar* Parser::parseGlobal(bool isConst, bool inferred) {
     auto* g = arena_.make<GlobalVar>(peek().loc);
     g->isConst = isConst;
-    g->typeExpr = parseType();
+    if (!inferred) g->typeExpr = parseType();
     g->name = std::string(expect(TokenKind::Identifier, "a variable name").text);
     if (match(TokenKind::Eq)) g->init = parseExpression();
-    else if (isConst) fail(peek(), "expected '=' (a const needs a value)");
+    else if (isConst || inferred) fail(peek(), "expected '=' with a value");
     expect(TokenKind::Semicolon, "';' after global variable");
     return g;
 }
@@ -436,32 +440,99 @@ BlockStmt* Parser::parseBlock() {
     return block;
 }
 
-Stmt* Parser::parseVarDecl(bool isConst) {
+Stmt* Parser::parseVarDecl(bool isConst, bool inferred) {
     auto* v = arena_.make<VarDeclStmt>(peek().loc);
     v->isConst = isConst;
-    v->typeExpr = parseType();
+    // `var x = e;` and `const x = e;` infer the type from the initializer.
+    if (!inferred) v->typeExpr = parseType();
     v->name = std::string(expect(TokenKind::Identifier, "a variable name").text);
     if (match(TokenKind::Eq)) v->init = parseExpression();
-    else if (isConst) fail(peek(), "expected '=' (a const needs a value)");
+    else if (isConst || inferred) fail(peek(), inferred ? "expected '=' (the type is inferred from the value)"
+                                                        : "expected '=' (a const needs a value)");
     return v;
 }
 
 Stmt* Parser::parseSimpleStmt() {
+    if (check(TokenKind::KwVar)) {
+        advance();
+        return parseVarDecl(false, true);
+    }
     if (check(TokenKind::KwConst)) {
         advance();
-        return parseVarDecl(true);
+        bool inferred = check(TokenKind::Identifier) && peek(1).is(TokenKind::Eq);
+        return parseVarDecl(true, inferred);
     }
-    if (looksLikeDecl()) return parseVarDecl(false);
+    if (looksLikeDecl()) return parseVarDecl(false, false);
     auto* s = arena_.make<ExprStmt>(peek().loc);
     s->expr = parseExpression();
     return s;
 }
 
 Stmt* Parser::parseStmt() {
+    // `name: while/for/do ...` labels a loop for `break name;` / `continue name;`.
+    if (check(TokenKind::Identifier) && peek(1).is(TokenKind::Colon) &&
+        (peek(2).is(TokenKind::KwWhile) || peek(2).is(TokenKind::KwFor) || peek(2).is(TokenKind::KwDo))) {
+        std::string label(advance().text);
+        advance();   // ':'
+        Stmt* loop = parseStmt();
+        if (loop->kind == StmtKind::While) loop->as<WhileStmt>()->label = label;
+        else if (loop->kind == StmtKind::For) loop->as<ForStmt>()->label = label;
+        else if (loop->kind == StmtKind::DoWhile) loop->as<DoWhileStmt>()->label = label;
+        return loop;
+    }
     const Token& t = peek();
     switch (t.kind) {
     case TokenKind::LBrace:
         return parseBlock();
+    case TokenKind::KwDo: {
+        advance();
+        auto* s = arena_.make<DoWhileStmt>(t.loc);
+        s->body = parseStmt();
+        expect(TokenKind::KwWhile, "'while' after do-loop body");
+        expect(TokenKind::LParen, "'(' after 'while'");
+        s->cond = parseExpression();
+        expect(TokenKind::RParen, "')' after condition");
+        expect(TokenKind::Semicolon, "';' after do-while");
+        return s;
+    }
+    case TokenKind::KwSwitch: {
+        advance();
+        auto* s = arena_.make<SwitchStmt>(t.loc);
+        expect(TokenKind::LParen, "'(' after 'switch'");
+        s->subject = parseExpression();
+        expect(TokenKind::RParen, "')' after switch value");
+        expect(TokenKind::LBrace, "'{' to open the switch");
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfFile)) {
+            SwitchCase sc;
+            sc.loc = peek().loc;
+            if (match(TokenKind::KwDefault)) {
+                sc.isDefault = true;
+            } else {
+                expect(TokenKind::KwCase, "'case' or 'default'");
+                do {
+                    sc.values.push_back(parseExpression());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::Colon, "':' after case value");
+            while (!check(TokenKind::KwCase) && !check(TokenKind::KwDefault) && !check(TokenKind::RBrace) &&
+                   !check(TokenKind::EndOfFile)) {
+                try {
+                    sc.body.push_back(parseStmt());
+                } catch (const ParseError&) {
+                    synchronizeStmt();
+                }
+            }
+            s->cases.push_back(std::move(sc));
+        }
+        expect(TokenKind::RBrace, "'}' to close the switch");
+        return s;
+    }
+    case TokenKind::KwDefer: {
+        advance();
+        auto* s = arena_.make<DeferStmt>(t.loc);
+        s->body = parseStmt();
+        return s;
+    }
     case TokenKind::KwIf: {
         advance();
         auto* s = arena_.make<IfStmt>(t.loc);
@@ -503,13 +574,17 @@ Stmt* Parser::parseStmt() {
     }
     case TokenKind::KwBreak: {
         advance();
+        auto* s = arena_.make<BreakStmt>(t.loc);
+        if (check(TokenKind::Identifier)) s->label = std::string(advance().text);
         expect(TokenKind::Semicolon, "';' after break");
-        return arena_.make<BreakStmt>(t.loc);
+        return s;
     }
     case TokenKind::KwContinue: {
         advance();
+        auto* s = arena_.make<ContinueStmt>(t.loc);
+        if (check(TokenKind::Identifier)) s->label = std::string(advance().text);
         expect(TokenKind::Semicolon, "';' after continue");
-        return arena_.make<ContinueStmt>(t.loc);
+        return s;
     }
     case TokenKind::Semicolon: {
         advance();
@@ -690,6 +765,16 @@ Expr* Parser::parsePrimary() {
         expect(TokenKind::RParen, "')'");
         return e;
     }
+    case TokenKind::LBracket: {
+        advance();
+        auto* a = arena_.make<ArrayLitExpr>(t.loc);
+        while (!check(TokenKind::RBracket)) {
+            a->elems.push_back(parseExpression());
+            if (!match(TokenKind::Comma)) break;
+        }
+        expect(TokenKind::RBracket, "']' to close the array literal");
+        return a;
+    }
     case TokenKind::Identifier: {
         advance();
         std::vector<TypeExpr*> typeArgs;
@@ -714,6 +799,12 @@ Expr* Parser::parsePrimary() {
             if (!check(TokenKind::RBrace)) {
                 do {
                     if (check(TokenKind::RBrace)) break;   // trailing comma
+                    std::string fieldName;
+                    if (check(TokenKind::Identifier) && peek(1).is(TokenKind::Colon)) {   // `x: 1.0`
+                        fieldName = std::string(advance().text);
+                        advance();
+                    }
+                    s->fieldNames.push_back(fieldName);
                     s->fields.push_back(parseExpression());
                 } while (match(TokenKind::Comma));
             }

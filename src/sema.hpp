@@ -40,6 +40,10 @@ private:
     void checkBlock(BlockStmt* b, bool newScope = true);
     Expr* checkCondition(Expr* e);
     bool alwaysReturns(Stmt* s);
+    Type* inferType(Expr*& e);
+    int findBreakTarget(const std::string& label, bool isContinue, SourceLoc loc);
+    void checkLoopBody(Stmt* body, const std::string& label);
+    Expr* checkArrayLit(ArrayLitExpr* e);
 
     // Expressions
     Expr* check(Expr* e);
@@ -109,7 +113,13 @@ private:
 
     std::vector<std::map<std::string, LocalVar*>> scopes_;
     FuncDecl* currentFunc_ = nullptr;
-    int loopDepth_ = 0;
+    int loopDepth_ = 0;     // loop nesting (register allocation weights)
+    int deferDepth_ = 0;
+    struct BreakTarget {
+        std::string label;
+        enum Kind { Loop, Switch, Barrier } kind;   // Barrier: a defer body (cannot be jumped out of)
+    };
+    std::vector<BreakTarget> breakTargets_;
 };
 
 } // namespace ron

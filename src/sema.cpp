@@ -459,13 +459,18 @@ void Sema::resolveGlobal(GlobalVar* g) {
         return;
     }
     state = 1;
-    g->type = resolveType(g->typeExpr);
+    if (g->typeExpr) {
+        g->type = resolveType(g->typeExpr);
+    } else {
+        g->init = check(g->init);
+        g->type = inferType(g->init);
+    }
     if (g->type && g->type->isVoid()) {
         diags_.error(g->loc, "a variable cannot have type void");
         g->type = nullptr;
     }
     if (g->type && g->init) {
-        Expr* v = coerce(check(g->init), g->type, "initializer");
+        Expr* v = coerce(g->typeExpr ? check(g->init) : g->init, g->type, "initializer");
         g->init = v;
         if (v && v->type) {
             if (v->kind == ExprKind::IntLit) {
@@ -588,9 +593,86 @@ bool Sema::alwaysReturns(Stmt* s) {
     }
     case StmtKind::For:
         return s->as<ForStmt>()->cond == nullptr;
+    case StmtKind::DoWhile:
+        return alwaysReturns(s->as<DoWhileStmt>()->body);
+    case StmtKind::Switch: {
+        // Every case returns, and the switch cannot fall out (default, or all enum members).
+        auto* sw = s->as<SwitchStmt>();
+        bool covered = false;
+        for (const SwitchCase& c : sw->cases) {
+            if (c.isDefault) covered = true;
+            bool returns = false;
+            for (Stmt* st : c.body) returns |= alwaysReturns(st);
+            if (!returns) return false;
+        }
+        Type* t = sw->subject->type;
+        if (!covered && t && t->enumDecl) {
+            size_t values = 0;
+            for (const SwitchCase& c : sw->cases) values += c.values.size();
+            covered = values >= t->enumDecl->members.size();
+        }
+        return covered;
+    }
     default:
         return false;
     }
+}
+
+// Type of `var x = e;`: untyped literals default to int / double.
+Type* Sema::inferType(Expr*& e) {
+    if (!e || !e->type) return nullptr;
+    if (e->type->isNull()) {
+        diags_.error(e->loc, "cannot infer a type from 'null'; write the pointer type (e.g. Enemy* p = null;)");
+        return nullptr;
+    }
+    if (e->type->isVoid()) {
+        diags_.error(e->loc, "this expression has no value");
+        return nullptr;
+    }
+    if (e->kind == ExprKind::ArrayLit) {
+        e = coerce(e, e->type, "array literal");
+        return e->type;
+    }
+    if (isUntypedFloat(e)) {
+        e = foldCast(e, types_.f64(), false);
+        return types_.f64();
+    }
+    if (isUntypedInt(e)) {
+        Type* t = e->type;
+        e = foldCast(e, t, false);
+        return t;
+    }
+    return e->type;
+}
+
+// Finds the loop/switch a break or continue refers to; returns its index or -1.
+int Sema::findBreakTarget(const std::string& label, bool isContinue, SourceLoc loc) {
+    for (int i = static_cast<int>(breakTargets_.size()) - 1; i >= 0; --i) {
+        const BreakTarget& t = breakTargets_[i];
+        if (t.kind == BreakTarget::Barrier) break;
+        if (!label.empty()) {
+            if (t.kind == BreakTarget::Loop && t.label == label) return i;
+            continue;
+        }
+        if (t.kind == BreakTarget::Loop || (!isContinue && t.kind == BreakTarget::Switch)) return i;
+    }
+    const char* what = isContinue ? "continue" : "break";
+    if (!label.empty()) diags_.error(loc, std::string("no enclosing loop labeled '") + label + "' for '" + what + "'");
+    else if (!breakTargets_.empty() && breakTargets_.back().kind == BreakTarget::Barrier)
+        diags_.error(loc, std::string("'") + what + "' cannot leave a defer block");
+    else diags_.error(loc, std::string("'") + what + "' outside of a loop" + (isContinue ? "" : " or switch"));
+    return -1;
+}
+
+void Sema::checkLoopBody(Stmt* body, const std::string& label) {
+    if (body->kind == StmtKind::Defer) diags_.error(body->loc, "defer must be inside a block { ... }");
+    breakTargets_.push_back({label, BreakTarget::Loop});
+    ++loopDepth_;
+    pushScope();
+    checkStmt(body);
+    popScope();
+    --loopDepth_;
+    breakTargets_.pop_back();
 }
 
 void Sema::checkBlock(BlockStmt* b, bool newScope) {
@@ -616,14 +698,20 @@ void Sema::checkStmt(Stmt* s) {
         break;
     case StmtKind::VarDecl: {
         auto* v = s->as<VarDeclStmt>();
-        Type* t = resolveType(v->typeExpr);
-        if (t && t->isVoid()) {
-            diags_.error(v->loc, "a variable cannot have type void");
-            t = nullptr;
-        }
-        if (v->init) {
+        Type* t = nullptr;
+        if (v->typeExpr) {
+            t = resolveType(v->typeExpr);
+            if (t && t->isVoid()) {
+                diags_.error(v->loc, "a variable cannot have type void");
+                t = nullptr;
+            }
+            if (v->init) {
+                v->init = check(v->init);
+                if (t) v->init = coerce(v->init, t, "initializer");
+            }
+        } else {
             v->init = check(v->init);
-            if (t) v->init = coerce(v->init, t, "initializer");
+            t = inferType(v->init);
         }
         v->var = declareLocal(v->name, t, v->loc, v->isConst);
         currentFunc_->locals.push_back(v->var);
@@ -637,6 +725,8 @@ void Sema::checkStmt(Stmt* s) {
     case StmtKind::If: {
         auto* i = s->as<IfStmt>();
         i->cond = checkCondition(i->cond);
+        if (i->thenStmt->kind == StmtKind::Defer || (i->elseStmt && i->elseStmt->kind == StmtKind::Defer))
+            diags_.error(s->loc, "defer must be inside a block { ... }");
         pushScope();
         checkStmt(i->thenStmt);
         popScope();
@@ -650,11 +740,13 @@ void Sema::checkStmt(Stmt* s) {
     case StmtKind::While: {
         auto* w = s->as<WhileStmt>();
         w->cond = checkCondition(w->cond);
-        ++loopDepth_;
-        pushScope();
-        checkStmt(w->body);
-        popScope();
-        --loopDepth_;
+        checkLoopBody(w->body, w->label);
+        break;
+    }
+    case StmtKind::DoWhile: {
+        auto* d = s->as<DoWhileStmt>();
+        checkLoopBody(d->body, d->label);
+        d->cond = checkCondition(d->cond);
         break;
     }
     case StmtKind::For: {
@@ -663,17 +755,68 @@ void Sema::checkStmt(Stmt* s) {
         if (f->init) checkStmt(f->init);
         if (f->cond) f->cond = checkCondition(f->cond);
         if (f->step) f->step = check(f->step);
-        ++loopDepth_;
-        pushScope();
-        checkStmt(f->body);
+        checkLoopBody(f->body, f->label);
         popScope();
-        --loopDepth_;
-        popScope();
+        break;
+    }
+    case StmtKind::Switch: {
+        auto* sw = s->as<SwitchStmt>();
+        sw->subject = check(sw->subject);
+        Type* t = sw->subject->type;
+        if (t && !t->isInt()) {
+            diags_.error(sw->subject->loc, "switch needs an integer or enum value, not '" + typeName(t) + "'");
+            t = nullptr;
+        }
+        if (t && isUntypedInt(sw->subject)) sw->subject = foldCast(sw->subject, t, false);
+        std::map<uint64_t, bool> seen;
+        bool hasDefault = false;
+        breakTargets_.push_back({"", BreakTarget::Switch});
+        for (SwitchCase& c : sw->cases) {
+            if (c.isDefault) {
+                if (hasDefault) diags_.error(c.loc, "duplicate 'default' in switch");
+                hasDefault = true;
+            }
+            for (Expr*& v : c.values) {
+                v = check(v);
+                if (!t || !v->type) continue;
+                v = coerce(v, t, "case value");
+                if (!v->type) continue;
+                if (v->kind != ExprKind::IntLit) {
+                    diags_.error(v->loc, "a case value must be a constant");
+                    continue;
+                }
+                uint64_t key = v->as<IntLitExpr>()->value;
+                if (seen[key]) diags_.error(v->loc, "duplicate case value");
+                seen[key] = true;
+            }
+            pushScope();
+            for (Stmt* st : c.body) checkStmt(st);
+            popScope();
+        }
+        breakTargets_.pop_back();
+        if (t && t->enumDecl && !hasDefault) {
+            std::string missing;
+            for (const EnumMember& m : t->enumDecl->members)
+                if (!seen.count(normalizeInt(static_cast<uint64_t>(m.resolved), t))) missing += (missing.empty() ? "" : ", ") + m.name;
+            if (!missing.empty())
+                diags_.error(sw->loc, "switch on '" + t->name + "' does not handle: " + missing +
+                                          " (add these cases or a default)");
+        }
+        break;
+    }
+    case StmtKind::Defer: {
+        auto* d = s->as<DeferStmt>();
+        breakTargets_.push_back({"", BreakTarget::Barrier});
+        ++deferDepth_;
+        checkStmt(d->body);
+        --deferDepth_;
+        breakTargets_.pop_back();
         break;
     }
     case StmtKind::Return: {
         auto* r = s->as<ReturnStmt>();
         Type* rt = currentFunc_->returnType;
+        if (deferDepth_ > 0) diags_.error(r->loc, "'return' is not allowed inside a defer block");
         if (r->value) {
             r->value = check(r->value);
             if (rt && rt->isVoid()) {
@@ -687,10 +830,10 @@ void Sema::checkStmt(Stmt* s) {
         break;
     }
     case StmtKind::Break:
+        findBreakTarget(s->as<BreakStmt>()->label, false, s->loc);
+        break;
     case StmtKind::Continue:
-        if (loopDepth_ == 0)
-            diags_.error(s->loc, std::string("'") + (s->kind == StmtKind::Break ? "break" : "continue") +
-                                     "' outside of a loop");
+        findBreakTarget(s->as<ContinueStmt>()->label, true, s->loc);
         break;
     }
 }
@@ -707,6 +850,17 @@ void Sema::setUntypedIntType(IntLitExpr* e) {
 int Sema::conversionCost(Expr* e, Type* to) {
     Type* from = e->type;
     if (!from || !to) return -1;
+    if (e->kind == ExprKind::ArrayLit && to->isArray()) {
+        auto* a = e->as<ArrayLitExpr>();
+        if (a->elems.size() > to->count) return -1;
+        int worst = 0;
+        for (Expr* x : a->elems) {
+            int c = conversionCost(x, to->elem);
+            if (c < 0) return -1;
+            worst = std::max(worst, c);
+        }
+        return worst;
+    }
     if (e->kind == ExprKind::Ternary && isUntyped(e)) {
         int a = conversionCost(e->as<TernaryExpr>()->thenExpr, to);
         int b = conversionCost(e->as<TernaryExpr>()->elseExpr, to);
@@ -814,6 +968,20 @@ Expr* Sema::foldCast(Expr* e, Type* to, bool explicitCast) {
 
 Expr* Sema::coerce(Expr* e, Type* to, const char* context) {
     if (!e || !e->type || !to) return e;
+    if (e->kind == ExprKind::ArrayLit && to->isArray()) {
+        auto* a = e->as<ArrayLitExpr>();
+        if (a->elems.size() > to->count) {
+            diags_.error(e->loc, "array literal has " + std::to_string(a->elems.size()) + " elements, but '" +
+                                     typeName(to) + "' holds " + std::to_string(to->count));
+            return errorExpr(e);
+        }
+        for (Expr*& x : a->elems) {
+            x = coerce(x, to->elem, "array element");
+            if (!x->type) return errorExpr(e);
+        }
+        a->type = to;
+        return a;
+    }
     if (e->type == to && !isUntyped(e)) return e;
     if (to->isStruct() && e->type == to) return e;
     int cost = conversionCost(e, to);
@@ -1007,8 +1175,42 @@ Expr* Sema::check(Expr* e) {
         return lit;
     }
     case ExprKind::StructLit: return checkStructLit(e->as<StructLitExpr>());
+    case ExprKind::ArrayLit: return checkArrayLit(e->as<ArrayLitExpr>());
     }
     return errorExpr(e);
+}
+
+// `[a, b, c]` gets a provisional type T[n]; coerce() adapts it to the expected array type.
+Expr* Sema::checkArrayLit(ArrayLitExpr* e) {
+    if (e->elems.empty()) {
+        diags_.error(e->loc, "an array literal needs at least one element");
+        return errorExpr(e);
+    }
+    for (Expr*& x : e->elems) {
+        x = check(x);
+        if (!x->type) return errorExpr(e);
+    }
+    Type* elem = nullptr;
+    for (Expr* x : e->elems)
+        if (!isUntyped(x)) {
+            elem = x->type;
+            break;
+        }
+    if (!elem) {
+        bool anyFloat = false;
+        Type* widest = e->elems[0]->type;
+        for (Expr* x : e->elems) {
+            anyFloat |= isUntypedFloat(x);
+            if (x->type->size > widest->size) widest = x->type;
+        }
+        elem = anyFloat ? types_.f64() : widest;
+    }
+    if (elem->isVoid() || elem->isNull()) {
+        diags_.error(e->loc, "cannot infer the element type of this array literal");
+        return errorExpr(e);
+    }
+    e->type = types_.arrayOf(elem, e->elems.size());
+    return e;
 }
 
 Expr* Sema::checkIdent(IdentExpr* e) {
@@ -1430,6 +1632,8 @@ Expr* Sema::checkAssign(AssignExpr* e) {
         return errorExpr(e);
     }
     if (t->type->isArray()) {
+        if (!e->compound && e->value->kind == ExprKind::ArrayLit) e->value = coerce(e->value, t->type, "assignment");
+        if (!e->value->type) return errorExpr(e);
         if (e->compound || e->value->type != t->type) {
             diags_.error(e->loc, "cannot assign '" + typeName(e->value->type) + "' to '" + typeName(t->type) + "'");
             return errorExpr(e);
@@ -1700,6 +1904,39 @@ Expr* Sema::checkStructLit(StructLitExpr* e) {
         diags_.error(e->loc, "struct '" + s->name + "' is not generic");
         return errorExpr(e);
     }
+
+    // Named initializers: Vec3{x: 1.0, z: 2.0}; omitted fields are zero.
+    bool named = false;
+    for (const std::string& n : e->fieldNames) named |= !n.empty();
+    if (named) {
+        std::vector<Expr*> full(s->fields.size(), nullptr);
+        for (size_t i = 0; i < e->fields.size(); ++i) {
+            const std::string& n = e->fieldNames[i];
+            if (n.empty()) {
+                diags_.error(e->fields[i]->loc, "cannot mix positional and named fields in a struct literal");
+                return errorExpr(e);
+            }
+            size_t idx = 0;
+            while (idx < s->fields.size() && s->fields[idx].name != n) ++idx;
+            if (idx == s->fields.size()) {
+                diags_.error(e->fields[i]->loc, "struct '" + s->name + "' has no field '" + n + "'");
+                return errorExpr(e);
+            }
+            if (full[idx]) {
+                diags_.error(e->fields[i]->loc, "field '" + n + "' is given twice");
+                return errorExpr(e);
+            }
+            Expr* v = check(e->fields[i]);
+            if (!v->type || !s->fields[idx].type) return errorExpr(e);
+            full[idx] = coerce(v, s->fields[idx].type, ("field '" + n + "'").c_str());
+            if (!full[idx]->type) return errorExpr(e);
+        }
+        e->fields = std::move(full);
+        e->fieldNames.clear();
+        e->type = s->type;
+        return e;
+    }
+    e->fieldNames.clear();
     for (Expr*& f : e->fields) f = check(f);
     if (!e->fields.empty() && e->fields.size() != s->fields.size()) {
         diags_.error(e->loc, "struct '" + s->name + "' has " + std::to_string(s->fields.size()) + " fields, but " +

@@ -56,7 +56,7 @@ struct TypeExpr : AstNode {
 enum class ExprKind {
     IntLit, FloatLit, StringLit, BoolLit, NullLit,
     Ident, Path, Unary, Binary, Assign, Ternary,
-    Call, Index, Member, Cast, Sizeof, StructLit,
+    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit,
 };
 
 enum class UnaryOp { Neg, Not, BitNot, AddrOf, Deref, PreInc, PreDec, PostInc, PostDec };
@@ -190,17 +190,25 @@ struct SizeofExpr : Expr {
     SizeofExpr() : Expr(ExprKind::Sizeof) {}
 };
 
-// `Vec3{1.0, 2.0, 3.0}` or `Vec3{}` (zero-initialized)
+// `Vec3{1.0, 2.0, 3.0}`, `Vec3{x: 1.0, z: 2.0}` or `Vec3{}` (zero-initialized).
+// After sema, `fields` has one entry per struct field (null = zero).
 struct StructLitExpr : Expr {
     std::string typeName;
     std::vector<TypeExpr*> typeArgs;   // Pair::<int, float>{1, 2.0}
     std::vector<Expr*> fields;
+    std::vector<std::string> fieldNames;   // parallel to `fields` for named initializers
     StructLitExpr() : Expr(ExprKind::StructLit) {}
+};
+
+// `[1, 2, 3]`
+struct ArrayLitExpr : Expr {
+    std::vector<Expr*> elems;
+    ArrayLitExpr() : Expr(ExprKind::ArrayLit) {}
 };
 
 // ───────────────────────────── Statements ─────────────────────────────
 
-enum class StmtKind { Block, VarDecl, Expr, If, While, For, Return, Break, Continue };
+enum class StmtKind { Block, VarDecl, Expr, If, While, For, Return, Break, Continue, Switch, Defer, DoWhile };
 
 struct Stmt : AstNode {
     StmtKind kind;
@@ -214,7 +222,7 @@ struct BlockStmt : Stmt {
 };
 
 struct VarDeclStmt : Stmt {
-    TypeExpr* typeExpr = nullptr;
+    TypeExpr* typeExpr = nullptr;   // null for `var x = ...` (inferred)
     std::string name;
     Expr* init = nullptr;
     bool isConst = false;
@@ -237,7 +245,15 @@ struct IfStmt : Stmt {
 struct WhileStmt : Stmt {
     Expr* cond = nullptr;
     Stmt* body = nullptr;
+    std::string label;              // `outer: while (...)`
     WhileStmt() : Stmt(StmtKind::While) {}
+};
+
+struct DoWhileStmt : Stmt {
+    Stmt* body = nullptr;
+    Expr* cond = nullptr;
+    std::string label;
+    DoWhileStmt() : Stmt(StmtKind::DoWhile) {}
 };
 
 struct ForStmt : Stmt {
@@ -245,6 +261,7 @@ struct ForStmt : Stmt {
     Expr* cond = nullptr;           // may be null (infinite loop)
     Expr* step = nullptr;           // may be null
     Stmt* body = nullptr;
+    std::string label;
     ForStmt() : Stmt(StmtKind::For) {}
 };
 
@@ -254,11 +271,33 @@ struct ReturnStmt : Stmt {
 };
 
 struct BreakStmt : Stmt {
+    std::string label;              // empty = innermost loop or switch
     BreakStmt() : Stmt(StmtKind::Break) {}
 };
 
 struct ContinueStmt : Stmt {
+    std::string label;
     ContinueStmt() : Stmt(StmtKind::Continue) {}
+};
+
+struct SwitchCase {
+    std::vector<Expr*> values;      // empty for `default`
+    std::vector<Stmt*> body;
+    SourceLoc loc;
+    bool isDefault = false;
+};
+
+// No fallthrough: each case ends at the next `case`. `break` leaves the switch.
+struct SwitchStmt : Stmt {
+    Expr* subject = nullptr;
+    std::vector<SwitchCase> cases;
+    SwitchStmt() : Stmt(StmtKind::Switch) {}
+};
+
+// Runs `body` when the enclosing block exits (normally, or via return/break/continue).
+struct DeferStmt : Stmt {
+    Stmt* body = nullptr;
+    DeferStmt() : Stmt(StmtKind::Defer) {}
 };
 
 // ───────────────────────────── Declarations ─────────────────────────────

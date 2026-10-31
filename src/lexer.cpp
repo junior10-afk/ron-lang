@@ -40,6 +40,11 @@ constexpr Keyword kKeywords[] = {
     {"sizeof", TokenKind::KwSizeof},
     {"true", TokenKind::KwTrue},       {"false", TokenKind::KwFalse},
     {"null", TokenKind::KwNull},
+    {"var", TokenKind::KwVar},         {"switch", TokenKind::KwSwitch},
+    {"case", TokenKind::KwCase},       {"default", TokenKind::KwDefault},
+    {"defer", TokenKind::KwDefer},     {"do", TokenKind::KwDo},
+    {"match", TokenKind::KwMatch},     {"in", TokenKind::KwIn},
+    {"private", TokenKind::KwPrivate},
 };
 
 } // namespace
@@ -160,7 +165,7 @@ Token Lexer::next() {
     case '?': return make(TokenKind::Question, start);
     case '@': return make(TokenKind::At, start);
     case '~': return make(TokenKind::Tilde, start);
-    case '.': return make(TokenKind::Dot, start);
+    case '.': return make(match('.') ? TokenKind::DotDot : TokenKind::Dot, start);
     case ':': return make(match(':') ? TokenKind::ColonColon : TokenKind::Colon, start);
     case '+':
         if (match('+')) return make(TokenKind::PlusPlus, start);
@@ -173,7 +178,9 @@ Token Lexer::next() {
     case '/': return make(match('=') ? TokenKind::SlashEq : TokenKind::Slash, start);
     case '%': return make(match('=') ? TokenKind::PercentEq : TokenKind::Percent, start);
     case '^': return make(match('=') ? TokenKind::CaretEq : TokenKind::Caret, start);
-    case '=': return make(match('=') ? TokenKind::EqEq : TokenKind::Eq, start);
+    case '=':
+        if (match('>')) return make(TokenKind::FatArrow, start);
+        return make(match('=') ? TokenKind::EqEq : TokenKind::Eq, start);
     case '!': return make(match('=') ? TokenKind::BangEq : TokenKind::Bang, start);
     case '&':
         if (match('&')) return make(TokenKind::AmpAmp, start);

@@ -130,6 +130,23 @@ TEST(sema_generics) {
     CHECK(fails("fn make<T>() -> T { T v; return v; } fn main() -> int { return make(); }", "no matching function"));
 }
 
+TEST(sema_syntax_v01) {
+    CHECK(fails("enum C { R, G, B } fn main() -> int { C c = C::R; switch (c) { case C::R: return 1; } return 0; }",
+                "does not handle: G, B"));
+    CHECK(fails("fn main() -> int { switch (1) { case 1: case 1: } return 0; }", "duplicate case value"));
+    CHECK(fails("fn main() -> int { int x = 2; switch (x) { case x: } return 0; }", "must be a constant"));
+    CHECK(fails("fn main() -> int { defer { return 1; } return 0; }", "not allowed inside a defer"));
+    CHECK(fails("fn main() -> int { while (true) { defer { break; } } return 0; }", "cannot leave a defer"));
+    CHECK(fails("fn main() -> int { for (;;) { break nowhere; } return 0; }", "no enclosing loop labeled"));
+    CHECK(fails("fn main() -> int { switch (1) { default: continue; } return 0; }", "outside of a loop"));
+    CHECK(fails("fn main() -> int { var p = null; return 0; }", "cannot infer a type from 'null'"));
+    CHECK(fails("fn main() -> int { int[2] a = [1, 2, 3]; return 0; }", "holds 2"));
+    CHECK(fails("struct P { int x, y; } fn main() -> int { P p = P{x: 1, x: 2}; return 0; }", "given twice"));
+    CHECK(fails("struct P { int x, y; } fn main() -> int { P p = P{x: 1, 2}; return 0; }", "cannot mix"));
+    CHECK(fails("fn main() -> int { if (true) defer foo(); return 0; }", "defer must be inside a block"));
+    CHECK(valid("fn main() -> int { var x = 1; switch (x) { case 1: break; default: } return 0; }"));
+}
+
 TEST(sema_requires_main) {
     CHECK(fails("fn notmain() {}", "no 'main' function"));
 }

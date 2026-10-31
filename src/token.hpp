@@ -30,10 +30,11 @@ enum class TokenKind : uint8_t {
     KwFn, KwReturn, KwIf, KwElse, KwWhile, KwFor, KwBreak, KwContinue,
     KwStruct, KwEnum, KwConst, KwExtern, KwImport, KwAs, KwSizeof,
     KwTrue, KwFalse, KwNull,
+    KwVar, KwSwitch, KwCase, KwDefault, KwDefer, KwDo, KwMatch, KwIn, KwPrivate,
 
     // Delimiters
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semicolon, Colon, ColonColon, Dot, Arrow, Question, At,
+    Comma, Semicolon, Colon, ColonColon, Dot, DotDot, Arrow, FatArrow, Question, At,
 
     // Operators
     Plus, Minus, Star, Slash, Percent,
