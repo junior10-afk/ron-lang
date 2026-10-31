@@ -1,0 +1,223 @@
+// Formatted output for any type, driven by runtime type information.
+//
+//   println("{} has {} hp at {}", name, hp, pos);   // Vec3{x: 1.0, y: 2.0, z: 0.0}
+//   String s = format("{:.2} ms", dt * 1000.0);
+//
+// Placeholders: {} default, {:.N} N decimals, {:x} hexadecimal, {:W} right-aligned
+// in W columns (combinable: {:8.3}). {{ and }} print braces.
+
+import "std/string.ron";
+import "std/io.ron";
+
+fn __read_int(void* data, TypeInfo* t) -> i64 {
+    if (t.size == 1) return t.is_signed ? (*(data as i8*)) as i64 : (*(data as u8*)) as i64;
+    if (t.size == 2) return t.is_signed ? (*(data as i16*)) as i64 : (*(data as u16*)) as i64;
+    if (t.size == 4) return t.is_signed ? (*(data as i32*)) as i64 : (*(data as u32*)) as i64;
+    return *(data as i64*);
+}
+
+fn __append_hex(String* out, u64 v) {
+    u8[17] digits;
+    int n = 0;
+    if (v == 0) {
+        digits[0] = '0';
+        n = 1;
+    }
+    while (v > 0) {
+        u64 d = v & 15;
+        digits[n] = (d < 10 ? '0' + d : 'a' + d - 10) as u8;
+        v = v >> 4;
+        n++;
+    }
+    out.append("0x");
+    for (int i = n - 1; i >= 0; i--) out.append_char(digits[i]);
+}
+
+// Exactly `decimals` digits after the point (rounded).
+fn __append_fixed(String* out, f64 v, int decimals) {
+    if (v != v) {
+        out.append("nan");
+        return;
+    }
+    if (v < 0.0) {
+        out.append_char('-');
+        v = -v;
+    }
+    f64 scale = 1.0;
+    for (int i = 0; i < decimals; i++) scale *= 10.0;
+    u64 total = (v * scale + 0.5) as u64;
+    u64 unit = scale as u64;
+    out.append((total / unit) as i64);
+    if (decimals > 0) {
+        out.append_char('.');
+        u64 frac = total % unit;
+        u8[24] digits;
+        for (int i = decimals - 1; i >= 0; i--) {
+            digits[i] = ('0' + frac % 10) as u8;
+            frac /= 10;
+        }
+        out.append_bytes(&digits[0], decimals);
+    }
+}
+
+fn write_any(String* out, void* data, TypeInfo* t, int precision, bool hex) {
+    switch (t.kind) {
+    case TypeKind::Bool:
+        out.append(*(data as bool*) ? "true" : "false");
+    case TypeKind::Int:
+        if (hex) {
+            __append_hex(out, __read_int(data, t) as u64);
+        } else if (!t.is_signed && t.size == 8) {
+            u8[24] buf;
+            u64 n = u64_to_str(*(data as u64*), &buf[0]);
+            out.append_bytes(&buf[0], n as int);
+        } else {
+            out.append(__read_int(data, t));
+        }
+    case TypeKind::Float: {
+        f64 v = t.size == 4 ? (*(data as f32*)) as f64 : *(data as f64*);
+        if (precision >= 0) __append_fixed(out, v, precision);
+        else out.append(v);
+    }
+    case TypeKind::Enum: {
+        i64 v = __read_int(data, t);
+        for (int i = 0; i < t.count; i++) {
+            if (t.values[i] == v) {
+                out.append(t.names[i]);
+                return;
+            }
+        }
+        out.append(v);
+    }
+    case TypeKind::Sum: {
+        int tag = *(data as i32*);
+        if (tag >= 0 && tag < t.count) out.append(t.names[tag]);
+        else out.append("<invalid>");
+    }
+    case TypeKind::Pointer: {
+        u8* p = *(data as u8**);
+        bool isText = t.elem != null && t.elem.kind == TypeKind::Int && t.elem.size == 1;
+        if (p == null) out.append("null");
+        else if (isText && !hex) out.append(p);
+        else __append_hex(out, p as u64);
+    }
+    case TypeKind::Struct:
+        if (streq(t.name, "String")) {
+            String s = *(data as String*);
+            out.append(s);
+            return;
+        }
+        out.append(t.name);
+        out.append_char('{');
+        for (int i = 0; i < t.count; i++) {
+            if (i > 0) out.append(", ");
+            out.append(t.names[i]);
+            out.append(": ");
+            write_any(out, (data as u8*) + t.values[i], t.types[i], precision, hex);
+        }
+        out.append_char('}');
+    case TypeKind::Array: {
+        out.append_char('[');
+        for (int i = 0; i < t.count; i++) {
+            if (i > 0) out.append(", ");
+            write_any(out, (data as u8*) + (i * t.elem.size) as i64, t.elem, precision, hex);
+        }
+        out.append_char(']');
+    }
+    case TypeKind::Slice: {
+        u8* items = *(data as u8**);
+        i64 len = *(((data as u8*) + 8) as i64*);
+        out.append_char('[');
+        for (i64 i = 0; i < len; i++) {
+            if (i > 0) out.append(", ");
+            write_any(out, items + i * t.elem.size, t.elem, precision, hex);
+        }
+        out.append_char(']');
+    }
+    case TypeKind::Function:
+        out.append("fn@");
+        __append_hex(out, *(data as u64*));
+    default:
+        out.append(t.name);
+    }
+}
+
+fn format_into(String* out, u8* fmt, Any[] args) {
+    i64 next = 0;
+    u64 i = 0;
+    while (fmt[i] != 0) {
+        u8 c = fmt[i];
+        if (c == '{' && fmt[i + 1] == '{') {
+            out.append_char('{');
+            i += 2;
+            continue;
+        }
+        if (c == '}' && fmt[i + 1] == '}') {
+            out.append_char('}');
+            i += 2;
+            continue;
+        }
+        if (c != '{') {
+            out.append_char(c);
+            i++;
+            continue;
+        }
+        // {[:[width][.precision][x]]}
+        i++;
+        int width = 0;
+        int precision = -1;
+        bool hex = false;
+        if (fmt[i] == ':') {
+            i++;
+            while (fmt[i] >= '0' && fmt[i] <= '9') {
+                width = width * 10 + (fmt[i] - '0') as int;
+                i++;
+            }
+            if (fmt[i] == '.') {
+                i++;
+                precision = 0;
+                while (fmt[i] >= '0' && fmt[i] <= '9') {
+                    precision = precision * 10 + (fmt[i] - '0') as int;
+                    i++;
+                }
+            }
+            if (fmt[i] == 'x') {
+                hex = true;
+                i++;
+            }
+        }
+        while (fmt[i] != 0 && fmt[i] != '}') i++;
+        if (fmt[i] == '}') i++;
+        if (next >= args.len) {
+            out.append("{?}");
+            continue;
+        }
+        String piece;
+        write_any(&piece, args[next].data, args[next].type, precision, hex);
+        next++;
+        for (int pad = piece.len; pad < width; pad++) out.append_char(' ');
+        out.append(piece);
+        piece.free_string();
+    }
+}
+
+fn format(u8* fmt, ..Any args) -> String {
+    String s;
+    format_into(&s, fmt, args);
+    return s;
+}
+
+fn print(u8* fmt, ..Any args) {
+    String s;
+    format_into(&s, fmt, args);
+    print(s);
+    s.free_string();
+}
+
+fn println(u8* fmt, ..Any args) {
+    String s;
+    format_into(&s, fmt, args);
+    s.append_char('\n');
+    print(s);
+    s.free_string();
+}

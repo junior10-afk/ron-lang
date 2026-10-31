@@ -226,6 +226,7 @@ FuncDecl* Parser::parseFunc(const std::string& externDll) {
         do {
             Param p;
             p.loc = peek().loc;
+            p.variadic = match(TokenKind::DotDot);   // ..Any args
             p.typeExpr = parseType();
             p.name = std::string(expect(TokenKind::Identifier, "a parameter name").text);
             fn->params.push_back(std::move(p));

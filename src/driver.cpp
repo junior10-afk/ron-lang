@@ -55,6 +55,9 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
     std::string root = canonicalPath(options.input);
     queue.push_back({root, SourceLoc{0, 0, 0, UINT32_MAX}});
     seen.insert(root);
+    // The prelude (Any, TypeInfo) is part of every program.
+    std::string prelude = resolveImport("std/prelude.ron", fs::path(root).parent_path(), options.stdRoot);
+    if (!prelude.empty() && seen.insert(prelude).second) queue.push_back({prelude, SourceLoc{0, 0, 0, UINT32_MAX}});
 
     while (!queue.empty()) {
         auto [path, from] = queue.front();

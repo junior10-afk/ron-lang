@@ -1,0 +1,22 @@
+// Imported automatically into every Ron program.
+// Runtime type information used by variadic `..Any` parameters and type_of().
+
+enum TypeKind { Void, Bool, Int, Float, Pointer, Array, Struct, Enum, Sum, Function, Slice }
+
+struct TypeInfo {
+    int kind;            // a TypeKind value
+    int size;            // in bytes
+    bool is_signed;      // integers
+    u8* name;            // "i32", "Vec3", "Option<int>", "u8*", ...
+    int count;           // enum members, struct fields, sum variants, array length
+    u8** names;          // member / field / variant names
+    i64* values;         // enum member values, struct field offsets
+    TypeInfo** types;    // struct field types
+    TypeInfo* elem;      // pointee / element type
+}
+
+// A value of any type: a pointer to the data and its type description.
+struct Any {
+    void* data;
+    TypeInfo* type;
+}

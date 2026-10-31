@@ -168,6 +168,8 @@ Expr* cloneExpr(AstArena& a, Expr* e) {
         return c;
     }
     case ExprKind::Variant:
+    case ExprKind::Pack:
+    case ExprKind::TypeOf:
         return e;   // only created by sema, never part of an unchecked template
     case ExprKind::Slice: {
         auto* src = e->as<SliceExpr>();

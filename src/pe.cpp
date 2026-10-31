@@ -147,6 +147,16 @@ std::vector<uint8_t> writePE(const Image& image, Subsystem subsystem) {
         put32(text.data, f.at, target - next);
     }
 
+    // Absolute addresses inside .rdata / .data
+    for (const Image::AbsFixup& f : image.absFixups) {
+        auto rvaOf = [&](x64::Section s) {
+            return s == x64::Section::Text ? text.rva : s == x64::Section::Rdata ? rdata.rva
+                 : s == x64::Section::Data ? data.rva : idata.rva;
+        };
+        std::vector<uint8_t>& bytes = f.where == x64::Section::Rdata ? rdata.data : data.data;
+        put64(bytes, f.at, kImageBase + rvaOf(f.target) + f.offset);
+    }
+
     Sec* sections[] = {&text, &rdata, &data, &idata};
     uint32_t fileOff = kHeadersSize;
     for (Sec* s : sections) {

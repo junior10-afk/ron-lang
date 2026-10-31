@@ -57,7 +57,7 @@ struct TypeExpr : AstNode {
 enum class ExprKind {
     IntLit, FloatLit, StringLit, BoolLit, NullLit,
     Ident, Path, Unary, Binary, Assign, Ternary,
-    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit, Slice, Variant, Try,
+    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit, Slice, Variant, Try, Pack, TypeOf,
 };
 
 enum class UnaryOp { Neg, Not, BitNot, AddrOf, Deref, PreInc, PreDec, PostInc, PostDec };
@@ -137,6 +137,21 @@ struct VariantExpr : Expr {
     int member = 0;
     std::vector<Expr*> args;
     VariantExpr() : Expr(ExprKind::Variant) {}
+};
+
+// The extra arguments of a variadic call, packed into a temporary array and
+// passed as a slice. With `..Any` each value is boxed as Any{data, type info}.
+struct PackExpr : Expr {
+    Type* elemType = nullptr;
+    bool boxAny = false;
+    std::vector<Expr*> elems;
+    PackExpr() : Expr(ExprKind::Pack) {}
+};
+
+// `type_of(expr)`: pointer to the runtime TypeInfo of the expression's type.
+struct TypeOfExpr : Expr {
+    Type* target = nullptr;
+    TypeOfExpr() : Expr(ExprKind::TypeOf) {}
 };
 
 // `expr?`: unwraps Option/Result, or returns None/Err from the current function.
@@ -381,6 +396,7 @@ struct Param {
     TypeExpr* typeExpr = nullptr;
     std::string name;
     SourceLoc loc;
+    bool variadic = false;   // `..Any args` / `..int nums`: receives a slice
 };
 
 struct Decl : AstNode {
@@ -404,6 +420,7 @@ struct FuncDecl : Decl {
     std::vector<LocalVar*> paramVars;
     std::vector<LocalVar*> locals;        // every local declared in the body
     std::vector<FuncDecl*> callees;       // direct calls (for dead-code elimination)
+    bool variadic = false;                // last parameter is `..T`
     bool used = false;                    // reachable from main
 
     FuncDecl() : Decl(Kind::Func) {}

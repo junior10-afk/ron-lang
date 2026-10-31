@@ -25,6 +25,10 @@ public:
     std::vector<FuncDecl*> externs;     // imported functions that are called
     std::vector<GlobalVar*> globals;    // mutable globals (consts are folded away)
     FuncDecl* mainFunc = nullptr;
+    Type* typeInfoType() const {
+        auto it = structs_.find("TypeInfo");
+        return it == structs_.end() ? nullptr : it->second->type;
+    }
 
 private:
     // Declarations
@@ -60,6 +64,7 @@ private:
     Expr* finalizeVariant(Expr* e, bool report);
     void checkMatch(MatchStmt* m);
     Expr* checkTry(TryExpr* e);
+    bool isAnyType(Type* t) const;
     LocalVar* hiddenLocal(const char* name, Type* t, SourceLoc loc);
     Expr* mkIdent(LocalVar* v, SourceLoc loc);
     Expr* mkInt(uint64_t value, Type* t, SourceLoc loc);

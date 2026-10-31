@@ -1243,6 +1243,12 @@ void CodeGen::genExpr(Expr* e) {
     case ExprKind::Try:
         genTry(e->as<TryExpr>());
         break;
+    case ExprKind::Pack:
+        genPack(e->as<PackExpr>());
+        break;
+    case ExprKind::TypeOf:
+        as_.lea(RAX, Mem::ripRel(Section::Rdata, typeInfo(e->as<TypeOfExpr>()->target)));
+        break;
     case ExprKind::Index:
     case ExprKind::Member:
         loadValue(e->type, genMem(e));
@@ -1787,6 +1793,134 @@ void CodeGen::genSlice(SliceExpr* e) {
         as_.store(lenField, R11, 8);
     }
     as_.lea(RAX, ptrField);
+}
+
+// ───────────── Runtime type information ─────────────
+
+namespace {
+void put32At(std::vector<uint8_t>& b, size_t at, uint32_t v) {
+    for (int i = 0; i < 4; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i));
+}
+void put64At(std::vector<uint8_t>& b, size_t at, uint64_t v) {
+    for (int i = 0; i < 8; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i));
+}
+} // namespace
+
+uint32_t CodeGen::rdataAlloc(uint32_t size, uint32_t align) {
+    while (image_.rdata.size() % align) image_.rdata.push_back(0);
+    auto off = static_cast<uint32_t>(image_.rdata.size());
+    image_.rdata.resize(image_.rdata.size() + size, 0);
+    return off;
+}
+
+void CodeGen::rdataPointer(uint32_t at, uint32_t targetOffset) {
+    image_.absFixups.push_back({Section::Rdata, at, Section::Rdata, targetOffset});
+}
+
+// Emits (once per type) a TypeInfo record matching the prelude's layout; returns its .rdata offset.
+uint32_t CodeGen::typeInfo(Type* t) {
+    auto memo = typeInfos_.find(t);
+    if (memo != typeInfos_.end()) return memo->second;
+    Type* infoType = sema_.typeInfoType();
+    StructDecl* info = infoType->structDecl;
+    auto field = [&](const char* name) -> uint32_t {
+        for (const FieldDecl& f : info->fields)
+            if (f.name == name) return f.offset;
+        return 0;
+    };
+    uint32_t rec = rdataAlloc(infoType->size, 8);
+    typeInfos_[t] = rec;   // registered first: recursive types point back to it
+
+    enum Kind { Void, Bool, Int, Float, Pointer, Array, Struct, Enum, Sum, Function, Slice };
+    int kind = Void;
+    switch (t->kind) {
+    case TypeKind::Void: kind = Void; break;
+    case TypeKind::Bool: kind = Bool; break;
+    case TypeKind::Int: kind = t->enumDecl ? Enum : Int; break;
+    case TypeKind::Float: kind = Float; break;
+    case TypeKind::Pointer:
+    case TypeKind::Null: kind = Pointer; break;
+    case TypeKind::Array: kind = Array; break;
+    case TypeKind::Struct: kind = t->sumDecl ? Sum : Struct; break;
+    case TypeKind::Function: kind = Function; break;
+    case TypeKind::Slice: kind = Slice; break;
+    }
+    put32At(image_.rdata, rec + field("kind"), static_cast<uint32_t>(kind));
+    put32At(image_.rdata, rec + field("size"), t->size);
+    image_.rdata[rec + field("is_signed")] = t->isInt() && t->isSigned ? 1 : 0;
+    rdataPointer(rec + field("name"), addString(typeName(t)));
+
+    std::vector<std::string> names;
+    std::vector<int64_t> values;
+    std::vector<Type*> types;
+    if (t->enumDecl) {
+        for (const EnumMember& m : t->enumDecl->members) {
+            names.push_back(m.name);
+            values.push_back(m.resolved);
+        }
+    } else if (t->sumDecl) {
+        for (const EnumMember& m : t->sumDecl->members) names.push_back(m.name);
+    } else if (t->isStruct()) {
+        for (const FieldDecl& f : t->structDecl->fields) {
+            if (!f.type) continue;
+            names.push_back(f.name);
+            values.push_back(f.offset);
+            types.push_back(f.type);
+        }
+    }
+    uint32_t count = t->isArray() ? static_cast<uint32_t>(t->count) : static_cast<uint32_t>(names.size());
+    put32At(image_.rdata, rec + field("count"), count);
+    if (!names.empty()) {
+        uint32_t arr = rdataAlloc(static_cast<uint32_t>(names.size() * 8), 8);
+        for (size_t i = 0; i < names.size(); ++i) rdataPointer(arr + static_cast<uint32_t>(i * 8), addString(names[i]));
+        rdataPointer(rec + field("names"), arr);
+    }
+    if (!values.empty()) {
+        uint32_t arr = rdataAlloc(static_cast<uint32_t>(values.size() * 8), 8);
+        for (size_t i = 0; i < values.size(); ++i) put64At(image_.rdata, arr + i * 8, static_cast<uint64_t>(values[i]));
+        rdataPointer(rec + field("values"), arr);
+    }
+    if (!types.empty()) {
+        uint32_t arr = rdataAlloc(static_cast<uint32_t>(types.size() * 8), 8);
+        for (size_t i = 0; i < types.size(); ++i) rdataPointer(arr + static_cast<uint32_t>(i * 8), typeInfo(types[i]));
+        rdataPointer(rec + field("types"), arr);
+    }
+    if (t->elem) rdataPointer(rec + field("elem"), typeInfo(t->elem));
+    return rec;
+}
+
+// Extra arguments of a variadic call → temporary array → slice { ptr, len }.
+void CodeGen::genPack(PackExpr* p) {
+    int32_t slice = allocSlot(16, 8);
+    size_t n = p->elems.size();
+    if (n == 0) {
+        zeroMem(Mem::at(RBP, slice), 16);
+        as_.lea(RAX, Mem::at(RBP, slice));
+        return;
+    }
+    uint32_t elemSize = p->elemType->size;
+    int32_t arr = allocSlot(static_cast<uint32_t>(n * elemSize), std::max<uint32_t>(p->elemType->align, 8));
+    for (size_t i = 0; i < n; ++i) {
+        Expr* x = p->elems[i];
+        int32_t at = arr + static_cast<int32_t>(i * elemSize);
+        genExpr(x);
+        if (p->boxAny && x->type != p->elemType) {
+            // Box: copy the value into its own slot, then store Any{&slot, &type_info}.
+            int32_t valueSlot = allocSlot(std::max<uint32_t>(x->type->size, 1), std::max<uint32_t>(x->type->align, 8));
+            storeValue(x->type, Mem::at(RBP, valueSlot));
+            as_.lea(RAX, Mem::at(RBP, valueSlot));
+            as_.store(Mem::at(RBP, at), RAX, 8);
+            as_.lea(RAX, Mem::ripRel(Section::Rdata, typeInfo(x->type)));
+            as_.store(Mem::at(RBP, at + 8), RAX, 8);
+        } else {
+            storeValue(p->elemType, Mem::at(RBP, at));
+        }
+    }
+    as_.lea(RAX, Mem::at(RBP, arr));
+    as_.store(Mem::at(RBP, slice), RAX, 8);
+    as_.movRI(RCX, n);
+    as_.store(Mem::at(RBP, slice + 8), RCX, 8);
+    as_.lea(RAX, Mem::at(RBP, slice));
 }
 
 void CodeGen::genArrayLit(ArrayLitExpr* e) {

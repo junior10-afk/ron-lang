@@ -3,6 +3,7 @@
 import "std/win32.ron";
 import "std/string.ron";
 import "std/mem.ron";
+import "std/fmt.ron";   // print("{} pts", score) / println(...) with placeholders
 
 void* __stdout = null;
 

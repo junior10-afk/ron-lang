@@ -568,11 +568,20 @@ void Sema::resolveGlobal(GlobalVar* g) {
 
 void Sema::resolveSignature(FuncDecl* f) {
     f->returnType = f->returnTypeExpr ? resolveType(f->returnTypeExpr) : types_.voidType();
-    for (Param& p : f->params) {
+    for (size_t pi = 0; pi < f->params.size(); ++pi) {
+        Param& p = f->params[pi];
         Type* t = resolveType(p.typeExpr);
         if (t && t->isVoid()) {
             diags_.error(p.loc, "a parameter cannot have type void");
             t = nullptr;
+        }
+        if (p.variadic) {
+            // `..T name` receives the extra arguments as a T[] slice.
+            if (pi + 1 != f->params.size()) diags_.error(p.loc, "only the last parameter can be variadic (..T)");
+            if (!f->typeParams.empty() || f->genericOrigin) diags_.error(p.loc, "generic functions cannot be variadic");
+            if (!f->externDll.empty()) diags_.error(p.loc, "extern functions cannot be variadic");
+            f->variadic = true;
+            if (t) t = types_.sliceOf(t);
         }
         if (t && t->isArray()) {
             diags_.error(p.loc, "arrays cannot be passed by value; pass a pointer (" +
@@ -598,6 +607,10 @@ void Sema::resolveSignature(FuncDecl* f) {
         for (Type* t : f->paramTypes) hasStruct |= t && t->isStruct();
         if (!hasStruct) diags_.error(f->loc, "operator overloads need at least one struct parameter");
     }
+}
+
+bool Sema::isAnyType(Type* t) const {
+    return t && t->isStruct() && !t->sumDecl && t->name == "Any";
 }
 
 // ───────────────────────────── Sum types ─────────────────────────────
@@ -1636,7 +1649,8 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
         if (!changed) break;
     }
     for (FuncDecl* f : it->second) {
-        if (f->params.size() != args.size()) continue;
+        size_t fixed = f->variadic ? f->params.size() - 1 : f->params.size();
+        if (f->variadic ? args.size() < fixed : args.size() != fixed) continue;
         bool isTemplate = !f->typeParams.empty();
         if (hasExplicit && !isTemplate) continue;
         for (int variant = 0; variant < (addrOfBase ? 2 : 1); ++variant) {
@@ -1660,10 +1674,20 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
             int total = 0;
             bool ok = true;
             for (size_t i = 0; i < actual.size() && ok; ++i) {
-                int c = conversionCost(actual[i], paramTypes[i]);
+                int c;
+                if (f->variadic && i >= fixed) {
+                    Type* elem = paramTypes.back() ? paramTypes.back()->elem : nullptr;
+                    if (!elem) c = -1;
+                    else if (isAnyType(elem)) c = actual[i]->type && !actual[i]->type->isVoid() ? 4 : -1;   // anything boxes
+                    else c = conversionCost(actual[i], elem);
+                    if (c >= 0) c += 1;   // prefer an exact non-variadic overload
+                } else {
+                    c = conversionCost(actual[i], paramTypes[i]);
+                }
                 if (c < 0) ok = false;
                 total += c;
             }
+            if (f->variadic && actual.size() == fixed) total += 1;
             if (!ok) continue;
             // A non-template wins over a template with equally good conversions.
             total = total * 2 + (isTemplate ? 1 : 0);
@@ -1716,6 +1740,26 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
             ufcsBase->as<IdentExpr>()->local->addressTaken = true;
     }
     if (!best->typeParams.empty()) best = instantiateFunction(best, bestTypeArgs, loc);
+    if (best->variadic && best->paramTypes.back()) {
+        // Pack the extra arguments into a slice (boxed as Any when the element type is Any).
+        size_t fixed = best->params.size() - 1;
+        auto* pack = arena_.make<PackExpr>(loc);
+        pack->elemType = best->paramTypes.back()->elem;
+        pack->boxAny = isAnyType(pack->elemType);
+        for (size_t i = fixed; i < args.size(); ++i) {
+            Expr* a = args[i];
+            if (pack->boxAny && a->type != pack->elemType) {
+                if (!inferType(a)) return nullptr;
+            } else {
+                a = coerce(a, pack->elemType, "argument");
+                if (!a->type) return nullptr;
+            }
+            pack->elems.push_back(a);
+        }
+        pack->type = best->paramTypes.back();
+        args.resize(fixed);
+        args.push_back(pack);
+    }
     for (size_t i = 0; i < args.size(); ++i) {
         if (!best->paramTypes[i]) return nullptr;
         args[i] = coerce(args[i], best->paramTypes[i], "argument");
@@ -1770,7 +1814,10 @@ Expr* Sema::check(Expr* e) {
     case ExprKind::ArrayLit: return checkArrayLit(e->as<ArrayLitExpr>());
     case ExprKind::Slice: return checkSlice(e->as<SliceExpr>());
     case ExprKind::Try: return checkTry(e->as<TryExpr>());
-    case ExprKind::Variant: return e;   // built by sema, already checked
+    case ExprKind::Variant:
+    case ExprKind::Pack:
+    case ExprKind::TypeOf:
+        return e;   // built by sema, already checked
     }
     return errorExpr(e);
 }
@@ -2395,6 +2442,19 @@ Expr* Sema::checkCall(CallExpr* e) {
     }
 
     // Built-in intrinsics
+    if (name == "type_of" && !funcs_.count("type_of") && e->args.size() == 1) {
+        auto info = structs_.find("TypeInfo");
+        if (info == structs_.end()) {
+            diags_.error(e->loc, "type_of needs the prelude (std/prelude.ron)");
+            return errorExpr(e);
+        }
+        Expr* a = e->args[0];
+        if (!inferType(a)) return errorExpr(e);
+        auto* t = arena_.make<TypeOfExpr>(e->loc);
+        t->target = a->type;
+        t->type = types_.pointerTo(info->second->type);
+        return t;
+    }
     if (name == "sqrt" && !funcs_.count("sqrt") && e->args.size() == 1) {
         Expr*& a = e->args[0];
         Type* t = a->type;

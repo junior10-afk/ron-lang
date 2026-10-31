@@ -562,6 +562,42 @@ TEST(e2e_sum_types_match_try) {
     )", "3.0\n6.0\n0.0\n7\n9\nnot a digit\ntrue\n2\n-1\ntrue\n2.5\ngo\n"));
 }
 
+TEST(e2e_variadics_and_format) {
+    CHECK(prints("format", R"(
+        import "std/io.ron";
+        import "std/option.ron";
+        struct Vec3 { float x, y, z; }
+        enum Mood { Happy, Angry = 5 }
+        fn total(..int nums) -> int {
+            int s = 0;
+            for (var n in nums) s += n;
+            return s;
+        }
+        fn count(..Any things) -> i64 { return things.len; }
+        fn main() -> int {
+            println(total(1, 2, 3, 4));
+            println(total());
+            println(count("a", 1, 2.5, true));
+            println("{} + {} = {}", 2, 3, 5);
+            println("pos {} mood {}", Vec3{1.0, 2.5, -3.0}, Mood::Angry);
+            println("{:.2} | {:x} | {:6}|", 3.14159, 255, 42);
+            println("{} {} {}", "text", false, 'A');
+            String s = format("{}-{}", 7, string("str"));
+            println(s);
+            int[3] arr = [1, 2, 3];
+            int[] sl = arr[1..];
+            println("{} {}", arr, sl);
+            Option<int> o = Option::Some(1);
+            println("{}", o);
+            u64 big = 18446744073709551615;
+            println("{{literal}} {}", big);
+            println("{}", type_of(arr).name);
+            return 0;
+        }
+    )", "10\n0\n4\n2 + 3 = 5\npos Vec3{x: 1.0, y: 2.5, z: -3.0} mood Angry\n3.14 | 0xff |     42|\ntext false 65\n7-str\n"
+        "[1, 2, 3] [2, 3]\nSome\n{literal} 18446744073709551615\ni32[3]\n"));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

@@ -23,6 +23,15 @@ struct Image {
     };
     std::vector<Import> importSlots;
     uint32_t entryOffset = 0;   // in .text
+    // 64-bit absolute addresses stored in data (e.g. pointers inside type info tables).
+    // The image has a fixed base, so the PE writer resolves them to final addresses.
+    struct AbsFixup {
+        x64::Section where;     // Rdata or Data
+        uint32_t at;            // offset in that section
+        x64::Section target;
+        uint32_t offset;        // offset in the target section
+    };
+    std::vector<AbsFixup> absFixups;
 };
 
 // Single-pass code generator from the typed AST to x86-64 machine code.
@@ -77,6 +86,11 @@ private:
     void genVariant(VariantExpr* v);
     void genTry(TryExpr* e);
     void genMatch(MatchStmt* m);
+    void genPack(PackExpr* p);
+    uint32_t typeInfo(Type* t);
+    uint32_t rdataAlloc(uint32_t size, uint32_t align);
+    void rdataPointer(uint32_t at, uint32_t targetOffset);
+    std::map<Type*, uint32_t> typeInfos_;
     void finishReturn(bool hasValue);
     void genFunctionAddress(FuncDecl* f);
     std::vector<std::pair<size_t, FuncDecl*>> funcRefs_;   // fixup index -> function whose address is taken
