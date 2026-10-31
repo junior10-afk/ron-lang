@@ -1,0 +1,105 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Ron",
+  "scopeName": "source.ron",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#chars" },
+    { "include": "#numbers" },
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#types" },
+    { "include": "#functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.ron", "match": "//.*$" },
+        { "include": "#block-comment" }
+      ]
+    },
+    "block-comment": {
+      "name": "comment.block.ron",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "patterns": [{ "include": "#block-comment" }]
+    },
+    "strings": {
+      "name": "string.quoted.double.ron",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.ron", "match": "\\\\(?:[ntr0\\\\\"']|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]{1,6}\\})" },
+        { "name": "constant.other.placeholder.ron", "match": "\\{\\{|\\}\\}|\\{(?::[0-9]*(?:\\.[0-9]+)?x?)?\\}" }
+      ]
+    },
+    "chars": {
+      "name": "string.quoted.single.ron",
+      "match": "'(?:\\\\(?:[ntr0\\\\\"']|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]{1,6}\\})|[^'\\\\])'"
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.hex.ron", "match": "\\b0[xX][0-9a-fA-F_]+\\b" },
+        { "name": "constant.numeric.binary.ron", "match": "\\b0[bB][01_]+\\b" },
+        { "name": "constant.numeric.float.ron", "match": "\\b[0-9][0-9_]*(?:\\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9]+)?f\\b|\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9]+)?\\b|\\b[0-9][0-9_]*[eE][+-]?[0-9]+\\b" },
+        { "name": "constant.numeric.integer.ron", "match": "\\b[0-9][0-9_]*\\b" }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.ron" },
+            "2": { "name": "entity.name.function.ron" }
+          }
+        },
+        {
+          "match": "\\b(struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.ron" },
+            "2": { "name": "entity.name.type.ron" }
+          }
+        },
+        {
+          "match": "\\b(test)\\s+(?=\")",
+          "captures": { "1": { "name": "keyword.other.test.ron" } }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.ron", "match": "\\b(if|else|while|for|do|in|switch|case|default|match|break|continue|return|defer)\\b" },
+        { "name": "storage.type.ron", "match": "\\b(fn|struct|enum|var|const)\\b" },
+        { "name": "storage.modifier.ron", "match": "\\b(private|extern)\\b" },
+        { "name": "keyword.other.ron", "match": "\\b(import|as|sizeof)\\b" }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        { "name": "constant.language.ron", "match": "\\b(true|false|null)\\b" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        { "name": "support.type.primitive.ron", "match": "\\b(void|bool|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|int|uint|float|double|char|byte|usize|isize)\\b" },
+        { "name": "entity.name.type.ron", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        { "name": "entity.name.function.call.ron", "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*(?:::<[^>]*>)?\\s*\\()" }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.arrow.ron", "match": "->|=>" },
+        { "name": "keyword.operator.range.ron", "match": "\\.\\." },
+        { "name": "keyword.operator.ron", "match": "[-+*/%&|^~!<>=?]+" }
+      ]
+    }
+  }
+}

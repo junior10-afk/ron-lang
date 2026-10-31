@@ -24,17 +24,25 @@ source.ron ─► Lexer ─► Parser ─► AST ─► Sema (types) ─► x86-
 | 6 | Runtime & standard library | Written in Ron: I/O, memory, strings, math (sin/cos/sqrt), vectors/matrices | done |
 | 7 | Vulkan engine | `ron_engine.dll`: window, swapchain, depth, MSAA, shadows, lit meshes, camera, input | done |
 | 8 | Game features | ECS, physics (gravity, AABB/sphere collisions), audio, `ronc run --watch` live reload | done |
-
 | 9 | Performance | Register allocation (callee-saved GPR/XMM), SIB addressing, immediates, branch fusion | done |
 | 10 | Generics & containers | Monomorphized generic structs/functions, `List<T>`, `Map<K, V>`, `String` | done |
 | 11 | Materials & textures | PBR (GGX), PNG decoder, mipmapped textures, world-space UVs | done |
 | 12 | Animation | glTF 2.0 loader, GPU skinning, keyframe sampling, cross-fade blending | done |
+| 13 | Syntax | `var`, `switch`, `defer`, `do-while`, labeled loops, array literals, named initializers | done |
+| 14 | Functions & slices | Function values and callbacks, `T[]` slices, `for-in` loops and ranges | done |
+| 15 | Sum types | Tagged unions, `match`, `Option` / `Result`, the `?` operator | done |
+| 16 | Variadics | `..T` / `..Any`, runtime type information, `format` and `println("{}")` | done |
+| 17 | Modules | `private`, `import ... as m`, computed global initializers | done |
+| 18 | Runtime | Stack traces, `panic`, `assert`, bounds checks, warnings | done |
+| 19 | System library | Files, directories, args, env, threads, mutexes, atomics | done |
+| 20 | Tooling | `test` blocks, `ronc test/new/--version`, VS Code highlighting, docs, release 0.1.0 | done |
 
-## Further work
+## Further work (0.2 and later)
 
-- **Compiler**: SIMD code generation for vector math, inlining, debug info (PDB) to step through
-  Ron code in a debugger, a language server for editors.
-- **Language**: slices, `defer`, closures, namespaces per module.
+- **Compiler**: PDB debug info (step through Ron code in a debugger), x64 unwind tables, SIMD code
+  generation for vector math, inlining, a language server for editors.
+- **Language**: closures capturing variables, traits/interfaces, `match` as an expression,
+  compile-time evaluation.
 - **Engine**: normal maps, image-based lighting, instanced rendering, post-processing (bloom,
   SSAO), cascaded shadows, a UI layer, state-preserving hot reload.
 

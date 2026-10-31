@@ -15,6 +15,7 @@ import "std/audio.ron";
 import "std/random.ron";
 import "std/string.ron";
 import "std/io.ron";
+import "std/os.ron";
 
 const int TAG_WALL = 1;
 const int TAG_BALL = 2;
@@ -284,10 +285,9 @@ fn update_title(Game* g) {
 
 fn load_character() -> int {
     // Works when run from the repository root, examples/ or a build folder.
-    int m = engine_model_load("assets/character.glb");
-    if (m < 0) m = engine_model_load("../assets/character.glb");
-    if (m < 0) m = engine_model_load("../../assets/character.glb");
-    return m;
+    for (var path in ["assets/character.glb", "../assets/character.glb", "../../assets/character.glb"])
+        if (file_exists(path)) return engine_model_load(path);
+    return -1;
 }
 
 fn main() -> int {

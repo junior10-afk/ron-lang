@@ -4,12 +4,13 @@
 
 import "std/engine.ron";
 import "std/io.ron";
+import "std/os.ron";
 
 fn main() -> int {
     if (!engine_init(1280, 720, "Ron - character viewer")) return 1;
-    int model = engine_model_load("assets/character.glb");
-    if (model < 0) model = engine_model_load("../assets/character.glb");
-    if (model < 0) model = engine_model_load("../../assets/character.glb");
+    int model = -1;
+    for (var path in ["assets/character.glb", "../assets/character.glb", "../../assets/character.glb"])
+        if (model < 0 && file_exists(path)) model = engine_model_load(path);
     if (model < 0) {
         println("assets/character.glb not found");
         return 1;
