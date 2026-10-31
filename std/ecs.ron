@@ -1,0 +1,162 @@
+// A small data-oriented Entity Component System.
+//
+// Entities are integer ids. Each component type lives in its own tightly
+// packed array (structure of arrays) and a bitmask says which components an
+// entity has. Systems are plain functions that loop over the arrays.
+
+import "std/math.ron";
+import "std/mem.ron";
+import "std/engine.ron";
+import "std/physics.ron";
+
+const u32 HAS_TRANSFORM = 1;
+const u32 HAS_VELOCITY = 2;
+const u32 HAS_RENDER = 4;
+const u32 HAS_BODY = 8;
+const u32 HAS_LIFETIME = 16;
+const u32 HAS_SPIN = 32;
+const u32 HAS_TAG = 64;
+
+struct Transform {
+    Vec3 position;
+    Vec3 rotation;   // euler angles (radians): pitch, yaw, roll
+    Vec3 scale;
+}
+
+struct Render {
+    int mesh;
+    Color color;
+    bool checker;
+}
+
+struct World {
+    int capacity;
+    int count;          // highest used id + 1
+    int alive;
+    u32* masks;
+    Transform* transforms;
+    Vec3* velocities;
+    Render* renders;
+    int* bodies;        // physics body id
+    float* lifetimes;   // seconds left
+    Vec3* spins;        // angular velocity (radians / s)
+    int* tags;          // free-form game data (e.g. entity kind)
+}
+
+fn world_create(int capacity) -> World {
+    World w;
+    w.capacity = capacity;
+    u64 n = capacity as u64;
+    w.masks = alloc(n * sizeof(u32));
+    w.transforms = alloc(n * sizeof(Transform));
+    w.velocities = alloc(n * sizeof(Vec3));
+    w.renders = alloc(n * sizeof(Render));
+    w.bodies = alloc(n * sizeof(int));
+    w.lifetimes = alloc(n * sizeof(float));
+    w.spins = alloc(n * sizeof(Vec3));
+    w.tags = alloc(n * sizeof(int));
+    return w;
+}
+
+fn spawn(World* w) -> int {
+    for (int e = 0; e < w.capacity; e++) {
+        if (w.masks[e] == 0) {
+            w.masks[e] = HAS_TRANSFORM;
+            w.transforms[e] = Transform{vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0)};
+            if (e >= w.count) w.count = e + 1;
+            w.alive++;
+            return e;
+        }
+    }
+    return -1;
+}
+
+fn destroy(World* w, int e) {
+    if (e < 0 || e >= w.count || w.masks[e] == 0) return;
+    w.masks[e] = 0;
+    w.alive--;
+}
+
+fn is_alive(World* w, int e) -> bool { return e >= 0 && e < w.count && w.masks[e] != 0; }
+fn has(World* w, int e, u32 components) -> bool { return (w.masks[e] & components) == components; }
+
+fn transform(World* w, int e) -> Transform* { return &w.transforms[e]; }
+
+fn set_position(World* w, int e, Vec3 p) { w.transforms[e].position = p; }
+fn set_scale(World* w, int e, Vec3 s) { w.transforms[e].scale = s; }
+
+fn set_velocity(World* w, int e, Vec3 v) {
+    w.velocities[e] = v;
+    w.masks[e] |= HAS_VELOCITY;
+}
+
+fn set_render(World* w, int e, int mesh, Color c) {
+    w.renders[e] = Render{mesh, c, false};
+    w.masks[e] |= HAS_RENDER;
+}
+
+fn set_body(World* w, int e, int body_id) {
+    w.bodies[e] = body_id;
+    w.masks[e] |= HAS_BODY;
+}
+
+fn set_lifetime(World* w, int e, float seconds) {
+    w.lifetimes[e] = seconds;
+    w.masks[e] |= HAS_LIFETIME;
+}
+
+fn set_spin(World* w, int e, Vec3 spin) {
+    w.spins[e] = spin;
+    w.masks[e] |= HAS_SPIN;
+}
+
+fn set_tag(World* w, int e, int tag) {
+    w.tags[e] = tag;
+    w.masks[e] |= HAS_TAG;
+}
+
+fn model_matrix(Transform* t) -> Mat4 { return mat4_trs(t.position, t.rotation, t.scale); }
+
+// ───────────── Systems ─────────────
+
+// position += velocity * dt, rotation += spin * dt
+fn system_movement(World* w, float dt) {
+    for (int e = 0; e < w.count; e++) {
+        u32 m = w.masks[e];
+        if ((m & HAS_VELOCITY) != 0 && (m & HAS_BODY) == 0)
+            w.transforms[e].position = w.transforms[e].position + w.velocities[e] * dt;
+        if ((m & HAS_SPIN) != 0)
+            w.transforms[e].rotation = w.transforms[e].rotation + w.spins[e] * dt;
+    }
+}
+
+// Copies simulated body positions into transforms.
+fn system_physics_sync(World* w, PhysicsWorld* p) {
+    for (int e = 0; e < w.count; e++) {
+        if ((w.masks[e] & HAS_BODY) == 0) continue;
+        Body* b = p.body(w.bodies[e]);
+        w.transforms[e].position = b.position;
+    }
+}
+
+// Destroys entities whose lifetime ran out (and their physics bodies).
+fn system_lifetime(World* w, PhysicsWorld* p, float dt) {
+    for (int e = 0; e < w.count; e++) {
+        if ((w.masks[e] & HAS_LIFETIME) == 0) continue;
+        w.lifetimes[e] -= dt;
+        if (w.lifetimes[e] <= 0.0) {
+            if ((w.masks[e] & HAS_BODY) != 0) p.remove_body(w.bodies[e]);
+            w.destroy(e);
+        }
+    }
+}
+
+fn system_render(World* w) {
+    for (int e = 0; e < w.count; e++) {
+        if ((w.masks[e] & (HAS_RENDER | HAS_TRANSFORM)) != (HAS_RENDER | HAS_TRANSFORM)) continue;
+        Mat4 m = model_matrix(&w.transforms[e]);
+        Render* r = &w.renders[e];
+        if (r.checker) engine_draw_checker(r.mesh, &m, r.color.r, r.color.g, r.color.b);
+        else engine_draw(r.mesh, &m, r.color.r, r.color.g, r.color.b);
+    }
+}

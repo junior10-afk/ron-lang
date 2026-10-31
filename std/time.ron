@@ -1,0 +1,19 @@
+// High-resolution time.
+
+import "std/win32.ron";
+
+i64 __qpc_freq = 0;
+i64 __qpc_start = 0;
+
+// Seconds since the first call.
+fn now() -> f64 {
+    if (__qpc_freq == 0) {
+        QueryPerformanceFrequency(&__qpc_freq);
+        QueryPerformanceCounter(&__qpc_start);
+    }
+    i64 t = 0;
+    QueryPerformanceCounter(&t);
+    return ((t - __qpc_start) as f64) / (__qpc_freq as f64);
+}
+
+fn sleep_ms(u32 ms) { Sleep(ms); }

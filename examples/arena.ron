@@ -1,0 +1,263 @@
+// Ron Arena: a small 3D physics game written entirely in Ron.
+//
+//   WASD / arrows  move          Space  jump        Shift  sprint
+//   F              shoot a ball  R      reset       Esc    quit
+//   Right mouse    orbit camera  Wheel  zoom        Q / E  rotate camera
+//
+// Collect the spinning gold cubes while balls rain from the sky.
+// Build & run:  ronc run examples/arena.ron
+
+import "std/engine.ron";
+import "std/ecs.ron";
+import "std/physics.ron";
+import "std/audio.ron";
+import "std/random.ron";
+import "std/string.ron";
+import "std/io.ron";
+
+const int TAG_WALL = 1;
+const int TAG_BALL = 2;
+const int TAG_PICKUP = 3;
+const int TAG_PLAYER = 4;
+
+const int MAX_ENTITIES = 512;
+const int PICKUP_COUNT = 8;
+const float ARENA = 18.0;
+
+struct Game {
+    World world;
+    PhysicsWorld physics;
+    int cube, sphere, plane;
+    int player;
+    int player_body;
+    OrbitCamera cam;
+    int score;
+    float spawn_timer;
+    float title_timer;
+}
+
+fn add_block(Game* g, Vec3 pos, Vec3 half, Color c) {
+    int e = g.world.spawn();
+    g.world.set_position(e, pos);
+    g.world.set_scale(e, half * 2.0);
+    g.world.set_render(e, g.cube, c);
+    g.world.set_body(e, g.physics.add_box(pos, half, 0.0));
+    g.world.set_tag(e, TAG_WALL);
+}
+
+fn spawn_ball(Game* g, Vec3 pos, Vec3 velocity, float radius, Color c) {
+    int e = g.world.spawn();
+    if (e < 0) return;
+    int b = g.physics.add_sphere(pos, radius, radius * 4.0);
+    if (b < 0) {
+        g.world.destroy(e);
+        return;
+    }
+    Body* body = g.physics.body(b);
+    body.velocity = velocity;
+    body.restitution = 0.7;
+    g.world.set_position(e, pos);
+    g.world.set_scale(e, vec3(radius, radius, radius) * 2.0);
+    g.world.set_render(e, g.sphere, c);
+    g.world.set_body(e, b);
+    g.world.set_lifetime(e, 14.0);
+    g.world.set_tag(e, TAG_BALL);
+}
+
+fn random_color() -> Color {
+    int pick = random_int(0, 4);
+    if (pick == 0) return rgb(0.9, 0.2, 0.15);
+    if (pick == 1) return rgb(0.15, 0.55, 0.95);
+    if (pick == 2) return rgb(0.2, 0.8, 0.3);
+    if (pick == 3) return rgb(0.95, 0.5, 0.1);
+    return rgb(0.7, 0.3, 0.9);
+}
+
+fn random_spot(float height) -> Vec3 {
+    return vec3(random_range(-ARENA + 2.0, ARENA - 2.0), height, random_range(-ARENA + 2.0, ARENA - 2.0));
+}
+
+fn place_pickup(Game* g, int e) {
+    g.world.set_position(e, random_spot(0.9 + random() * 2.5));
+}
+
+fn build_level(Game* g) {
+    Color wall = rgb(0.55, 0.5, 0.45);
+    Color stone = rgb(0.45, 0.47, 0.52);
+    // Arena walls
+    add_block(g, vec3(0.0, 1.0, -ARENA), vec3(ARENA, 1.0, 0.5), wall);
+    add_block(g, vec3(0.0, 1.0, ARENA), vec3(ARENA, 1.0, 0.5), wall);
+    add_block(g, vec3(-ARENA, 1.0, 0.0), vec3(0.5, 1.0, ARENA), wall);
+    add_block(g, vec3(ARENA, 1.0, 0.0), vec3(0.5, 1.0, ARENA), wall);
+    // A staircase of platforms
+    for (int i = 0; i < 5; i++) {
+        float f = i as float;
+        add_block(g, vec3(-10.0 + f * 2.2, 0.4 + f * 0.6, -8.0), vec3(1.1, 0.4 + f * 0.6, 1.1), stone);
+    }
+    // Pillars
+    for (int i = 0; i < 6; i++) {
+        float a = (i as float) * TAU / 6.0;
+        add_block(g, vec3(cos(a) * 9.0, 2.0, sin(a) * 9.0 + 4.0), vec3(0.6, 2.0, 0.6), rgb(0.75, 0.72, 0.65));
+    }
+    // A big ramp-like block in the middle
+    add_block(g, vec3(6.0, 0.75, -2.0), vec3(2.5, 0.75, 2.5), rgb(0.35, 0.4, 0.5));
+
+    // Gold pickups
+    for (int i = 0; i < PICKUP_COUNT; i++) {
+        int e = g.world.spawn();
+        g.world.set_scale(e, vec3(0.6, 0.6, 0.6));
+        g.world.set_render(e, g.cube, rgb(1.0, 0.78, 0.2));
+        g.world.set_spin(e, vec3(1.3, 2.1, 0.0));
+        g.world.set_tag(e, TAG_PICKUP);
+        place_pickup(g, e);
+    }
+}
+
+fn reset_player(Game* g) {
+    Body* b = g.physics.body(g.player_body);
+    b.position = vec3(0.0, 2.0, 6.0);
+    b.velocity = vec3(0.0, 0.0, 0.0);
+    g.score = 0;
+}
+
+fn update_player(Game* g, float dt) {
+    Body* b = g.physics.body(g.player_body);
+
+    // Camera-relative movement
+    float yaw = g.cam.yaw;
+    Vec3 forward = vec3(-sin(yaw), 0.0, -cos(yaw));
+    Vec3 right = vec3(cos(yaw), 0.0, -sin(yaw));
+    Vec3 input = vec3(0.0, 0.0, 0.0);
+    if (engine_key_down(KEY_W) || engine_key_down(KEY_UP)) input = input + forward;
+    if (engine_key_down(KEY_S) || engine_key_down(KEY_DOWN)) input = input - forward;
+    if (engine_key_down(KEY_D) || engine_key_down(KEY_RIGHT)) input = input + right;
+    if (engine_key_down(KEY_A) || engine_key_down(KEY_LEFT)) input = input - right;
+    float speed = engine_key_down(KEY_SHIFT) ? 11.0 : 7.0;
+    Vec3 target = normalize(input) * speed;
+
+    // Accelerate towards the target velocity (less control in the air)
+    float control = b.grounded ? 12.0 : 3.0;
+    float k = min(1.0, control * dt);
+    b.velocity.x = lerp(b.velocity.x, target.x, k);
+    b.velocity.z = lerp(b.velocity.z, target.z, k);
+
+    if (engine_key_pressed(KEY_SPACE) && b.grounded) {
+        b.velocity.y = 9.5;
+        sfx_jump();
+    }
+    if (engine_key_pressed(KEY_F)) {
+        Vec3 dir = normalize(forward + vec3(0.0, 0.25, 0.0));
+        spawn_ball(g, b.position + forward * 1.2 + vec3(0.0, 0.6, 0.0), dir * 24.0, 0.35, rgb(0.95, 0.95, 0.95));
+        engine_play_sweep(900.0, 200.0, 0.15, 0.2, WAVE_SAW);
+    }
+    if (engine_key_pressed(KEY_R)) reset_player(g);
+    if (b.position.y < -20.0) reset_player(g);
+
+    // Collect pickups
+    for (int e = 0; e < g.world.count; e++) {
+        if (!g.world.has(e, HAS_TAG) || g.world.tags[e] != TAG_PICKUP) continue;
+        if (distance(g.world.transforms[e].position, b.position) < 1.1) {
+            g.score++;
+            sfx_pickup();
+            place_pickup(g, e);
+        }
+    }
+}
+
+fn update_title(Game* g) {
+    StrBuf sb;
+    sb.clear();
+    sb.append("Ron Arena  |  Score: ");
+    sb.append(g.score);
+    sb.append("  |  Entities: ");
+    sb.append(g.world.alive);
+    sb.append("  |  WASD move, Space jump, F shoot, right-drag camera");
+    engine_set_title(sb.text());
+}
+
+fn main() -> int {
+    if (!engine_init(1280, 720, "Ron Arena")) {
+        println("could not start the engine (is a Vulkan GPU available?)");
+        return 1;
+    }
+    engine_set_light(-0.5, -1.0, -0.35, 1.8);
+    engine_set_fog(0.45, 0.55, 0.7, 0.012);
+    seed_random(engine_time() as u64 * 1000 + 7);
+
+    Game game;
+    Game* g = &game;
+    g.world = world_create(MAX_ENTITIES);
+    g.physics = physics_world(MAX_ENTITIES);
+    g.cube = engine_mesh_cube();
+    g.sphere = engine_mesh_sphere(24, 32);
+    g.plane = engine_mesh_plane(80.0);
+    g.cam = orbit_camera(vec3(0.0, 1.0, 6.0), 14.0);
+
+    build_level(g);
+
+    // The player: an entity with a sphere body
+    g.player = g.world.spawn();
+    g.player_body = g.physics.add_sphere(vec3(0.0, 2.0, 6.0), 0.5, 2.0);
+    g.physics.body(g.player_body).restitution = 0.0;
+    g.world.set_scale(g.player, vec3(1.0, 1.0, 1.0));
+    g.world.set_render(g.player, g.sphere, rgb(0.2, 0.45, 0.95));
+    g.world.set_body(g.player, g.player_body);
+    g.world.set_tag(g.player, TAG_PLAYER);
+
+    // Ground: a render-only entity drawn with the checkerboard material
+    int ground = g.world.spawn();
+    g.world.set_render(ground, g.plane, rgb(0.62, 0.62, 0.6));
+    g.world.renders[ground].checker = true;
+
+    while (engine_running()) {
+        float dt = engine_delta();
+
+        // Camera controls
+        if (engine_key_down(KEY_Q)) g.cam.yaw += 2.0 * dt;
+        if (engine_key_down(KEY_E)) g.cam.yaw -= 2.0 * dt;
+        g.cam.update();
+
+        update_player(g, dt);
+
+        // Rain of balls
+        g.spawn_timer -= dt;
+        if (g.spawn_timer <= 0.0) {
+            g.spawn_timer = 0.45;
+            spawn_ball(g, random_spot(14.0), vec3(random_range(-2.0, 2.0), 0.0, random_range(-2.0, 2.0)),
+                       random_range(0.3, 0.7), random_color());
+        }
+
+        g.physics.step(dt);
+
+        // Impact sounds (a few per frame at most)
+        int sounds = 0;
+        for (int i = 0; i < g.physics.contact_count && sounds < 3; i++) {
+            Contact* c = &g.physics.contacts[i];
+            if (c.impact > 5.0) {
+                sfx_impact(c.impact);
+                sounds++;
+            }
+        }
+
+        system_lifetime(&g.world, &g.physics, dt);
+        system_physics_sync(&g.world, &g.physics);
+        system_movement(&g.world, dt);
+
+        Body* pb = g.physics.body(g.player_body);
+        g.cam.target = lerp(g.cam.target, pb.position + vec3(0.0, 0.8, 0.0), min(1.0, 8.0 * dt));
+        g.cam.apply();
+
+        g.title_timer -= dt;
+        if (g.title_timer <= 0.0) {
+            g.title_timer = 0.25;
+            update_title(g);
+        }
+
+        if (engine_begin_frame(0.45, 0.55, 0.7)) {
+            system_render(&g.world);
+            engine_end_frame();
+        }
+    }
+    engine_shutdown();
+    return 0;
+}

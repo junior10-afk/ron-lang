@@ -42,9 +42,25 @@ uint64_t normalizeInt(uint64_t v, const Type* t) {
     return v;
 }
 
-bool isUntypedInt(const Expr* e) { return e->kind == ExprKind::IntLit && e->as<IntLitExpr>()->untyped; }
-bool isUntypedFloat(const Expr* e) { return e->kind == ExprKind::FloatLit && e->as<FloatLitExpr>()->untyped; }
+// A conditional whose branches are both untyped literals is itself untyped:
+// `c ? 1.0 : -1.0` takes its type from the context, like a plain literal.
+bool isUntypedTernary(const Expr* e);
+bool isUntypedInt(const Expr* e) {
+    if (e->kind == ExprKind::Ternary)
+        return isUntypedTernary(e) && isUntypedInt(e->as<TernaryExpr>()->thenExpr) &&
+               isUntypedInt(e->as<TernaryExpr>()->elseExpr);
+    return e->kind == ExprKind::IntLit && e->as<IntLitExpr>()->untyped;
+}
+bool isUntypedFloat(const Expr* e) {
+    if (e->kind == ExprKind::Ternary) return isUntypedTernary(e) && !isUntypedInt(e);
+    return e->kind == ExprKind::FloatLit && e->as<FloatLitExpr>()->untyped;
+}
 bool isUntyped(const Expr* e) { return isUntypedInt(e) || isUntypedFloat(e); }
+bool isUntypedTernary(const Expr* e) {
+    auto* t = e->as<TernaryExpr>();
+    return t->thenExpr && t->elseExpr && t->thenExpr->type && t->elseExpr->type && isUntyped(t->thenExpr) &&
+           isUntyped(t->elseExpr);
+}
 
 std::string operatorFuncName(BinaryOp op) { return std::string("op") + binaryOpText(op); }
 
@@ -81,12 +97,13 @@ bool Sema::run() {
                 }
     }
 
+    std::vector<FuncDecl*> bodies;
     for (Decl* d : program_.decls) {
         if (d->declKind != Decl::Kind::Func) continue;
         auto* f = static_cast<FuncDecl*>(d);
         if (f->body) {
             checkFunction(f);
-            functions.push_back(f);
+            bodies.push_back(f);
         }
     }
 
@@ -99,9 +116,25 @@ bool Sema::run() {
             diags_.error(mainFunc->loc, "'main' must take no parameters and have a body");
         else if (mainFunc->returnType && !mainFunc->returnType->isVoid() && !mainFunc->returnType->isInt())
             diags_.error(mainFunc->loc, "'main' must return 'int' or nothing");
-        mainFunc->used = true;
     }
 
+    // Dead-code elimination: only functions reachable from main are compiled,
+    // so importing a library costs nothing for the parts you do not call.
+    if (mainFunc) {
+        std::vector<FuncDecl*> work{mainFunc};
+        mainFunc->used = true;
+        while (!work.empty()) {
+            FuncDecl* f = work.back();
+            work.pop_back();
+            for (FuncDecl* c : f->callees)
+                if (!c->used) {
+                    c->used = true;
+                    work.push_back(c);
+                }
+        }
+    }
+    for (FuncDecl* f : bodies)
+        if (f->used) functions.push_back(f);
     for (auto& [name, list] : funcs_)
         for (FuncDecl* f : list)
             if (!f->body && f->used) externs.push_back(f);
@@ -514,6 +547,11 @@ void Sema::setUntypedIntType(IntLitExpr* e) {
 int Sema::conversionCost(Expr* e, Type* to) {
     Type* from = e->type;
     if (!from || !to) return -1;
+    if (e->kind == ExprKind::Ternary && isUntyped(e)) {
+        int a = conversionCost(e->as<TernaryExpr>()->thenExpr, to);
+        int b = conversionCost(e->as<TernaryExpr>()->elseExpr, to);
+        return a < 0 || b < 0 ? -1 : std::max(a, b);
+    }
     if (from == to) return isUntyped(e) ? 1 : 0;
     if (isUntypedInt(e)) {
         // Prefer signed, then unsigned, then float overloads for integer literals.
@@ -552,6 +590,13 @@ Expr* Sema::implicitCast(Expr* e, Type* to) {
 
 // Converts a literal to another type at compile time, or wraps it in a cast.
 Expr* Sema::foldCast(Expr* e, Type* to, bool explicitCast) {
+    if (e->kind == ExprKind::Ternary && isUntyped(e)) {
+        auto* t = e->as<TernaryExpr>();
+        t->thenExpr = foldCast(t->thenExpr, to, explicitCast);
+        t->elseExpr = foldCast(t->elseExpr, to, explicitCast);
+        t->type = to;
+        return t;
+    }
     if (e->kind == ExprKind::IntLit) {
         auto* lit = e->as<IntLitExpr>();
         if (to->isInt()) {
@@ -710,7 +755,7 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
 
     if (bestUsesAddr) args[0] = addrOfBase;
     for (size_t i = 0; i < args.size(); ++i) args[i] = coerce(args[i], best->paramTypes[i], "argument");
-    best->used = true;
+    if (currentFunc_) currentFunc_->callees.push_back(best);
     return best;
 }
 
@@ -1107,8 +1152,8 @@ Expr* Sema::checkBinary(BinaryExpr* e) {
             common = types_.f64();
             l = foldCast(l, common, false);
             r = foldCast(r, common, false);
-            l->as<FloatLitExpr>()->untyped = true;
-            r->as<FloatLitExpr>()->untyped = true;
+            if (l->kind == ExprKind::FloatLit) l->as<FloatLitExpr>()->untyped = true;
+            if (r->kind == ExprKind::FloatLit) r->as<FloatLitExpr>()->untyped = true;
         } else {
             common = l->type->size >= r->type->size ? l->type : r->type;
         }
@@ -1239,6 +1284,16 @@ Expr* Sema::checkTernary(TernaryExpr* e) {
     Expr*& a = e->thenExpr;
     Expr*& b = e->elseExpr;
     if (!a->type || !b->type) return errorExpr(e);
+    if (isUntyped(a) && isUntyped(b)) {
+        // Stay untyped; the context (assignment, argument, operator) picks the type later.
+        if (isUntypedFloat(a) != isUntypedFloat(b)) {
+            Expr*& intSide = isUntypedFloat(a) ? b : a;
+            intSide = foldCast(intSide, types_.f64(), false);
+            if (intSide->kind == ExprKind::FloatLit) intSide->as<FloatLitExpr>()->untyped = true;
+        }
+        e->type = isUntypedFloat(a) ? types_.f64() : (a->type->size >= b->type->size ? a->type : b->type);
+        return e;
+    }
     if (a->type == b->type && !isUntyped(a) && !isUntyped(b)) {
         e->type = a->type;
     } else if (isUntyped(a) && !isUntyped(b)) {

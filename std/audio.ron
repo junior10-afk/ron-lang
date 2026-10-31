@@ -1,0 +1,35 @@
+// Procedural sound effects on top of the engine's synthesizer.
+
+import "std/engine.ron";
+import "std/math.ron";
+
+// Frequency of a MIDI note (69 = A4 = 440 Hz)
+fn note_hz(int midi) -> float {
+    float semis = (midi - 69) as float;
+    // 2^(semis/12) computed with repeated multiplication (no pow() needed)
+    float f = 440.0;
+    float up = 1.0594630943593;   // 2^(1/12)
+    if (semis > 0.0) { for (int i = 0; i < (semis as int); i++) f *= up; }
+    else { for (int i = 0; i < (-semis as int); i++) f /= up; }
+    return f;
+}
+
+fn play_note(int midi, float seconds, float volume) {
+    engine_play_tone(note_hz(midi), seconds, volume, WAVE_SQUARE);
+}
+
+fn sfx_jump() { engine_play_sweep(220.0, 660.0, 0.18, 0.25, WAVE_SQUARE); }
+fn sfx_land() { engine_play_sweep(160.0, 60.0, 0.12, 0.3, WAVE_SINE); }
+fn sfx_pickup() {
+    engine_play_tone(note_hz(76), 0.12, 0.2, WAVE_SQUARE);
+    engine_play_sweep(note_hz(83), note_hz(88), 0.25, 0.18, WAVE_SQUARE);
+}
+fn sfx_explosion() {
+    engine_play_tone(80.0, 0.6, 0.5, WAVE_NOISE);
+    engine_play_sweep(120.0, 30.0, 0.5, 0.4, WAVE_SINE);
+}
+// A soft thud whose loudness follows the impact speed.
+fn sfx_impact(float speed) {
+    float v = clamp(speed / 20.0, 0.03, 0.35);
+    engine_play_sweep(140.0 + speed * 6.0, 50.0, 0.1, v, WAVE_SINE);
+}

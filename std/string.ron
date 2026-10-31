@@ -30,6 +30,35 @@ fn u64_to_str(u64 v, u8* buf) -> u64 {
     return n;
 }
 
+// A fixed-capacity string builder: text(&sb) gives a null-terminated u8*.
+struct StrBuf {
+    u8[256] data;
+    u64 len;
+}
+
+fn clear(StrBuf* sb) {
+    sb.len = 0;
+    sb.data[0] = 0;
+}
+
+fn append(StrBuf* sb, u8* s) {
+    u64 i = 0;
+    while (s[i] != 0 && sb.len < 255) {
+        sb.data[sb.len] = s[i];
+        sb.len++;
+        i++;
+    }
+    sb.data[sb.len] = 0;
+}
+
+fn append(StrBuf* sb, i64 v) {
+    u8[24] tmp;
+    i64_to_str(v, &tmp[0]);
+    sb.append(&tmp[0]);
+}
+
+fn text(StrBuf* sb) -> u8* { return &sb.data[0]; }
+
 fn i64_to_str(i64 v, u8* buf) -> u64 {
     if (v >= 0) return u64_to_str(v as u64, buf);
     buf[0] = '-';

@@ -1,0 +1,211 @@
+// Scalar math, vectors and 4x4 matrices, implemented in Ron.
+// Matrices are column-major (m[col * 4 + row]) to match Vulkan/GLSL.
+
+const float PI = 3.14159265358979;
+const float TAU = 6.28318530717959;
+const float HALF_PI = 1.57079632679490;
+const float DEG2RAD = 0.01745329251994;
+
+// ───────────── Scalars ─────────────
+
+fn abs(float x) -> float { return x < 0.0 ? -x : x; }
+fn abs(int x) -> int { return x < 0 ? -x : x; }
+fn min(float a, float b) -> float { return a < b ? a : b; }
+fn max(float a, float b) -> float { return a > b ? a : b; }
+fn min(int a, int b) -> int { return a < b ? a : b; }
+fn max(int a, int b) -> int { return a > b ? a : b; }
+fn clamp(float x, float lo, float hi) -> float { return x < lo ? lo : (x > hi ? hi : x); }
+fn clamp(int x, int lo, int hi) -> int { return x < lo ? lo : (x > hi ? hi : x); }
+fn lerp(float a, float b, float t) -> float { return a + (b - a) * t; }
+fn sign(float x) -> float { return x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0); }
+fn radians(float degrees) -> float { return degrees * DEG2RAD; }
+fn smoothstep(float e0, float e1, float x) -> float {
+    float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn floor(float x) -> float {
+    float t = (x as i64) as float;
+    return t > x ? t - 1.0 : t;
+}
+
+fn ceil(float x) -> float {
+    float t = (x as i64) as float;
+    return t < x ? t + 1.0 : t;
+}
+
+// Result has the sign of y (always in [0, y) for positive y).
+fn fmod(float x, float y) -> float { return x - floor(x / y) * y; }
+
+fn sin(float x) -> float {
+    // Reduce to [-pi, pi], then to [-pi/2, pi/2] using sin(x) = sin(pi - x).
+    x = fmod(x + PI, TAU) - PI;
+    if (x > HALF_PI) x = PI - x;
+    else if (x < -HALF_PI) x = -PI - x;
+    float x2 = x * x;
+    // Taylor series to x^11 (error < 1e-7 on the reduced range)
+    return x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0 * (1.0 - x2 / 72.0 * (1.0 - x2 / 110.0)))));
+}
+
+fn cos(float x) -> float { return sin(x + HALF_PI); }
+fn tan(float x) -> float { return sin(x) / cos(x); }
+
+fn atan(float x) -> float {
+    if (x > 1.0) return HALF_PI - atan(1.0 / x);
+    if (x < -1.0) return -HALF_PI - atan(1.0 / x);
+    float x2 = x * x;
+    // Minimax polynomial on [-1, 1] (error ~1e-5)
+    return x * (0.9998660 + x2 * (-0.3302995 + x2 * (0.1801410 + x2 * (-0.0851330 + x2 * 0.0208351))));
+}
+
+fn atan2(float y, float x) -> float {
+    if (x > 0.0) return atan(y / x);
+    if (x < 0.0) return y >= 0.0 ? atan(y / x) + PI : atan(y / x) - PI;
+    if (y > 0.0) return HALF_PI;
+    if (y < 0.0) return -HALF_PI;
+    return 0.0;
+}
+
+// ───────────── Vectors ─────────────
+
+struct Vec2 { float x, y; }
+struct Vec3 { float x, y, z; }
+struct Vec4 { float x, y, z, w; }
+
+fn vec2(float x, float y) -> Vec2 { return Vec2{x, y}; }
+fn vec3(float x, float y, float z) -> Vec3 { return Vec3{x, y, z}; }
+fn vec4(float x, float y, float z, float w) -> Vec4 { return Vec4{x, y, z, w}; }
+
+fn +(Vec2 a, Vec2 b) -> Vec2 { return Vec2{a.x + b.x, a.y + b.y}; }
+fn -(Vec2 a, Vec2 b) -> Vec2 { return Vec2{a.x - b.x, a.y - b.y}; }
+fn *(Vec2 a, float s) -> Vec2 { return Vec2{a.x * s, a.y * s}; }
+fn length(Vec2 v) -> float { return sqrt(v.x * v.x + v.y * v.y); }
+
+fn +(Vec3 a, Vec3 b) -> Vec3 { return Vec3{a.x + b.x, a.y + b.y, a.z + b.z}; }
+fn -(Vec3 a, Vec3 b) -> Vec3 { return Vec3{a.x - b.x, a.y - b.y, a.z - b.z}; }
+fn -(Vec3 a) -> Vec3 { return Vec3{-a.x, -a.y, -a.z}; }
+fn *(Vec3 a, float s) -> Vec3 { return Vec3{a.x * s, a.y * s, a.z * s}; }
+fn *(float s, Vec3 a) -> Vec3 { return Vec3{a.x * s, a.y * s, a.z * s}; }
+fn *(Vec3 a, Vec3 b) -> Vec3 { return Vec3{a.x * b.x, a.y * b.y, a.z * b.z}; }
+fn /(Vec3 a, float s) -> Vec3 { return Vec3{a.x / s, a.y / s, a.z / s}; }
+fn ==(Vec3 a, Vec3 b) -> bool { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+fn dot(Vec3 a, Vec3 b) -> float { return a.x * b.x + a.y * b.y + a.z * b.z; }
+fn cross(Vec3 a, Vec3 b) -> Vec3 {
+    return Vec3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+fn length_sq(Vec3 v) -> float { return dot(v, v); }
+fn length(Vec3 v) -> float { return sqrt(dot(v, v)); }
+fn distance(Vec3 a, Vec3 b) -> float { return length(a - b); }
+fn normalize(Vec3 v) -> Vec3 {
+    float l = length(v);
+    if (l < 0.000001) return Vec3{0.0, 0.0, 0.0};
+    return v / l;
+}
+fn lerp(Vec3 a, Vec3 b, float t) -> Vec3 { return a + (b - a) * t; }
+
+fn +(Vec4 a, Vec4 b) -> Vec4 { return Vec4{a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w}; }
+fn *(Vec4 a, float s) -> Vec4 { return Vec4{a.x * s, a.y * s, a.z * s, a.w * s}; }
+fn dot(Vec4 a, Vec4 b) -> float { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+
+// ───────────── 4x4 matrices ─────────────
+
+struct Mat4 { float[16] m; }
+
+fn mat4_identity() -> Mat4 {
+    Mat4 r;
+    r.m[0] = 1.0; r.m[5] = 1.0; r.m[10] = 1.0; r.m[15] = 1.0;
+    return r;
+}
+
+fn *(Mat4 a, Mat4 b) -> Mat4 {
+    Mat4 r;
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            float s = 0.0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[col * 4 + k];
+            r.m[col * 4 + row] = s;
+        }
+    }
+    return r;
+}
+
+fn *(Mat4 a, Vec4 v) -> Vec4 {
+    return Vec4{
+        a.m[0] * v.x + a.m[4] * v.y + a.m[8] * v.z + a.m[12] * v.w,
+        a.m[1] * v.x + a.m[5] * v.y + a.m[9] * v.z + a.m[13] * v.w,
+        a.m[2] * v.x + a.m[6] * v.y + a.m[10] * v.z + a.m[14] * v.w,
+        a.m[3] * v.x + a.m[7] * v.y + a.m[11] * v.z + a.m[15] * v.w};
+}
+
+fn transform_point(Mat4 a, Vec3 p) -> Vec3 {
+    Vec4 r = a * Vec4{p.x, p.y, p.z, 1.0};
+    return Vec3{r.x, r.y, r.z};
+}
+
+fn mat4_translate(Vec3 t) -> Mat4 {
+    Mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+fn mat4_scale(Vec3 s) -> Mat4 {
+    Mat4 r;
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z; r.m[15] = 1.0;
+    return r;
+}
+
+fn mat4_rotate_x(float a) -> Mat4 {
+    Mat4 r = mat4_identity();
+    float c = cos(a);
+    float s = sin(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+fn mat4_rotate_y(float a) -> Mat4 {
+    Mat4 r = mat4_identity();
+    float c = cos(a);
+    float s = sin(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+fn mat4_rotate_z(float a) -> Mat4 {
+    Mat4 r = mat4_identity();
+    float c = cos(a);
+    float s = sin(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+// translation * rotation(yaw, pitch, roll) * scale
+fn mat4_trs(Vec3 pos, Vec3 rot, Vec3 scale) -> Mat4 {
+    return mat4_translate(pos) * mat4_rotate_y(rot.y) * mat4_rotate_x(rot.x) * mat4_rotate_z(rot.z) * mat4_scale(scale);
+}
+
+// Right-handed perspective for Vulkan: depth in [0, 1], clip-space Y pointing down.
+fn mat4_perspective(float fovy, float aspect, float near, float far) -> Mat4 {
+    float f = 1.0 / tan(fovy * 0.5);
+    Mat4 r;
+    r.m[0] = f / aspect;
+    r.m[5] = -f;
+    r.m[10] = far / (near - far);
+    r.m[11] = -1.0;
+    r.m[14] = near * far / (near - far);
+    return r;
+}
+
+fn mat4_look_at(Vec3 eye, Vec3 target, Vec3 up) -> Mat4 {
+    Vec3 f = normalize(target - eye);
+    Vec3 s = normalize(cross(f, up));
+    Vec3 u = cross(s, f);
+    Mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[4] = s.y; r.m[8] = s.z;
+    r.m[1] = u.x; r.m[5] = u.y; r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -dot(s, eye);
+    r.m[13] = -dot(u, eye);
+    r.m[14] = dot(f, eye);
+    return r;
+}

@@ -293,7 +293,8 @@ struct FuncDecl : Decl {
     Type* returnType = nullptr;
     std::vector<LocalVar*> paramVars;
     std::vector<LocalVar*> locals;        // every local declared in the body
-    bool used = false;
+    std::vector<FuncDecl*> callees;       // direct calls (for dead-code elimination)
+    bool used = false;                    // reachable from main
 
     FuncDecl() : Decl(Kind::Func) {}
 };

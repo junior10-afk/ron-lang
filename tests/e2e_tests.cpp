@@ -251,6 +251,97 @@ TEST(e2e_enums_and_casts) {
     )", 57));
 }
 
+TEST(e2e_std_math) {
+    CHECK(prints("math", R"(
+        import "std/io.ron";
+        import "std/math.ron";
+        fn show(float v) { println((v * 1000.0 + (v < 0.0 ? -0.5 : 0.5)) as int); }   // 3 decimals, rounded
+        fn main() -> int {
+            show(sin(PI / 6.0));
+            show(cos(0.0));
+            show(cos(PI));
+            show(sin(-7.0 * PI / 2.0));
+            show(atan2(1.0, 1.0));
+            show(floor(-1.5));
+            show(fmod(7.5, 2.0));
+            Vec3 c = cross(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0));
+            show(c.z);
+            show(length(vec3(3.0, 4.0, 0.0)));
+            Mat4 m = mat4_translate(vec3(1.0, 2.0, 3.0)) * mat4_scale(vec3(2.0, 2.0, 2.0));
+            Vec3 p = transform_point(m, vec3(1.0, 1.0, 1.0));
+            show(p.x + p.y + p.z);   // 3 + 4 + 5
+            return 0;
+        }
+    )", "500\n1000\n-1000\n1000\n785\n-2000\n1500\n1000\n5000\n12000\n"));
+}
+
+TEST(e2e_std_physics_and_ecs) {
+    // Uses the ECS (which references the engine) without calling any engine
+    // function: dead-code elimination keeps ron_engine.dll out of the imports.
+    CHECK(prints("physics", R"(
+        import "std/io.ron";
+        import "std/ecs.ron";
+        fn main() -> int {
+            PhysicsWorld p = physics_world(16);
+            int ball = p.add_sphere(vec3(0.0, 10.0, 0.0), 0.5, 1.0);
+            p.body(ball).restitution = 0.0;
+            int crate = p.add_box(vec3(3.0, 5.0, 0.0), vec3(0.5, 0.5, 0.5), 1.0);
+            int floor_box = p.add_box(vec3(3.0, 0.5, 0.0), vec3(2.0, 0.5, 2.0), 0.0);
+            for (int i = 0; i < 240; i++) p.step(1.0 / 60.0);
+            println((p.body(ball).position.y * 100.0 + 0.5) as int);    // rests on the ground: 50
+            println((p.body(crate).position.y * 100.0 + 0.5) as int);   // rests on the static box: 150
+            println(p.body(ball).grounded);
+
+            World w = world_create(8);
+            int a = w.spawn();
+            int b = w.spawn();
+            w.set_velocity(b, vec3(1.0, 0.0, 0.0));
+            w.set_lifetime(a, 0.5);
+            for (int i = 0; i < 10; i++) {
+                system_movement(&w, 0.1);
+                system_lifetime(&w, &p, 0.1);
+            }
+            println(w.alive);                                            // a expired: 1
+            println((w.transforms[b].position.x * 10.0 + 0.5) as int);   // 10
+            return 0;
+        }
+    )", "50\n150\ntrue\n1\n10\n"));
+}
+
+TEST(e2e_std_strings_and_random) {
+    CHECK(prints("strings", R"(
+        import "std/io.ron";
+        import "std/string.ron";
+        import "std/random.ron";
+        fn main() -> int {
+            StrBuf sb;
+            sb.clear();
+            sb.append("score=");
+            sb.append(-42);
+            sb.append("!");
+            println(sb.text());
+            println(strlen(sb.text()) as i64);
+            println(streq("abc", "abc") && !streq("abc", "abd"));
+            seed_random(123);
+            bool ok = true;
+            for (int i = 0; i < 1000; i++) {
+                int r = random_int(3, 7);
+                float f = random();
+                if (r < 3 || r > 7 || f < 0.0 || f >= 1.0) ok = false;
+            }
+            println(ok);
+            return 0;
+        }
+    )", "score=-42!\n10\ntrue\ntrue\n"));
+}
+
+TEST(e2e_compile_errors_are_reported) {
+    RunResult r = runProgram("bad", "fn main() -> int { int x = \"text\"; return y; }");
+    CHECK(!r.compiled);
+    CHECK(r.errors.find("cannot convert 'u8*' to 'i32'") != std::string::npos);
+    CHECK(r.errors.find("unknown name 'y'") != std::string::npos);
+}
+
 TEST(e2e_hello_world) {
     CHECK(prints("hello", R"(
         import "std/io.ron";

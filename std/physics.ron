@@ -1,0 +1,239 @@
+// Rigid-body physics: spheres and axis-aligned boxes, gravity, an infinite
+// ground plane, impulse-based collision response and contact events.
+
+import "std/math.ron";
+import "std/mem.ron";
+
+const int SHAPE_SPHERE = 0;
+const int SHAPE_BOX = 1;
+
+struct Body {
+    Vec3 position;
+    Vec3 velocity;
+    Vec3 half_extents;   // boxes
+    float radius;        // spheres
+    float inv_mass;      // 0 = static (immovable)
+    float restitution;   // bounciness, 0..1
+    float friction;      // 0..1, applied on contact
+    int shape;
+    bool active;
+    bool grounded;       // touched the ground or a surface below during the last step
+    bool is_trigger;     // reports contacts but does not collide
+}
+
+// A collision that happened during the last step.
+struct Contact {
+    int a, b;            // body ids (b = -1 for the ground)
+    Vec3 normal;         // from a towards b
+    float impact;        // closing speed along the normal
+}
+
+struct PhysicsWorld {
+    Body* bodies;
+    int count, capacity;
+    Vec3 gravity;
+    float ground_y;
+    int substeps;
+    Contact* contacts;
+    int contact_count, contact_capacity;
+}
+
+fn physics_world(int capacity) -> PhysicsWorld {
+    PhysicsWorld w;
+    w.bodies = alloc((capacity * sizeof(Body)) as u64);
+    w.capacity = capacity;
+    w.gravity = vec3(0.0, -18.0, 0.0);
+    w.ground_y = 0.0;
+    w.substeps = 4;
+    w.contact_capacity = 256;
+    w.contacts = alloc((w.contact_capacity * sizeof(Contact)) as u64);
+    return w;
+}
+
+fn add_body(PhysicsWorld* w, Body b) -> int {
+    // Reuse a removed slot first
+    for (int i = 0; i < w.count; i++) {
+        if (!w.bodies[i].active) {
+            w.bodies[i] = b;
+            return i;
+        }
+    }
+    if (w.count >= w.capacity) return -1;
+    w.bodies[w.count] = b;
+    w.count++;
+    return w.count - 1;
+}
+
+fn add_sphere(PhysicsWorld* w, Vec3 pos, float radius, float mass) -> int {
+    Body b;
+    b.position = pos;
+    b.radius = radius;
+    b.half_extents = vec3(radius, radius, radius);
+    b.inv_mass = mass > 0.0 ? 1.0 / mass : 0.0;
+    b.restitution = 0.5;
+    b.friction = 0.3;
+    b.shape = SHAPE_SPHERE;
+    b.active = true;
+    return w.add_body(b);
+}
+
+fn add_box(PhysicsWorld* w, Vec3 pos, Vec3 half, float mass) -> int {
+    Body b;
+    b.position = pos;
+    b.half_extents = half;
+    b.radius = length(half);
+    b.inv_mass = mass > 0.0 ? 1.0 / mass : 0.0;
+    b.restitution = 0.2;
+    b.friction = 0.5;
+    b.shape = SHAPE_BOX;
+    b.active = true;
+    return w.add_body(b);
+}
+
+fn remove_body(PhysicsWorld* w, int id) {
+    if (id >= 0 && id < w.count) w.bodies[id].active = false;
+}
+
+fn body(PhysicsWorld* w, int id) -> Body* { return &w.bodies[id]; }
+
+fn apply_impulse(PhysicsWorld* w, int id, Vec3 impulse) {
+    Body* b = &w.bodies[id];
+    b.velocity = b.velocity + impulse * b.inv_mass;
+}
+
+fn __record(PhysicsWorld* w, int a, int b, Vec3 n, float impact) {
+    if (w.contact_count >= w.contact_capacity) return;
+    w.contacts[w.contact_count] = Contact{a, b, n, impact};
+    w.contact_count++;
+}
+
+// Penetration test between two bodies. On overlap returns true and fills the
+// normal (pointing from a to b) and depth.
+fn __overlap(Body* a, Body* b, Vec3* normal, float* depth) -> bool {
+    if (a.shape == SHAPE_SPHERE && b.shape == SHAPE_SPHERE) {
+        Vec3 d = b.position - a.position;
+        float dist2 = length_sq(d);
+        float r = a.radius + b.radius;
+        if (dist2 >= r * r) return false;
+        float dist = sqrt(dist2);
+        *normal = dist > 0.0001 ? d / dist : vec3(0.0, 1.0, 0.0);
+        *depth = r - dist;
+        return true;
+    }
+    if (a.shape == SHAPE_BOX && b.shape == SHAPE_BOX) {
+        Vec3 d = b.position - a.position;
+        float ox = a.half_extents.x + b.half_extents.x - abs(d.x);
+        float oy = a.half_extents.y + b.half_extents.y - abs(d.y);
+        float oz = a.half_extents.z + b.half_extents.z - abs(d.z);
+        if (ox <= 0.0 || oy <= 0.0 || oz <= 0.0) return false;
+        // Separate along the axis of least penetration
+        if (ox < oy && ox < oz) { *normal = vec3(sign(d.x), 0.0, 0.0); *depth = ox; }
+        else if (oy < oz) { *normal = vec3(0.0, sign(d.y), 0.0); *depth = oy; }
+        else { *normal = vec3(0.0, 0.0, sign(d.z)); *depth = oz; }
+        return true;
+    }
+    // Sphere vs box: closest point on the box to the sphere center
+    bool flipped = a.shape == SHAPE_BOX;
+    Body* s = flipped ? b : a;
+    Body* bx = flipped ? a : b;
+    Vec3 rel = s.position - bx.position;
+    Vec3 closest = vec3(clamp(rel.x, -bx.half_extents.x, bx.half_extents.x),
+                        clamp(rel.y, -bx.half_extents.y, bx.half_extents.y),
+                        clamp(rel.z, -bx.half_extents.z, bx.half_extents.z));
+    Vec3 diff = rel - closest;
+    float dist2 = length_sq(diff);
+    if (dist2 >= s.radius * s.radius) return false;
+    Vec3 n;   // from box towards sphere
+    float dep;
+    if (dist2 > 0.000001) {
+        float dist = sqrt(dist2);
+        n = diff / dist;
+        dep = s.radius - dist;
+    } else {
+        // Sphere center inside the box: push out along the nearest face
+        float px = bx.half_extents.x - abs(rel.x);
+        float py = bx.half_extents.y - abs(rel.y);
+        float pz = bx.half_extents.z - abs(rel.z);
+        if (px < py && px < pz) { n = vec3(sign(rel.x), 0.0, 0.0); dep = px + s.radius; }
+        else if (py < pz) { n = vec3(0.0, sign(rel.y), 0.0); dep = py + s.radius; }
+        else { n = vec3(0.0, 0.0, sign(rel.z)); dep = pz + s.radius; }
+    }
+    *normal = flipped ? n : -n;
+    *depth = dep;
+    return true;
+}
+
+fn __bottom(Body* b) -> float {
+    return b.shape == SHAPE_SPHERE ? b.position.y - b.radius : b.position.y - b.half_extents.y;
+}
+
+fn step(PhysicsWorld* w, float dt) {
+    w.contact_count = 0;
+    for (int i = 0; i < w.count; i++) w.bodies[i].grounded = false;
+    float h = dt / (w.substeps as float);
+
+    for (int sub = 0; sub < w.substeps; sub++) {
+        // Integrate
+        for (int i = 0; i < w.count; i++) {
+            Body* b = &w.bodies[i];
+            if (!b.active || b.inv_mass == 0.0) continue;
+            b.velocity = b.velocity + w.gravity * h;
+            b.position = b.position + b.velocity * h;
+
+            // Ground plane
+            float pen = w.ground_y - __bottom(b);
+            if (pen > 0.0) {
+                b.position.y += pen;
+                if (b.velocity.y < 0.0) {
+                    float impact = -b.velocity.y;
+                    if (sub == 0 && impact > 1.0) w.__record(i, -1, vec3(0.0, -1.0, 0.0), impact);
+                    b.velocity.y = impact > 1.0 ? impact * b.restitution : 0.0;
+                }
+                float keep = 1.0 - b.friction * h * 4.0;
+                b.velocity.x *= keep;
+                b.velocity.z *= keep;
+                b.grounded = true;
+            }
+        }
+
+        // Pairwise collisions (O(n^2): fine for a few hundred bodies)
+        for (int i = 0; i < w.count; i++) {
+            Body* a = &w.bodies[i];
+            if (!a.active) continue;
+            for (int j = i + 1; j < w.count; j++) {
+                Body* b = &w.bodies[j];
+                if (!b.active) continue;
+                if (a.inv_mass == 0.0 && b.inv_mass == 0.0) continue;
+                // Cheap bounding-sphere rejection
+                if (distance(a.position, b.position) > a.radius + b.radius + 0.01) continue;
+                Vec3 n;
+                float depth;
+                if (!__overlap(a, b, &n, &depth)) continue;
+
+                float closing = dot(a.velocity - b.velocity, n);
+                if (a.is_trigger || b.is_trigger) {
+                    if (sub == 0) w.__record(i, j, n, abs(closing));
+                    continue;
+                }
+
+                // Positional correction, shared by inverse mass
+                float total = a.inv_mass + b.inv_mass;
+                a.position = a.position - n * (depth * a.inv_mass / total);
+                b.position = b.position + n * (depth * b.inv_mass / total);
+
+                if (n.y < -0.5) a.grounded = true;
+                if (n.y > 0.5) b.grounded = true;
+
+                // Impulse along the normal
+                if (closing > 0.0) {
+                    float e = min(a.restitution, b.restitution);
+                    if (closing < 1.0) e = 0.0;
+                    float j_imp = (1.0 + e) * closing / total;
+                    a.velocity = a.velocity - n * (j_imp * a.inv_mass);
+                    b.velocity = b.velocity + n * (j_imp * b.inv_mass);
+                    if (sub == 0 && closing > 1.0) w.__record(i, j, n, closing);
+                }
+            }
+        }
+    }
+}

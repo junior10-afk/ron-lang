@@ -1,0 +1,115 @@
+// Bindings for ron_engine.dll (Vulkan renderer, window, input, audio) plus a
+// few Ron-side helpers. `ronc` copies the DLL next to your executable.
+
+import "std/math.ron";
+
+extern "ron_engine.dll" {
+    fn engine_init(int width, int height, u8* title) -> bool;
+    fn engine_shutdown();
+    fn engine_running() -> bool;
+    fn engine_begin_frame(float r, float g, float b) -> bool;
+    fn engine_end_frame();
+    fn engine_set_title(u8* title);
+    fn engine_width() -> int;
+    fn engine_height() -> int;
+    fn engine_aspect() -> float;
+    fn engine_screenshot(u8* bmp_path);
+
+    fn engine_time() -> f64;
+    fn engine_delta() -> float;
+    fn engine_fps() -> float;
+
+    fn engine_set_camera(Mat4* view, Mat4* proj, Vec3* eye);
+    fn engine_set_light(float dx, float dy, float dz, float intensity);
+    fn engine_set_ambient(float sky_r, float sky_g, float sky_b, float ground_r, float ground_g, float ground_b);
+    fn engine_set_fog(float r, float g, float b, float density);
+
+    fn engine_mesh_cube() -> int;
+    fn engine_mesh_sphere(int rings, int segments) -> int;
+    fn engine_mesh_plane(float size) -> int;
+    fn engine_mesh_create(float* vertices, int vertex_count, u32* indices, int index_count) -> int;
+    fn engine_draw(int mesh, Mat4* model, float r, float g, float b);
+    fn engine_draw_checker(int mesh, Mat4* model, float r, float g, float b);
+
+    fn engine_key_down(int key) -> bool;
+    fn engine_key_pressed(int key) -> bool;
+    fn engine_mouse_down(int button) -> bool;
+    fn engine_mouse_dx() -> float;
+    fn engine_mouse_dy() -> float;
+    fn engine_mouse_wheel() -> float;
+
+    fn engine_play_tone(float frequency, float seconds, float volume, int wave);
+    fn engine_play_sweep(float from_hz, float to_hz, float seconds, float volume, int wave);
+}
+
+// Key codes (Windows virtual keys)
+const int KEY_BACKSPACE = 8;
+const int KEY_TAB = 9;
+const int KEY_ENTER = 13;
+const int KEY_SHIFT = 16;
+const int KEY_CTRL = 17;
+const int KEY_ESCAPE = 27;
+const int KEY_SPACE = 32;
+const int KEY_LEFT = 37;
+const int KEY_UP = 38;
+const int KEY_RIGHT = 39;
+const int KEY_DOWN = 40;
+const int KEY_0 = 48;
+const int KEY_1 = 49;
+const int KEY_2 = 50;
+const int KEY_3 = 51;
+const int KEY_A = 65;
+const int KEY_D = 68;
+const int KEY_E = 69;
+const int KEY_F = 70;
+const int KEY_Q = 81;
+const int KEY_R = 82;
+const int KEY_S = 83;
+const int KEY_W = 87;
+
+const int MOUSE_LEFT = 0;
+const int MOUSE_RIGHT = 1;
+const int MOUSE_MIDDLE = 2;
+
+const int WAVE_SINE = 0;
+const int WAVE_SQUARE = 1;
+const int WAVE_SAW = 2;
+const int WAVE_NOISE = 3;
+
+struct Color { float r, g, b; }
+
+fn rgb(float r, float g, float b) -> Color { return Color{r, g, b}; }
+
+fn draw(int mesh, Mat4 model, Color c) { engine_draw(mesh, &model, c.r, c.g, c.b); }
+
+// An orbit camera around a target point (drag with the right mouse button, wheel to zoom).
+struct OrbitCamera {
+    Vec3 target;
+    float yaw, pitch, distance;
+    float fov;
+}
+
+fn orbit_camera(Vec3 target, float distance) -> OrbitCamera {
+    return OrbitCamera{target, 0.6, 0.45, distance, radians(60.0)};
+}
+
+fn eye(OrbitCamera* cam) -> Vec3 {
+    float cp = cos(cam.pitch);
+    return cam.target + vec3(sin(cam.yaw) * cp, sin(cam.pitch), cos(cam.yaw) * cp) * cam.distance;
+}
+
+fn update(OrbitCamera* cam) {
+    if (engine_mouse_down(MOUSE_RIGHT)) {
+        cam.yaw -= engine_mouse_dx() * 0.005;
+        cam.pitch += engine_mouse_dy() * 0.005;
+    }
+    cam.pitch = clamp(cam.pitch, -1.2, 1.45);
+    cam.distance = clamp(cam.distance * (1.0 - engine_mouse_wheel() * 0.1), 2.0, 200.0);
+}
+
+fn apply(OrbitCamera* cam) {
+    Vec3 e = cam.eye();
+    Mat4 view = mat4_look_at(e, cam.target, vec3(0.0, 1.0, 0.0));
+    Mat4 proj = mat4_perspective(cam.fov, engine_aspect(), 0.1, 500.0);
+    engine_set_camera(&view, &proj, &e);
+}

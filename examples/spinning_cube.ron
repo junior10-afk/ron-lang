@@ -1,0 +1,31 @@
+// A lit, spinning cube on a checkerboard floor.
+// Run: ronc run examples/spinning_cube.ron   (right mouse: orbit, wheel: zoom, Esc: quit)
+
+import "std/engine.ron";
+
+fn main() -> int {
+    if (!engine_init(1280, 720, "Ron - spinning cube")) return 1;
+
+    int cube = engine_mesh_cube();
+    int floor_mesh = engine_mesh_plane(40.0);
+    OrbitCamera cam = orbit_camera(vec3(0.0, 1.0, 0.0), 6.0);
+
+    while (engine_running()) {
+        cam.update();
+        cam.apply();
+        float t = engine_time() as float;
+
+        if (engine_begin_frame(0.45, 0.55, 0.7)) {
+            Mat4 ground = mat4_identity();
+            engine_draw_checker(floor_mesh, &ground, 0.55, 0.55, 0.58);
+
+            Mat4 model = mat4_translate(vec3(0.0, 1.2 + sin(t * 2.0) * 0.25, 0.0)) *
+                         mat4_rotate_y(t) * mat4_rotate_x(t * 0.7) *
+                         mat4_scale(vec3(1.5, 1.5, 1.5));
+            engine_draw(cube, &model, 0.9, 0.35, 0.2);
+            engine_end_frame();
+        }
+    }
+    engine_shutdown();
+    return 0;
+}

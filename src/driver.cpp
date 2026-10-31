@@ -102,6 +102,9 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
     Image image = codegen.generate();
     std::vector<uint8_t> exe = writePE(image, options.subsystem);
 
+    std::error_code ec;
+    fs::path parent = fs::path(options.output).parent_path();
+    if (!parent.empty()) fs::create_directories(parent, ec);
     std::ofstream out(options.output, std::ios::binary);
     if (!out) {
         diags.error(SourceLoc{0, 0, 0, UINT32_MAX}, "cannot write '" + options.output + "'");
