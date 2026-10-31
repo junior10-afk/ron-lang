@@ -28,7 +28,9 @@ void Diagnostics::error(SourceLoc loc, std::string message) {
 }
 
 void Diagnostics::warning(SourceLoc loc, std::string message) {
+    if (loc.fileId < sources_.count() && sources_.get(loc.fileId).library) return;
     diags_.push_back({Severity::Warning, loc, std::move(message)});
+    ++warningCount_;
 }
 
 void Diagnostics::note(SourceLoc loc, std::string message) {

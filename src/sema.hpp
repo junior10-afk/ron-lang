@@ -26,6 +26,11 @@ public:
     std::vector<GlobalVar*> globals;    // mutable globals (consts are folded away)
     FuncDecl* mainFunc = nullptr;
     FuncDecl* initFunction = nullptr;   // __ron_init_globals (null when no global needs it)
+    FuncDecl* runtimeInit = nullptr;    // std/runtime.ron: installs the crash handler
+    FuncDecl* boundsFail = nullptr;     // std/runtime.ron: reports an index out of bounds
+    const SourceManager* sources = nullptr;   // for file names in panic/assert messages
+    bool boundsChecks = true;
+    std::string fileName(SourceLoc loc) const;
     Type* typeInfoType() const {
         auto it = structs_.find("TypeInfo");
         return it == structs_.end() ? nullptr : it->second->type;

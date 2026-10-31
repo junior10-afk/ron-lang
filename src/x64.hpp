@@ -121,6 +121,7 @@ public:
     void pop(Reg r);
     void ret();
     void nop(unsigned n = 1);
+    void align(unsigned boundary);   // multi-byte NOPs up to the next boundary
     void repMovsb();
     void repStosb();
 

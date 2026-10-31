@@ -47,6 +47,9 @@ public:
     CodeGen(Sema& sema, TypeContext& types);
     Image generate();
 
+    const SourceManager* sources = nullptr;   // file names for crash reports
+    bool boundsChecks = true;                 // debug builds check array/slice indexes
+
 private:
     using Reg = x64::Reg;
     using Xmm = x64::Xmm;
@@ -87,6 +90,15 @@ private:
     void genTry(TryExpr* e);
     void genMatch(MatchStmt* m);
     void genPack(PackExpr* p);
+    // Runtime error reporting
+    void boundsCheck(Reg value, bool constLimit, uint64_t limit, int32_t limitSlot, bool allowEqual, SourceLoc loc);
+    void emitDebugInfo();
+    std::string shortFileName(uint32_t fileId) const;
+    struct LineMark { uint32_t pos; uint32_t fileId; uint32_t line; };
+    struct FuncRange { uint32_t start, end; std::string name; uint32_t fileId; };
+    std::vector<LineMark> lineMarks_;
+    std::vector<FuncRange> funcRanges_;
+    uint32_t debugInfoOffset_ = 0;
     uint32_t typeInfo(Type* t);
     uint32_t rdataAlloc(uint32_t size, uint32_t align);
     void rdataPointer(uint32_t at, uint32_t targetOffset);

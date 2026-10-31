@@ -24,13 +24,16 @@ void printUsage() {
         "ronc - the Ron compiler\n"
         "\n"
         "Usage:\n"
-        "  ronc build <file.ron> [-o out.exe] [--gui]   compile to a native executable\n"
+        "  ronc build <file.ron> [-o out.exe] [--gui] [--release] [--Werror]\n"
+        "                                               compile to a native executable\n"
         "  ronc run   <file.ron> [--gui] [--watch]      compile and run (--watch: rebuild and\n"
         "                                               restart whenever a source file changes)\n"
         "  ronc check <file.ron>                        type-check only\n"
         "  ronc tokens <file.ron>                       print the lexer's tokens\n"
         "\n"
-        "  ronc <file.ron> is a shortcut for 'ronc build <file.ron>'.\n",
+        "  ronc <file.ron> is a shortcut for 'ronc build <file.ron>'.\n"
+        "\n"
+        "  --release   no bounds checks (faster)    --Werror   treat warnings as errors\n",
         stderr);
 }
 
@@ -100,6 +103,9 @@ struct BuildOutcome {
     std::vector<std::string> sources;
 };
 
+bool g_release = false;
+bool g_werror = false;
+
 BuildOutcome build(const std::string& input, const std::string& output, ron::Subsystem subsystem) {
     ron::SourceManager sources;
     ron::Diagnostics diags(sources);
@@ -108,6 +114,8 @@ BuildOutcome build(const std::string& input, const std::string& output, ron::Sub
     opts.output = output;
     opts.stdRoot = stdRoot();
     opts.subsystem = subsystem;
+    opts.release = g_release;
+    opts.warningsAsErrors = g_werror;
     ron::CompileResult r = ron::compile(opts, sources, diags);
     diags.printAll();
     if (!r.ok) {
@@ -202,6 +210,8 @@ int main(int argc, char** argv) {
         if (args[i] == "-o" && i + 1 < args.size()) output = args[++i];
         else if (args[i] == "--gui") gui = true;
         else if (args[i] == "--watch") watch = true;
+        else if (args[i] == "--release") g_release = true;
+        else if (args[i] == "--Werror") g_werror = true;
         else if (input.empty()) input = args[i];
         else {
             printUsage();

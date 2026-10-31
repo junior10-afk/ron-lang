@@ -1,0 +1,195 @@
+// Imported automatically into every Ron program.
+// Crash reports with stack traces, panic(), assert() and bounds-check failures.
+// The compiler emits a table of functions and source lines; this file walks the
+// rbp frame chain (every Ron function keeps a frame pointer) to print where
+// the program was.
+
+import "std/win32.ron";
+
+extern "kernel32.dll" {
+    fn AddVectoredExceptionHandler(u32 first, fn(void*) -> i32 handler) -> void*;
+}
+
+// Layout written by the compiler (see CodeGen::emitDebugInfo).
+private struct FuncEntry { u64 start; u64 end; u8* name; u8* file; }
+private struct LineEntry { u64 address; u8* file; i64 line; }
+private struct DebugInfo { i64 func_count; FuncEntry* funcs; i64 line_count; LineEntry* lines; }
+
+private const u32 STD_ERROR = 4294967284;   // (DWORD)-12
+
+private fn err_write(u8* s) {
+    u64 n = 0;
+    while (s[n] != 0) n++;
+    u32 written = 0;
+    WriteFile(GetStdHandle(STD_ERROR), s, n as u32, &written, null);
+}
+
+private fn err_int(i64 v) {
+    u8[24] buf;
+    int n = 0;
+    bool negative = v < 0;
+    u64 m = negative ? ~(v as u64) + 1 : v as u64;
+    if (m == 0) {
+        buf[0] = '0';
+        n = 1;
+    }
+    while (m > 0) {
+        buf[n] = ('0' + m % 10) as u8;
+        m /= 10;
+        n++;
+    }
+    u8[26] out;
+    int k = 0;
+    if (negative) {
+        out[0] = '-';
+        k = 1;
+    }
+    for (int i = n - 1; i >= 0; i--) {
+        out[k] = buf[i];
+        k++;
+    }
+    out[k] = 0;
+    err_write(&out[0]);
+}
+
+private fn err_hex(u64 v) {
+    u8[19] out;
+    out[0] = '0';
+    out[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        u64 d = (v >> ((15 - i) * 4) as u64) & 15;
+        out[2 + i] = (d < 10 ? '0' + d : 'a' + d - 10) as u8;
+    }
+    out[18] = 0;
+    err_write(&out[0]);
+}
+
+private fn find_function(u64 address) -> FuncEntry* {
+    DebugInfo* info = __ron_debug_info() as DebugInfo*;
+    for (i64 i = 0; i < info.func_count; i++) {
+        FuncEntry* f = &info.funcs[i];
+        if (address >= f.start && address < f.end) return f;
+    }
+    return null;
+}
+
+// Prints "name (file:line)" for a code address; returns false outside Ron code.
+private fn print_location(u64 address) -> bool {
+    FuncEntry* f = find_function(address);
+    if (f == null) return false;
+    DebugInfo* info = __ron_debug_info() as DebugInfo*;
+    LineEntry* best = null;
+    for (i64 i = 0; i < info.line_count; i++) {
+        LineEntry* l = &info.lines[i];
+        if (l.address > address) break;
+        if (l.address >= f.start) best = l;
+    }
+    err_write(f.name);
+    if (best != null) {
+        err_write(" (");
+        err_write(best.file);
+        err_write(":");
+        err_int(best.line);
+        err_write(")");
+    }
+    return true;
+}
+
+// Walks the frame-pointer chain starting at `frame`.
+private fn print_stack(u64 rip, u64 frame) {
+    err_write("stack trace:\n");
+    u64 address = rip;
+    for (int depth = 0; depth < 64; depth++) {
+        err_write("  at ");
+        if (!print_location(address)) {
+            err_write("<outside Ron code> ");
+            err_hex(address);
+            err_write("\n");
+            return;
+        }
+        err_write("\n");
+        if (frame == 0) return;
+        u64* f = frame as u64*;
+        address = f[1] - 1;   // return address, minus one to stay inside the call
+        frame = f[0];
+        if (find_function(address) == null) return;
+    }
+}
+
+private fn crash_handler(void* pointers) -> i32 {
+    // EXCEPTION_POINTERS { EXCEPTION_RECORD*, CONTEXT* }
+    u64* ptrs = pointers as u64*;
+    u8* record = ptrs[0] as u8*;
+    u8* context = ptrs[1] as u8*;
+    u32 code = *(record as u32*);
+    u64 rip = *((context + 0xF8) as u64*);
+    u64 rbp = *((context + 0xA0) as u64*);
+    // Vectored handlers see every exception, including ones that C code (drivers,
+    // the engine) handles itself: only report hardware faults inside Ron code.
+    bool fatal = code == 0xC0000005 || code == 0xC0000094 || code == 0xC00000FD || code == 0xC000001D ||
+                 code == 0xC0000096 || code == 0xC0000095;
+    if (!fatal || find_function(rip) == null) return 0;   // EXCEPTION_CONTINUE_SEARCH
+    err_write("\ncrash: ");
+    if (code == 0xC0000005) {
+        u64 target = *((record + 40) as u64*);   // ExceptionInformation[1]
+        if (target < 65536) err_write("null pointer dereference");
+        else {
+            err_write("invalid memory access at ");
+            err_hex(target);
+        }
+    } else if (code == 0xC0000094) {
+        err_write("integer division by zero");
+    } else if (code == 0xC00000FD) {
+        err_write("stack overflow");
+    } else if (code == 0xC0000095) {
+        err_write("integer overflow");
+    } else {
+        err_write("exception ");
+        err_hex(code as u64);
+    }
+    err_write(" in ");
+    print_location(rip);
+    err_write("\n");
+    print_stack(rip, rbp);
+    ExitProcess(code);
+    return 1;
+}
+
+fn __ron_runtime_init() {
+    AddVectoredExceptionHandler(1, crash_handler);
+}
+
+// Prints " at file:line", the stack of the code that called the public wrapper, and exits.
+// Must be called directly from __ron_panic / __ron_assert / __ron_bounds_fail.
+private fn fail_at(u8* file, i64 line) {
+    err_write(" at ");
+    err_write(file);
+    err_write(":");
+    err_int(line);
+    err_write("\n");
+    u64* frame = __ron_frame_pointer() as u64*;
+    u64* wrapper = frame[0] as u64*;   // skip fail_at and the wrapper
+    print_stack(wrapper[1] - 1, wrapper[0]);
+    ExitProcess(101);
+}
+
+fn __ron_panic(u8* message, u8* file, i64 line) {
+    err_write("\npanic: ");
+    err_write(message);
+    fail_at(file, line);
+}
+
+fn __ron_assert(bool condition, u8* text, u8* file, i64 line) {
+    if (condition) return;
+    err_write("\nassertion failed: ");
+    err_write(text);
+    fail_at(file, line);
+}
+
+fn __ron_bounds_fail(i64 index, i64 length, u8* file, i64 line) {
+    err_write("\nindex out of bounds: index ");
+    err_int(index);
+    err_write(", length ");
+    err_int(length);
+    fail_at(file, line);
+}

@@ -20,6 +20,7 @@ struct Diagnostic {
 struct SourceFile {
     std::string path;
     std::string text;
+    bool library = false;   // standard library: warnings are not reported
 
     std::string_view lineAt(uint32_t line) const;
 };
@@ -29,6 +30,7 @@ class SourceManager {
 public:
     uint32_t add(std::string path, std::string text);
     const SourceFile& get(uint32_t id) const { return *files_[id]; }
+    SourceFile& get(uint32_t id) { return *files_[id]; }
     size_t count() const { return files_.size(); }
 
 private:
@@ -49,6 +51,7 @@ public:
 
     bool hasErrors() const { return errorCount_ > 0; }
     size_t errorCount() const { return errorCount_; }
+    size_t warningCount() const { return warningCount_; }
     const std::vector<Diagnostic>& all() const { return diags_; }
 
     std::string format(const Diagnostic& d) const;
@@ -58,6 +61,7 @@ private:
     const SourceManager& sources_;
     std::vector<Diagnostic> diags_;
     size_t errorCount_ = 0;
+    size_t warningCount_ = 0;
 };
 
 } // namespace ron

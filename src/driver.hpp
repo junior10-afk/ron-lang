@@ -13,6 +13,8 @@ struct CompileOptions {
     std::string output;            // .exe path; empty = check only
     std::string stdRoot;           // directory that contains `std/`
     Subsystem subsystem = Subsystem::Console;
+    bool release = false;          // no bounds checks
+    bool warningsAsErrors = false;
 };
 
 struct CompileResult {

@@ -192,7 +192,7 @@ struct TernaryExpr : Expr {
     TernaryExpr() : Expr(ExprKind::Ternary) {}
 };
 
-enum class Intrinsic { None, SqrtF32, SqrtF64 };
+enum class Intrinsic { None, SqrtF32, SqrtF64, DebugInfo, FramePointer };
 
 struct CallExpr : Expr {
     Expr* callee = nullptr;
@@ -391,6 +391,8 @@ struct LocalVar {
     double useWeight = 0;           // uses weighted by loop depth (register allocation priority)
     int32_t frameOffset = 0;        // rbp-relative, set by codegen
     int8_t reg = -1;                // allocated register (GPR or XMM number), -1 = stack slot
+    int refs = 0;                   // number of uses (unused-variable warning)
+    SourceLoc loc;
 };
 
 struct Param {

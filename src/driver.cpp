@@ -58,9 +58,12 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
     std::string root = canonicalPath(options.input);
     queue.push_back({root, SourceLoc{0, 0, 0, UINT32_MAX}});
     seen.insert(root);
-    // The prelude (Any, TypeInfo) is part of every program.
-    std::string prelude = resolveImport("std/prelude.ron", fs::path(root).parent_path(), options.stdRoot);
-    if (!prelude.empty() && seen.insert(prelude).second) queue.push_back({prelude, SourceLoc{0, 0, 0, UINT32_MAX}});
+    // The prelude (Any, TypeInfo) and the runtime (crash reports, panic) are part of every program.
+    for (const char* builtin : {"std/prelude.ron", "std/runtime.ron"}) {
+        std::string p = resolveImport(builtin, fs::path(root).parent_path(), options.stdRoot);
+        if (!p.empty() && seen.insert(p).second) queue.push_back({p, SourceLoc{0, 0, 0, UINT32_MAX}});
+    }
+    std::string libraryDir = options.stdRoot.empty() ? std::string() : canonicalPath(fs::path(options.stdRoot) / "std");
 
     while (!queue.empty()) {
         auto [path, from] = queue.front();
@@ -72,6 +75,7 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
         }
         result.sourceFiles.push_back(path);
         uint32_t id = sources.add(path, std::move(text));
+        sources.get(id).library = !libraryDir.empty() && path.rfind(libraryDir, 0) == 0;
         Lexer lexer(sources.get(id), id, diags);
         Parser parser(lexer.tokenizeAll(), arena, diags);
         size_t first = program.decls.size();
@@ -100,7 +104,13 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
 
     TypeContext types;
     Sema sema(program, arena, types, diags);
+    sema.sources = &sources;
+    sema.boundsChecks = !options.release;
     if (!sema.run()) return result;
+    if (options.warningsAsErrors && diags.warningCount() > 0) {
+        diags.error(SourceLoc{0, 0, 0, UINT32_MAX}, "warnings are treated as errors (--Werror)");
+        return result;
+    }
 
     std::set<std::string> dlls;
     for (FuncDecl* f : sema.externs) dlls.insert(f->externDll);
@@ -112,6 +122,8 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
     }
 
     CodeGen codegen(sema, types);
+    codegen.sources = &sources;
+    codegen.boundsChecks = !options.release;
     Image image = codegen.generate();
     std::vector<uint8_t> exe = writePE(image, options.subsystem);
 

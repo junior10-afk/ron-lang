@@ -153,6 +153,14 @@ bool Sema::run() {
             initFunction->used = true;
             work.push_back(initFunction);
         }
+        if (auto r = funcs_.find("__ron_runtime_init"); r != funcs_.end() && !r->second.empty()) runtimeInit = r->second[0];
+        if (auto b = funcs_.find("__ron_bounds_fail"); b != funcs_.end() && !b->second.empty() && boundsChecks)
+            boundsFail = b->second[0];
+        for (FuncDecl* root : {runtimeInit, boundsFail})
+            if (root && !root->used) {
+                root->used = true;
+                work.push_back(root);
+            }
         for (FuncDecl* f : globalRefs_)
             if (!f->used) {
                 f->used = true;
@@ -962,6 +970,7 @@ LocalVar* Sema::declareLocal(const std::string& name, Type* type, SourceLoc loc,
     v->name = name;
     v->type = type;
     v->isConst = isConst;
+    v->loc = loc;
     scopes_.back()[name] = v;
     return v;
 }
@@ -982,6 +991,11 @@ void Sema::checkFunction(FuncDecl* f) {
     bool isMain = f->name == "main" && f->params.empty();
     if (f->returnType && !f->returnType->isVoid() && !isMain && !alwaysReturns(f->body))
         diags_.error(f->loc, "function '" + f->name + "' does not return a value on every path");
+    if (!f->genericOrigin) {
+        for (LocalVar* v : f->locals)
+            if (v->refs == 0 && !v->isParam && !v->name.empty() && v->name[0] != '_' && v->name[0] != '$')
+                diags_.warning(v->loc, "unused variable '" + v->name + "'");
+    }
     currentFunc_ = nullptr;
 }
 
@@ -1286,8 +1300,23 @@ void Sema::checkLoopBody(Stmt* body, const std::string& label) {
 
 void Sema::checkBlock(BlockStmt* b, bool newScope) {
     if (newScope) pushScope();
-    for (Stmt* s : b->stmts) checkStmt(s);
+    bool ended = false, warned = false;
+    for (Stmt* s : b->stmts) {
+        if (ended && !warned && !(currentFunc_ && currentFunc_->genericOrigin)) {
+            diags_.warning(s->loc, "unreachable code");
+            warned = true;
+        }
+        checkStmt(s);
+        ended |= s->kind == StmtKind::Return || s->kind == StmtKind::Break || s->kind == StmtKind::Continue;
+    }
     if (newScope) popScope();
+}
+
+std::string Sema::fileName(SourceLoc loc) const {
+    if (!sources || loc.fileId >= sources->count()) return "?";
+    const std::string& p = sources->get(loc.fileId).path;
+    size_t slash = p.find_last_of("/\\");
+    return slash == std::string::npos ? p : p.substr(slash + 1);
 }
 
 Expr* Sema::checkCondition(Expr* e) {
@@ -1954,6 +1983,7 @@ Expr* Sema::checkIdent(IdentExpr* e) {
         double weight = 1;
         for (int i = 0; i < loopDepth_ && i < 6; ++i) weight *= 8;
         v->useWeight += weight;
+        ++v->refs;
         e->local = v;
         e->type = v->type;
         e->isLvalue = true;
@@ -2377,6 +2407,10 @@ Expr* Sema::checkBinary(BinaryExpr* e) {
     }
 
     if (isCompare) {
+        if (common->isInt() && !common->isSigned && !common->enumDecl && r->kind == ExprKind::IntLit &&
+            r->as<IntLitExpr>()->value == 0 && (op == BinaryOp::Ge || op == BinaryOp::Lt))
+            diags_.warning(e->loc, std::string("comparison is always ") + (op == BinaryOp::Ge ? "true" : "false") +
+                                       " (an unsigned value is never negative)");
         e->type = types_.boolType();
         return e;
     }
@@ -2572,6 +2606,38 @@ Expr* Sema::checkCall(CallExpr* e) {
         }
     }
 
+    // assert(cond) and panic(msg) report their source location.
+    if ((name == "assert" || name == "panic") && !funcs_.count(name) && e->args.size() == 1) {
+        auto str = [&](const std::string& s) {
+            auto* lit = arena_.make<StringLitExpr>(e->loc);
+            lit->value = s;
+            return check(lit);
+        };
+        auto* line = arena_.make<IntLitExpr>(e->loc);
+        line->value = e->loc.line;
+        std::vector<Expr*> args{e->args[0]};
+        if (name == "assert") {
+            std::string text = "assert";
+            if (sources && e->loc.fileId < sources->count()) {
+                std::string_view src = sources->get(e->loc.fileId).lineAt(e->loc.line);
+                size_t a = src.find_first_not_of(" \t"), z = src.find_last_not_of(" \t;");
+                if (a != std::string_view::npos) text = std::string(src.substr(a, z - a + 1));
+            }
+            args.push_back(str(text));
+        }
+        args.push_back(str(fileName(e->loc)));
+        args.push_back(check(line));
+        e->func = resolveOverload(name == "assert" ? "__ron_assert" : "__ron_panic", args, e->loc, true);
+        if (!e->func) return errorExpr(e);
+        e->args = std::move(args);
+        e->type = e->func->returnType;
+        return e;
+    }
+    if ((name == "__ron_debug_info" || name == "__ron_frame_pointer") && e->args.empty()) {
+        e->intrinsic = name == "__ron_debug_info" ? Intrinsic::DebugInfo : Intrinsic::FramePointer;
+        e->type = types_.pointerTo(types_.voidType());
+        return e;
+    }
     // Built-in intrinsics
     if (name == "type_of" && !funcs_.count("type_of") && e->args.size() == 1) {
         auto info = structs_.find("TypeInfo");

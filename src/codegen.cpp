@@ -119,9 +119,11 @@ void CodeGen::layoutGlobals() {
 Image CodeGen::generate() {
     for (FuncDecl* f : sema_.functions) funcLabels_[f] = as_.newLabel();
     layoutGlobals();
+    debugInfoOffset_ = rdataAlloc(32, 8);   // filled by emitDebugInfo()
     genEntryStub();
     for (FuncDecl* f : sema_.functions) genFunction(f);
     for (auto& [index, f] : funcRefs_) as_.fixups[index].target = as_.labelPos(funcLabels_[f]);
+    emitDebugInfo();
     image_.text = std::move(as_.code);
     image_.fixups = std::move(as_.fixups);
     return std::move(image_);
@@ -130,6 +132,7 @@ Image CodeGen::generate() {
 void CodeGen::genEntryStub() {
     image_.entryOffset = static_cast<uint32_t>(as_.pos());
     as_.subImm(RSP, 40);   // shadow space + realign (entry rsp is 8 mod 16)
+    if (sema_.runtimeInit) as_.call(funcLabels_[sema_.runtimeInit]);     // crash handler
     if (sema_.initFunction) as_.call(funcLabels_[sema_.initFunction]);   // globals with computed values
     as_.call(funcLabels_[sema_.mainFunc]);
     if (sema_.mainFunc->returnType->isVoid()) as_.movRI(RCX, 0);
@@ -217,6 +220,7 @@ void CodeGen::genFunction(FuncDecl* f) {
     allocateRegisters(f);
 
     as_.bind(funcLabels_[f]);
+    uint32_t funcStart = static_cast<uint32_t>(as_.pos());
     as_.push(RBP);
     as_.movRR(RBP, RSP);
     uint32_t subAt = static_cast<uint32_t>(as_.pos());
@@ -272,6 +276,7 @@ void CodeGen::genFunction(FuncDecl* f) {
     int32_t frame = alignUp(maxFrame_, 16) + alignUp(maxOutgoing_, 16);
     if (frame <= 4096) {
         as_.patch32(frameImm, static_cast<uint32_t>(frame));
+        funcRanges_.push_back({funcStart, static_cast<uint32_t>(as_.pos()), f->name, f->loc.fileId});
         return;
     }
     // Large frame: touch each stack page in order so the guard page grows the stack.
@@ -285,11 +290,18 @@ void CodeGen::genFunction(FuncDecl* f) {
     as_.patch32(subAt + 1, probe - (subAt + 5));
     as_.code[subAt + 5] = 0x90;
     as_.code[subAt + 6] = 0x90;
+    funcRanges_.push_back({funcStart, static_cast<uint32_t>(as_.pos()), f->name, f->loc.fileId});
 }
 
 // ───────────────────────────── Statements ─────────────────────────────
 
 void CodeGen::genStmt(Stmt* s) {
+    if (s->loc.fileId != UINT32_MAX && s->loc.line > 0 &&
+        (lineMarks_.empty() || lineMarks_.back().line != s->loc.line || lineMarks_.back().fileId != s->loc.fileId)) {
+        auto pos = static_cast<uint32_t>(as_.pos());
+        if (!lineMarks_.empty() && lineMarks_.back().pos == pos) lineMarks_.back() = {pos, s->loc.fileId, s->loc.line};
+        else lineMarks_.push_back({pos, s->loc.fileId, s->loc.line});
+    }
     switch (s->kind) {
     case StmtKind::Block:
         genScope(s->as<BlockStmt>()->stmts);
@@ -411,6 +423,7 @@ void CodeGen::genStmt(Stmt* s) {
         Label cond = as_.newLabel();
         Label end = as_.newLabel();
         as_.jmp(cond);
+        as_.align(16);   // hot loop entry
         as_.bind(body);
         loops_.push_back({end, cond, w->label, deferFrames_.size(), false});
         genStmt(w->body);
@@ -430,6 +443,7 @@ void CodeGen::genStmt(Stmt* s) {
         Label cond = as_.newLabel();
         Label end = as_.newLabel();
         as_.jmp(cond);
+        as_.align(16);   // hot loop entry
         as_.bind(body);
         loops_.push_back({end, cont, f->label, deferFrames_.size(), false});
         genStmt(f->body);
@@ -1019,6 +1033,8 @@ bool CodeGen::stableMem(Expr* e, Mem& out) {
         auto* ix = e->as<IndexExpr>();
         Type* bt = ix->base->type;
         uint32_t s = bt->elem->size;
+        // Checked indexes go through genIndexMem, which emits the bounds check.
+        if (boundsChecks && (bt->isArray() || bt->isSlice()) && ix->index->kind != ExprKind::IntLit) return false;
         Mem base;
         if (bt->isArray()) {
             if (!stableMem(ix->base, base) || base.hasIndex()) return false;
@@ -1061,8 +1077,17 @@ Mem CodeGen::genIndexMem(IndexExpr* e) {
     uint32_t s = bt->elem->size;
     Mem base;
     bool baseInRax = false;
+    bool check = boundsChecks && (bt->isArray() || bt->isSlice());
+    int32_t lenSlot = 0;
     if (bt->isSlice()) {
         Mem sm = genMem(e->base);
+        if (check) {
+            Mem lm = sm;
+            addDisp(lm, 8);
+            as_.load(R11, lm, 8, false);   // slice.len, kept for the bounds check
+            lenSlot = allocTemp8();
+            as_.store(Mem::at(RBP, lenSlot), R11, 8);
+        }
         as_.load(RAX, sm, 8, false);   // slice.ptr
         base = Mem::at(RAX, 0);
         baseInRax = true;
@@ -1088,15 +1113,27 @@ Mem CodeGen::genIndexMem(IndexExpr* e) {
         }
     }
 
+    auto checkIndex = [&](Reg idx) {
+        if (!check) return;
+        if (bt->isArray()) boundsCheck(idx, true, bt->count, 0, false, e->loc);
+        else boundsCheck(idx, false, 0, lenSlot, false, e->loc);
+    };
     if (e->index->kind == ExprKind::IntLit) {
         int64_t off = static_cast<int64_t>(e->index->as<IntLitExpr>()->value) * s;
         if (off >= INT32_MIN && off <= INT32_MAX) {
+            if (check && bt->isSlice()) {   // arrays are checked at compile time
+                as_.movRI(RCX, e->index->as<IntLitExpr>()->value);
+                checkIndex(RCX);
+            }
             base.disp += static_cast<int32_t>(off);
             return base;
         }
     }
     int ir = regOf(e->index);
-    if (ir >= 0 && scaleFor(s)) return Mem::indexed(base.base, static_cast<Reg>(ir), static_cast<uint8_t>(s), base.disp);
+    if (ir >= 0 && scaleFor(s)) {
+        checkIndex(static_cast<Reg>(ir));
+        return Mem::indexed(base.base, static_cast<Reg>(ir), static_cast<uint8_t>(s), base.disp);
+    }
 
     // Compute the index into RCX (keeping the base alive).
     if (ir >= 0) {
@@ -1113,6 +1150,7 @@ Mem CodeGen::genIndexMem(IndexExpr* e) {
         genExpr(e->index);
         as_.movRR(RCX, RAX);
     }
+    checkIndex(RCX);
     if (scaleFor(s)) return Mem::indexed(base.base, RCX, static_cast<uint8_t>(s), base.disp);
     as_.imulImm(RCX, RCX, static_cast<int32_t>(s));
     return Mem::indexed(base.base, RCX, 1, base.disp);
@@ -1218,7 +1256,11 @@ void CodeGen::genExpr(Expr* e) {
     }
     case ExprKind::Call: {
         auto* c = e->as<CallExpr>();
-        if (c->intrinsic == Intrinsic::SqrtF32 || c->intrinsic == Intrinsic::SqrtF64) {
+        if (c->intrinsic == Intrinsic::DebugInfo) {
+            as_.lea(RAX, Mem::ripRel(Section::Rdata, debugInfoOffset_));
+        } else if (c->intrinsic == Intrinsic::FramePointer) {
+            as_.movRR(RAX, RBP);
+        } else if (c->intrinsic == Intrinsic::SqrtF32 || c->intrinsic == Intrinsic::SqrtF64) {
             bool f32 = c->intrinsic == Intrinsic::SqrtF32;
             int x = xmmOf(c->args[0]);
             if (x >= 0) {
@@ -1779,12 +1821,15 @@ void CodeGen::genSlice(SliceExpr* e) {
         }
     }
     as_.store(ptrField, RAX, 8);
+    bool check = boundsChecks && !bt->isPointer();
     if (e->hi) {
         genExpr(e->hi);
+        if (check) boundsCheck(RAX, false, 0, slot + 8, true, e->loc);   // hi <= len
         as_.store(lenField, RAX, 8);
     }
     if (e->lo) {
         genExpr(e->lo);
+        if (boundsChecks) boundsCheck(RAX, false, 0, slot + 8, true, e->loc);   // lo <= hi
         as_.load(R10, ptrField, 8, false);
         as_.imulImm(RCX, RAX, static_cast<int32_t>(elemSize));
         as_.add(R10, RCX);
@@ -1796,7 +1841,7 @@ void CodeGen::genSlice(SliceExpr* e) {
     as_.lea(RAX, ptrField);
 }
 
-// ───────────── Runtime type information ─────────────
+// ───────────── Runtime error reporting ─────────────
 
 namespace {
 void put32At(std::vector<uint8_t>& b, size_t at, uint32_t v) {
@@ -1806,6 +1851,63 @@ void put64At(std::vector<uint8_t>& b, size_t at, uint64_t v) {
     for (int i = 0; i < 8; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i));
 }
 } // namespace
+
+std::string CodeGen::shortFileName(uint32_t fileId) const {
+    if (!sources || fileId >= sources->count()) return "?";
+    const std::string& p = sources->get(fileId).path;
+    size_t slash = p.find_last_of("/\\");
+    return slash == std::string::npos ? p : p.substr(slash + 1);
+}
+
+// if (value < limit) (or <= with allowEqual), unsigned: continue; else __ron_bounds_fail(value, limit, file, line)
+void CodeGen::boundsCheck(Reg value, bool constLimit, uint64_t limit, int32_t limitSlot, bool allowEqual, SourceLoc loc) {
+    if (!sema_.boundsFail) return;
+    Label ok = as_.newLabel();
+    if (constLimit && fitsInt32(limit)) {
+        as_.cmpImm(value, static_cast<int32_t>(limit));
+    } else {
+        if (constLimit) as_.movRI(R11, limit);
+        else as_.load(R11, Mem::at(RBP, limitSlot), 8, false);
+        as_.cmp(value, R11);
+    }
+    as_.jcc(allowEqual ? CC_BE : CC_B, ok);
+    // Failure path (never returns)
+    as_.movRR(RCX, value);
+    if (constLimit) as_.movRI(RDX, limit);
+    else as_.load(RDX, Mem::at(RBP, limitSlot), 8, false);
+    as_.lea(R8, Mem::ripRel(Section::Rdata, addString(shortFileName(loc.fileId))));
+    as_.movRI(R9, loc.line);
+    as_.call(funcLabels_[sema_.boundsFail]);
+    as_.bind(ok);
+}
+
+// Function and line tables read by std/runtime.ron (layout must match it):
+//   DebugInfo { i64 func_count; FuncEntry* funcs; i64 line_count; LineEntry* lines; }
+//   FuncEntry { u64 start; u64 end; u8* name; u8* file; }   LineEntry { u64 address; u8* file; i64 line; }
+void CodeGen::emitDebugInfo() {
+    uint32_t lines = rdataAlloc(static_cast<uint32_t>(std::max<size_t>(1, lineMarks_.size()) * 24), 8);
+    for (size_t i = 0; i < lineMarks_.size(); ++i) {
+        uint32_t at = lines + static_cast<uint32_t>(i * 24);
+        image_.absFixups.push_back({Section::Rdata, at, Section::Text, lineMarks_[i].pos});
+        rdataPointer(at + 8, addString(shortFileName(lineMarks_[i].fileId)));
+        put64At(image_.rdata, at + 16, lineMarks_[i].line);
+    }
+    uint32_t funcs = rdataAlloc(static_cast<uint32_t>(std::max<size_t>(1, funcRanges_.size()) * 32), 8);
+    for (size_t i = 0; i < funcRanges_.size(); ++i) {
+        uint32_t at = funcs + static_cast<uint32_t>(i * 32);
+        image_.absFixups.push_back({Section::Rdata, at, Section::Text, funcRanges_[i].start});
+        image_.absFixups.push_back({Section::Rdata, at + 8, Section::Text, funcRanges_[i].end});
+        rdataPointer(at + 16, addString(funcRanges_[i].name));
+        rdataPointer(at + 24, addString(shortFileName(funcRanges_[i].fileId)));
+    }
+    put64At(image_.rdata, debugInfoOffset_, funcRanges_.size());
+    rdataPointer(debugInfoOffset_ + 8, funcs);
+    put64At(image_.rdata, debugInfoOffset_ + 16, lineMarks_.size());
+    rdataPointer(debugInfoOffset_ + 24, lines);
+}
+
+// ───────────── Runtime type information ─────────────
+
 
 uint32_t CodeGen::rdataAlloc(uint32_t size, uint32_t align) {
     while (image_.rdata.size() % align) image_.rdata.push_back(0);

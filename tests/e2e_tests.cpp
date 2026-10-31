@@ -58,7 +58,7 @@ std::string runCapture(const std::string& exe, int& exitCode) {
     return out;
 }
 
-RunResult runProgram(const std::string& name, const std::string& source) {
+RunResult runProgram(const std::string& name, const std::string& source, bool release = false) {
     fs::path dir = fs::temp_directory_path() / "ron_e2e";
     fs::create_directories(dir);
     fs::path src = dir / (name + ".ron");
@@ -72,6 +72,7 @@ RunResult runProgram(const std::string& name, const std::string& source) {
     opts.input = src.string();
     opts.output = exe.string();
     opts.stdRoot = RON_SOURCE_DIR;
+    opts.release = release;
     r.compiled = compile(opts, sources, diags).ok;
     for (const auto& d : diags.all()) r.errors += diags.format(d);
     if (!r.compiled) {
@@ -653,6 +654,63 @@ TEST(e2e_modules_and_global_init) {
     )");
     CHECK(!amb.compiled);
     CHECK(amb.errors.find("ambiguous") != std::string::npos);
+}
+
+TEST(e2e_runtime_errors) {
+    const char* program = R"(
+        struct Enemy { int hp; }
+        fn hit(Enemy* e) -> int { return e.hp - 1; }
+        fn update(int mode) -> int {
+            int[3] arr = [1, 2, 3];
+            int[] view = arr[..];
+            var i = mode + 2;
+            if (mode == 1) return arr[i];
+            if (mode == 2) panic("boom");
+            if (mode == 3) assert(mode == 4);
+            if (mode == 4) return view[i + 5];
+            Enemy* nothing = null;
+            return hit(nothing);
+        }
+        fn main() -> int { return update(MODE); }
+    )";
+    auto run = [&](int mode, bool release = false) {
+        std::string src = program;
+        src.replace(src.find("MODE"), 4, std::to_string(mode));
+        return runProgram("rt" + std::to_string(mode) + (release ? "r" : ""), src, release);
+    };
+    RunResult a = run(1);
+    CHECK(a.output.find("index out of bounds: index 3, length 3 at rt1.ron:8") != std::string::npos);
+    CHECK(a.output.find("at main (rt1.ron:15)") != std::string::npos);
+    CHECK_EQ(a.exitCode, 101);
+    RunResult b = run(2);
+    CHECK(b.output.find("panic: boom at rt2.ron:9") != std::string::npos);
+    RunResult c = run(3);
+    CHECK(c.output.find("assertion failed: if (mode == 3) assert(mode == 4) at rt3.ron:10") != std::string::npos);
+    RunResult d = run(4);
+    CHECK(d.output.find("index 11, length 3") != std::string::npos);
+    RunResult e = run(5);
+    CHECK(e.output.find("crash: null pointer dereference in hit (rt5.ron:3)") != std::string::npos);
+    CHECK(e.output.find("at update (rt5.ron:13)") != std::string::npos);
+    RunResult rel = run(1, true);   // --release: no bounds checks
+    CHECK(rel.compiled && rel.output.find("out of bounds") == std::string::npos);
+}
+
+TEST(e2e_warnings) {
+    RunResult r = runProgram("warn", R"(
+        fn f(u32 u) -> int {
+            int unused = 3;
+            if (u >= 0) return 1;
+            return 0;
+            int never = 2;
+        }
+        fn main() -> int { int _ok = 1; return f(1); }
+    )");
+    CHECK(r.compiled);
+    CHECK_EQ(r.exitCode, 1);
+    CHECK(r.errors.find("warning: unused variable 'unused'") != std::string::npos);
+    CHECK(r.errors.find("warning: unreachable code") != std::string::npos);
+    CHECK(r.errors.find("comparison is always true") != std::string::npos);
+    CHECK(r.errors.find("'_ok'") == std::string::npos);
 }
 
 TEST(e2e_std_math) {
