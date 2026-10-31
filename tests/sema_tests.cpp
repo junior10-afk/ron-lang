@@ -118,6 +118,18 @@ TEST(sema_constness_and_lvalues) {
     CHECK(fails("fn main() -> int { int* p = &5; return 0; }", "address of a temporary"));
 }
 
+TEST(sema_generics) {
+    CHECK(valid(R"(
+        struct Box<T> { T value; }
+        fn get<T>(Box<T>* b) -> T { return b.value; }
+        fn main() -> int { Box<int> b; b.value = 3; Box<Box<int>> nested; return b.get() + nested.value.value; }
+    )"));
+    CHECK(fails("struct L<T> { T v; } fn main() -> int { L x; return 0; }", "needs 1 type argument"));
+    CHECK(fails("struct P { int x; } fn main() -> int { P<int> p; return 0; }", "is not generic"));
+    CHECK(fails("fn id<T>(T v) -> T { return v.missing; } fn main() -> int { return id(1); }", "has no field"));
+    CHECK(fails("fn make<T>() -> T { T v; return v; } fn main() -> int { return make(); }", "no matching function"));
+}
+
 TEST(sema_requires_main) {
     CHECK(fails("fn notmain() {}", "no 'main' function"));
 }

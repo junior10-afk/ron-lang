@@ -48,6 +48,7 @@ struct TypeExpr : AstNode {
     TypeExpr* inner = nullptr;   // Pointer, Array
     uint64_t arraySize = 0;      // Array: literal size...
     std::string sizeConst;       // ...or the name of an integer const: float[MAX] a;
+    std::vector<TypeExpr*> typeArgs;   // Named generic instance: List<int>
 };
 
 // ───────────────────────────── Expressions ─────────────────────────────
@@ -109,6 +110,7 @@ struct NullLitExpr : Expr {
 
 struct IdentExpr : Expr {
     std::string name;
+    std::vector<TypeExpr*> typeArgs;   // explicit generic arguments: make::<int>()
     LocalVar* local = nullptr;   // resolved by sema (one of these)
     GlobalVar* global = nullptr;
     IdentExpr() : Expr(ExprKind::Ident) {}
@@ -191,6 +193,7 @@ struct SizeofExpr : Expr {
 // `Vec3{1.0, 2.0, 3.0}` or `Vec3{}` (zero-initialized)
 struct StructLitExpr : Expr {
     std::string typeName;
+    std::vector<TypeExpr*> typeArgs;   // Pair::<int, float>{1, 2.0}
     std::vector<Expr*> fields;
     StructLitExpr() : Expr(ExprKind::StructLit) {}
 };
@@ -286,6 +289,9 @@ struct Decl : AstNode {
 
 struct FuncDecl : Decl {
     std::string name;               // operator overloads use "op+", "op-", ...
+    std::vector<std::string> typeParams;  // generic template: fn push<T>(...)
+    FuncDecl* genericOrigin = nullptr;    // set on instances
+    std::vector<Type*> typeArgs;          // instance arguments
     std::vector<Param> params;
     TypeExpr* returnTypeExpr = nullptr;   // null = void
     BlockStmt* body = nullptr;            // null for extern functions
@@ -314,6 +320,9 @@ struct StructDecl : Decl {
     std::string name;
     std::vector<FieldDecl> fields;
     Type* type = nullptr;
+    std::vector<std::string> typeParams;  // generic template: struct List<T>
+    StructDecl* genericOrigin = nullptr;  // set on instances
+    std::vector<Type*> typeArgs;          // instance arguments
     StructDecl() : Decl(Kind::Struct) {}
 };
 
@@ -355,5 +364,9 @@ struct ImportDecl : Decl {
 struct Program {
     std::vector<Decl*> decls;
 };
+
+// Deep copies of unchecked AST (used to instantiate generic functions).
+Expr* cloneExpr(AstArena& arena, Expr* e);
+Stmt* cloneStmt(AstArena& arena, Stmt* s);
 
 } // namespace ron

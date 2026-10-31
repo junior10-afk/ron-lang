@@ -61,6 +61,9 @@ fn print(f64 v) {
     write_bytes(&digits[0], len as u64);
 }
 
+fn print(String s) { write_bytes(s.c_str(), s.len as u64); }
+fn println(String s) { print(s); print("\n"); }
+
 fn println() { print("\n"); }
 fn println(u8* s) { print(s); print("\n"); }
 fn println(i64 v) { print(v); print("\n"); }

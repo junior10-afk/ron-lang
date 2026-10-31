@@ -67,7 +67,18 @@ private:
 
     // Overloads
     FuncDecl* resolveOverload(const std::string& name, std::vector<Expr*>& args, SourceLoc loc,
-                              bool reportErrors, Expr* ufcsBase = nullptr);
+                              bool reportErrors, Expr* ufcsBase = nullptr,
+                              const std::vector<Type*>* explicitTypeArgs = nullptr);
+
+    // Generics (monomorphization)
+    Type* instantiateStruct(StructDecl* g, const std::vector<Type*>& args);
+    FuncDecl* instantiateFunction(FuncDecl* g, const std::vector<Type*>& args, SourceLoc at);
+    bool deduceTypeArgs(FuncDecl* f, const std::vector<Expr*>& args, const std::vector<Type*>* explicitArgs,
+                        std::vector<Type*>& out);
+    bool unify(TypeExpr* p, Type* a, const std::vector<std::string>& params, std::map<std::string, Type*>& env);
+    void pushTypeEnv(const std::vector<std::string>& params, const std::vector<Type*>& args);
+    void popTypeEnv() { typeEnv_.pop_back(); }
+    std::string instanceName(const std::string& base, const std::vector<Type*>& args);
 
     // Scopes
     void pushScope() { scopes_.emplace_back(); }
@@ -89,6 +100,12 @@ private:
     std::map<GlobalVar*, int> globalState_;   // 0 = pending, 1 = resolving, 2 = done
     std::map<StructDecl*, int> structState_;
     std::vector<std::unique_ptr<LocalVar>> localStorage_;
+
+    std::vector<std::map<std::string, Type*>> typeEnv_;   // innermost frame: active type parameters
+    std::map<std::pair<StructDecl*, std::vector<Type*>>, StructDecl*> structInstances_;
+    std::map<std::pair<FuncDecl*, std::vector<Type*>>, FuncDecl*> funcInstances_;
+    std::vector<FuncDecl*> pendingInstances_;   // instantiated, body not yet checked
+    std::map<FuncDecl*, SourceLoc> instantiatedAt_;
 
     std::vector<std::map<std::string, LocalVar*>> scopes_;
     FuncDecl* currentFunc_ = nullptr;

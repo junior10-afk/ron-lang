@@ -275,6 +275,100 @@ TEST(e2e_register_pressure) {
     )", 181));
 }
 
+TEST(e2e_generics) {
+    CHECK(prints("generics", R"(
+        import "std/io.ron";
+        struct Pair<A, B> { A first; B second; }
+        struct Node<T> { T value; Node<T>* next; }       // self-reference through a pointer
+        fn make_pair<A, B>(A a, B b) -> Pair<A, B> { return Pair::<A, B>{a, b}; }
+        fn swap<T>(T* a, T* b) { T t = *a; *a = *b; *b = t; }
+        fn max_of<T>(T a, T b) -> T { return a > b ? a : b; }
+        fn zero<T>() -> T { T z; return z; }
+        fn sum<T>(Node<T>* n) -> T {
+            T total = zero::<T>();
+            while (n != null) { total += n.value; n = n.next; }
+            return total;
+        }
+        fn main() -> int {
+            Pair<int, float> p = make_pair(3, 2.5f);
+            println(p.first);
+            println(p.second);
+            int a = 1;
+            int b = 2;
+            swap(&a, &b);
+            println(a * 10 + b);
+            println(max_of(4, 9));
+            println(max_of(1.5, -2.0));
+            Node<i64> n3 = Node::<i64>{30, null};
+            Node<i64> n2 = Node::<i64>{20, &n3};
+            Node<i64> n1 = Node::<i64>{10, &n2};
+            println(sum(&n1));
+            Node<float> f2 = Node::<float>{0.25, null};
+            Node<float> f1 = Node::<float>{0.5, &f2};
+            println(sum(&f1));
+            println(sizeof(Pair<u8, i64>) as i64);
+            return 0;
+        }
+    )", "3\n2.5\n21\n9\n1.5\n60\n0.75\n16\n"));
+}
+
+TEST(e2e_list_map_string) {
+    CHECK(prints("containers", R"(
+        import "std/io.ron";
+        import "std/list.ron";
+        import "std/map.ron";
+        import "std/string.ron";
+        struct Enemy { int hp; float x; }
+        fn <(Enemy a, Enemy b) -> bool { return a.hp < b.hp; }
+        fn main() -> int {
+            List<int> nums;
+            for (int i = 0; i < 100; i++) nums.push(i * i);
+            println(nums.len);
+            println(nums.get(99));
+            nums.remove_swap(0);
+            println(nums.get(0));
+            println(nums.contains(81));
+
+            List<Enemy> enemies;
+            enemies.push(Enemy{30, 1.0});
+            enemies.push(Enemy{10, 2.0});
+            enemies.push(Enemy{20, 3.0});
+            enemies.sort();
+            enemies.at(0).hp += 5;
+            println(enemies.get(0).hp * 100 + enemies.get(1).hp + enemies.get(2).hp);
+
+            Map<int, float> scores;
+            for (int i = 0; i < 1000; i++) scores.put(i, (i as float) * 0.5);
+            println(scores.count);
+            println(*scores.get(500));
+            println(scores.has(1000));
+            scores.remove(500);
+            println(scores.has(500) || scores.get(501) == null);
+
+            Map<String, int> ids;
+            ids.put(string("player"), 1);
+            ids.put(string("enemy"), 2);
+            println(*ids.get(string("enemy")));
+
+            String s = string("Score: ");
+            s.append(42);
+            s.append(" / ");
+            s.append(3.25);
+            println(s);
+            String t = s + "!";
+            println(t.len);
+            println(t.find("42"));
+            println(t.substring(0, 5).to_upper());
+            println(parse_int(string("-1234")) + 1);
+            println(t == s);
+            s.free_string();
+            t.free_string();
+            nums.free_list();
+            return 0;
+        }
+    )", "100\n9801\n9801\ntrue\n1550\n1000\n250.0\nfalse\nfalse\n2\nScore: 42 / 3.25\n17\n7\nSCORE\n-1233\nfalse\n"));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

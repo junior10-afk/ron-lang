@@ -1,4 +1,7 @@
-// Null-terminated byte strings (u8*).
+// Strings: null-terminated byte strings (u8*), a fixed-size builder (StrBuf)
+// and the growable heap-allocated String.
+
+import "std/mem.ron";
 
 fn strlen(u8* s) -> u64 {
     u64 n = 0;
@@ -64,4 +67,207 @@ fn i64_to_str(i64 v, u8* buf) -> u64 {
     buf[0] = '-';
     u64 magnitude = ~(v as u64) + 1;   // works for i64 min too
     return 1 + u64_to_str(magnitude, buf + 1);
+}
+
+// Writes `v` with up to `decimals` digits after the point (trailing zeros
+// removed) into `buf` (at least 48 bytes); returns the length.
+fn f64_to_str(f64 v, int decimals, u8* buf) -> u64 {
+    u64 n = 0;
+    if (v != v) {
+        buf[0] = 'n'; buf[1] = 'a'; buf[2] = 'n'; buf[3] = 0;
+        return 3;
+    }
+    if (v < 0.0) {
+        buf[n] = '-';
+        n++;
+        v = -v;
+    }
+    if (v > 1.0e18) {
+        buf[n] = 'i'; buf[n + 1] = 'n'; buf[n + 2] = 'f'; buf[n + 3] = 0;
+        return n + 3;
+    }
+    f64 scale = 1.0;
+    for (int i = 0; i < decimals; i++) scale *= 10.0;
+    u64 whole = v as u64;
+    u64 frac = ((v - (whole as f64)) * scale + 0.5) as u64;
+    if ((frac as f64) >= scale) {
+        whole++;
+        frac -= scale as u64;
+    }
+    n += u64_to_str(whole, buf + n);
+    u8[24] digits;
+    for (int i = decimals - 1; i >= 0; i--) {
+        digits[i] = ('0' + frac % 10) as u8;
+        frac /= 10;
+    }
+    int len = decimals;
+    while (len > 1 && digits[len - 1] == '0') len--;
+    if (decimals > 0) {
+        buf[n] = '.';
+        n++;
+        for (int i = 0; i < len; i++) {
+            buf[n] = digits[i];
+            n++;
+        }
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// ───────────── String: growable, heap-allocated ─────────────
+//
+//   String s = string("Score: ");
+//   s.append(score);
+//   s.append(" pts");
+//   println(s);              // print/println accept String
+//   String t = s + "!";      // `+` makes a new String
+//   s.free_string();
+
+struct String {
+    u8* data;     // always null-terminated when non-null
+    int len;
+    int cap;
+}
+
+fn __str_reserve(String* s, int capacity) {
+    if (capacity + 1 <= s.cap) return;
+    int c = s.cap == 0 ? 16 : s.cap;
+    while (c < capacity + 1) c *= 2;
+    s.data = realloc(s.data, c as u64);
+    s.cap = c;
+}
+
+fn string(u8* text) -> String {
+    String s;
+    s.append(text);
+    return s;
+}
+
+fn string_with_capacity(int capacity) -> String {
+    String s;
+    __str_reserve(&s, capacity);
+    s.data[0] = 0;
+    return s;
+}
+
+fn c_str(String s) -> u8* { return s.data == null ? "" : s.data; }
+
+fn append_bytes(String* s, u8* bytes, int count) {
+    __str_reserve(s, s.len + count);
+    for (int i = 0; i < count; i++) s.data[s.len + i] = bytes[i];
+    s.len += count;
+    s.data[s.len] = 0;
+}
+
+fn append(String* s, u8* text) { s.append_bytes(text, strlen(text) as int); }
+fn append(String* s, String other) { s.append_bytes(other.c_str(), other.len); }
+fn append(String* s, i64 v) {
+    u8[24] tmp;
+    u64 n = i64_to_str(v, &tmp[0]);
+    s.append_bytes(&tmp[0], n as int);
+}
+fn append(String* s, f64 v) {
+    u8[48] tmp;
+    u64 n = f64_to_str(v, 3, &tmp[0]);
+    s.append_bytes(&tmp[0], n as int);
+}
+fn append(String* s, bool b) { s.append(b ? "true" : "false"); }
+fn append_char(String* s, u8 c) { s.append_bytes(&c, 1); }
+
+fn copy(String s) -> String {
+    String r;
+    r.append_bytes(s.c_str(), s.len);
+    return r;
+}
+
+fn +(String a, String b) -> String {
+    String r = string_with_capacity(a.len + b.len);
+    r.append(a);
+    r.append(b);
+    return r;
+}
+
+fn +(String a, u8* b) -> String {
+    String r = copy(a);
+    r.append(b);
+    return r;
+}
+
+fn ==(String a, String b) -> bool {
+    if (a.len != b.len) return false;
+    for (int i = 0; i < a.len; i++)
+        if (a.data[i] != b.data[i]) return false;
+    return true;
+}
+
+fn ==(String a, u8* b) -> bool { return streq(a.c_str(), b); }
+fn !=(String a, String b) -> bool { return !(a == b); }
+
+fn char_at(String s, int i) -> u8 { return s.data[i]; }
+
+fn substring(String s, int start, int count) -> String {
+    String r;
+    if (start < 0) start = 0;
+    if (start > s.len) start = s.len;
+    if (count > s.len - start) count = s.len - start;
+    if (count > 0) r.append_bytes(s.data + start, count);
+    return r;
+}
+
+// Index of the first occurrence of `needle`, or -1.
+fn find(String s, u8* needle) -> int {
+    int n = strlen(needle) as int;
+    for (int i = 0; i + n <= s.len; i++) {
+        bool match = true;
+        for (int j = 0; j < n && match; j++)
+            if (s.data[i + j] != needle[j]) match = false;
+        if (match) return i;
+    }
+    return -1;
+}
+
+fn starts_with(String s, u8* prefix) -> bool {
+    int n = strlen(prefix) as int;
+    if (n > s.len) return false;
+    for (int i = 0; i < n; i++)
+        if (s.data[i] != prefix[i]) return false;
+    return true;
+}
+
+fn to_upper(String s) -> String {
+    String r = copy(s);
+    for (int i = 0; i < r.len; i++)
+        if (r.data[i] >= 'a' && r.data[i] <= 'z') r.data[i] = r.data[i] - 32;
+    return r;
+}
+
+fn parse_int(String s) -> i64 {
+    i64 v = 0;
+    int i = 0;
+    bool neg = s.len > 0 && s.data[0] == '-';
+    if (neg) i = 1;
+    for (; i < s.len && s.data[i] >= '0' && s.data[i] <= '9'; i++) v = v * 10 + (s.data[i] - '0') as i64;
+    return neg ? -v : v;
+}
+
+fn clear(String* s) {
+    s.len = 0;
+    if (s.data != null) s.data[0] = 0;
+}
+
+fn free_string(String* s) {
+    free(s.data);
+    s.data = null;
+    s.len = 0;
+    s.cap = 0;
+}
+
+// FNV-1a hash, so String can be a Map key.
+fn hash(String s) -> u64 {
+    u64 h = 0xCBF29CE484222325;
+    for (int i = 0; i < s.len; i++) {
+        h ^= s.data[i] as u64;
+        h *= 0x100000001B3;
+    }
+    return h;
 }

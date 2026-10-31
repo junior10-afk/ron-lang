@@ -1,0 +1,99 @@
+// Map<K, V>: a hash map with open addressing and linear probing.
+// Keys can be any integer type, a pointer, or a String (see hash() overloads).
+//
+//   Map<u64, Entity> by_id;          // zero-initialized = empty
+//   by_id.put(42, e);
+//   Entity* found = by_id.get(42);   // null if missing
+
+import "std/mem.ron";
+
+struct Map<K, V> {
+    K* keys;
+    V* values;
+    u8* used;       // 1 = occupied
+    int cap;        // always a power of two (or 0)
+    int count;
+}
+
+// splitmix64 finalizer: spreads nearby integers over the whole table
+fn hash(u64 x) -> u64 {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EB;
+    x ^= x >> 31;
+    return x;
+}
+fn hash(i64 x) -> u64 { return hash(x as u64); }
+fn hash(void* p) -> u64 { return hash(p as u64); }
+
+fn __map_slot<K, V>(Map<K, V>* m, K key) -> int {
+    u64 mask = (m.cap - 1) as u64;
+    u64 i = hash(key) & mask;
+    while (m.used[i] != 0 && !(m.keys[i] == key)) i = (i + 1) & mask;
+    return i as int;
+}
+
+fn __map_grow<K, V>(Map<K, V>* m) {
+    Map<K, V> old = *m;
+    m.cap = old.cap == 0 ? 16 : old.cap * 2;
+    m.count = 0;
+    m.keys = alloc((m.cap as u64) * sizeof(K));
+    m.values = alloc((m.cap as u64) * sizeof(V));
+    m.used = alloc(m.cap as u64);
+    for (int i = 0; i < old.cap; i++)
+        if (old.used[i] != 0) m.put(old.keys[i], old.values[i]);
+    free(old.keys);
+    free(old.values);
+    free(old.used);
+}
+
+fn put<K, V>(Map<K, V>* m, K key, V value) {
+    if ((m.count + 1) * 4 > m.cap * 3) __map_grow(m);   // keep load factor under 75%
+    int i = __map_slot(m, key);
+    if (m.used[i] == 0) {
+        m.used[i] = 1;
+        m.keys[i] = key;
+        m.count++;
+    }
+    m.values[i] = value;
+}
+
+fn get<K, V>(Map<K, V>* m, K key) -> V* {
+    if (m.cap == 0) return null;
+    int i = __map_slot(m, key);
+    return m.used[i] != 0 ? &m.values[i] : null;
+}
+
+fn has<K, V>(Map<K, V>* m, K key) -> bool { return m.get(key) != null; }
+
+fn remove<K, V>(Map<K, V>* m, K key) -> bool {
+    if (m.cap == 0) return false;
+    int i = __map_slot(m, key);
+    if (m.used[i] == 0) return false;
+    m.used[i] = 0;
+    m.count--;
+    // Re-insert the rest of the probe chain so lookups stay correct.
+    int mask = m.cap - 1;
+    int j = (i + 1) & mask;
+    while (m.used[j] != 0) {
+        K k = m.keys[j];
+        V v = m.values[j];
+        m.used[j] = 0;
+        m.count--;
+        m.put(k, v);
+        j = (j + 1) & mask;
+    }
+    return true;
+}
+
+fn free_map<K, V>(Map<K, V>* m) {
+    free(m.keys);
+    free(m.values);
+    free(m.used);
+    m.keys = null;
+    m.values = null;
+    m.used = null;
+    m.cap = 0;
+    m.count = 0;
+}

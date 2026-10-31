@@ -1,5 +1,6 @@
 #include "sema.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -79,18 +80,21 @@ Sema::Sema(Program& program, AstArena& arena, TypeContext& types, Diagnostics& d
 
 bool Sema::run() {
     collect();
-    for (auto& [name, s] : structs_) layoutStruct(s);
+    for (auto& [name, s] : structs_)
+        if (s->typeParams.empty()) layoutStruct(s);
     for (auto& [name, e] : enums_) resolveEnum(e);
     for (Decl* d : program_.decls)
         if (d->declKind == Decl::Kind::Global) resolveGlobal(static_cast<GlobalVar*>(d));
     for (Decl* d : program_.decls)
-        if (d->declKind == Decl::Kind::Func) resolveSignature(static_cast<FuncDecl*>(d));
+        if (d->declKind == Decl::Kind::Func && static_cast<FuncDecl*>(d)->typeParams.empty())
+            resolveSignature(static_cast<FuncDecl*>(d));
 
     // Reject duplicate overloads (same parameter types).
     for (auto& [name, list] : funcs_) {
         for (size_t i = 0; i < list.size(); ++i)
             for (size_t j = i + 1; j < list.size(); ++j)
-                if (list[i]->paramTypes == list[j]->paramTypes) {
+                if (list[i]->typeParams.empty() && list[j]->typeParams.empty() &&
+                    list[i]->paramTypes == list[j]->paramTypes) {
                     diags_.error(list[j]->loc, "function '" + displayName(name) +
                                                    "' is already defined with the same parameter types");
                     diags_.note(list[i]->loc, "previous definition is here");
@@ -101,10 +105,23 @@ bool Sema::run() {
     for (Decl* d : program_.decls) {
         if (d->declKind != Decl::Kind::Func) continue;
         auto* f = static_cast<FuncDecl*>(d);
-        if (f->body) {
+        if (f->body && f->typeParams.empty()) {
             checkFunction(f);
             bodies.push_back(f);
         }
+    }
+
+    // Generic instances discovered while checking (instances may create more).
+    while (!pendingInstances_.empty()) {
+        FuncDecl* f = pendingInstances_.front();
+        pendingInstances_.erase(pendingInstances_.begin());
+        size_t errorsBefore = diags_.errorCount();
+        pushTypeEnv(f->genericOrigin->typeParams, f->typeArgs);
+        checkFunction(f);
+        popTypeEnv();
+        if (diags_.errorCount() > errorsBefore)
+            diags_.note(instantiatedAt_[f], "in the instantiation of '" + instanceName(f->name, f->typeArgs) + "'");
+        bodies.push_back(f);
     }
 
     auto it = funcs_.find("main");
@@ -154,7 +171,7 @@ void Sema::collect() {
                 diags_.error(s->loc, "type '" + s->name + "' is already defined");
                 break;
             }
-            s->type = types_.newStruct(s->name, s);
+            if (s->typeParams.empty()) s->type = types_.newStruct(s->name, s);   // templates get types per instance
             structs_[s->name] = s;
             break;
         }
@@ -193,8 +210,36 @@ void Sema::collect() {
 Type* Sema::resolveType(TypeExpr* t) {
     switch (t->kind) {
     case TypeExpr::Kind::Named: {
-        if (Type* b = types_.builtin(t->name)) return b;
-        if (auto it = structs_.find(t->name); it != structs_.end()) return it->second->type;
+        if (t->typeArgs.empty() && !typeEnv_.empty()) {
+            auto& env = typeEnv_.back();
+            if (auto it = env.find(t->name); it != env.end()) return it->second;
+        }
+        if (Type* b = types_.builtin(t->name)) {
+            if (!t->typeArgs.empty()) diags_.error(t->loc, "type '" + t->name + "' does not take type arguments");
+            return b;
+        }
+        if (auto it = structs_.find(t->name); it != structs_.end()) {
+            StructDecl* s = it->second;
+            if (s->typeParams.empty()) {
+                if (!t->typeArgs.empty()) {
+                    diags_.error(t->loc, "struct '" + s->name + "' is not generic");
+                    return nullptr;
+                }
+                return s->type;
+            }
+            if (t->typeArgs.size() != s->typeParams.size()) {
+                diags_.error(t->loc, "generic struct '" + s->name + "' needs " + std::to_string(s->typeParams.size()) +
+                                         " type argument(s), e.g. " + s->name + "<int>");
+                return nullptr;
+            }
+            std::vector<Type*> args;
+            for (TypeExpr* a : t->typeArgs) {
+                Type* r = resolveType(a);
+                if (!r) return nullptr;
+                args.push_back(r);
+            }
+            return instantiateStruct(s, args);
+        }
         if (auto it = enums_.find(t->name); it != enums_.end()) return it->second->type;
         diags_.error(t->loc, "unknown type '" + t->name + "'");
         return nullptr;
@@ -246,6 +291,9 @@ void Sema::layoutStruct(StructDecl* s) {
         return;
     }
     state = 1;
+    // Fields of a generic instance are resolved with its type arguments.
+    bool generic = s->genericOrigin != nullptr;
+    if (generic) pushTypeEnv(s->genericOrigin->typeParams, s->typeArgs);
     uint32_t offset = 0, align = 1;
     std::map<std::string, bool> seen;
     for (FieldDecl& f : s->fields) {
@@ -267,10 +315,122 @@ void Sema::layoutStruct(StructDecl* s) {
         offset += t->size;
         align = std::max(align, t->align);
     }
+    if (generic) popTypeEnv();
     s->type->size = std::max<uint32_t>(1, (offset + align - 1) / align * align);
     s->type->align = align;
     s->type->complete = true;
     structState_[s] = 2;
+}
+
+// ───────────────────────────── Generics ─────────────────────────────
+
+void Sema::pushTypeEnv(const std::vector<std::string>& params, const std::vector<Type*>& args) {
+    std::map<std::string, Type*> env;
+    for (size_t i = 0; i < params.size() && i < args.size(); ++i) env[params[i]] = args[i];
+    typeEnv_.push_back(std::move(env));
+}
+
+std::string Sema::instanceName(const std::string& base, const std::vector<Type*>& args) {
+    std::string n = base + "<";
+    for (size_t i = 0; i < args.size(); ++i) n += (i ? ", " : "") + typeName(args[i]);
+    return n + ">";
+}
+
+Type* Sema::instantiateStruct(StructDecl* g, const std::vector<Type*>& args) {
+    auto key = std::make_pair(g, args);
+    if (auto it = structInstances_.find(key); it != structInstances_.end()) return it->second->type;
+    auto* inst = arena_.make<StructDecl>(g->loc);
+    inst->name = instanceName(g->name, args);
+    inst->genericOrigin = g;
+    inst->typeArgs = args;
+    for (const FieldDecl& f : g->fields) {
+        FieldDecl copy;
+        copy.typeExpr = f.typeExpr;
+        copy.name = f.name;
+        copy.loc = f.loc;
+        inst->fields.push_back(copy);
+    }
+    inst->type = types_.newStruct(inst->name, inst);
+    structInstances_[key] = inst;   // registered before layout: List<T>* next is allowed
+    layoutStruct(inst);
+    return inst->type;
+}
+
+FuncDecl* Sema::instantiateFunction(FuncDecl* g, const std::vector<Type*>& args, SourceLoc at) {
+    auto key = std::make_pair(g, args);
+    if (auto it = funcInstances_.find(key); it != funcInstances_.end()) return it->second;
+    auto* inst = arena_.make<FuncDecl>(g->loc);
+    inst->name = g->name;
+    inst->params = g->params;
+    inst->returnTypeExpr = g->returnTypeExpr;
+    inst->body = static_cast<BlockStmt*>(cloneStmt(arena_, g->body));
+    inst->genericOrigin = g;
+    inst->typeArgs = args;
+    funcInstances_[key] = inst;
+    instantiatedAt_[inst] = at;
+    pushTypeEnv(g->typeParams, args);
+    resolveSignature(inst);
+    popTypeEnv();
+    pendingInstances_.push_back(inst);
+    return inst;
+}
+
+// Matches a parameter type pattern against an argument type, binding type parameters.
+// A parameter that is already bound is not re-checked here: conversion costs decide later.
+bool Sema::unify(TypeExpr* p, Type* a, const std::vector<std::string>& params, std::map<std::string, Type*>& env) {
+    if (!a) return false;
+    switch (p->kind) {
+    case TypeExpr::Kind::Named:
+        if (p->typeArgs.empty() && std::find(params.begin(), params.end(), p->name) != params.end()) {
+            if (!env.count(p->name)) env[p->name] = a;
+            return true;
+        }
+        if (!p->typeArgs.empty() && a->isStruct() && a->structDecl->genericOrigin &&
+            a->structDecl->genericOrigin->name == p->name && a->structDecl->typeArgs.size() == p->typeArgs.size()) {
+            for (size_t i = 0; i < p->typeArgs.size(); ++i)
+                if (!unify(p->typeArgs[i], a->structDecl->typeArgs[i], params, env)) return false;
+        }
+        return true;
+    case TypeExpr::Kind::Pointer:
+        if (a->isPointer() || a->isArray()) return unify(p->inner, a->elem, params, env);
+        return true;
+    case TypeExpr::Kind::Array:
+        if (a->isArray()) return unify(p->inner, a->elem, params, env);
+        return true;
+    }
+    return true;
+}
+
+bool Sema::deduceTypeArgs(FuncDecl* f, const std::vector<Expr*>& args, const std::vector<Type*>* explicitArgs,
+                          std::vector<Type*>& out) {
+    std::map<std::string, Type*> env;
+    if (explicitArgs) {
+        if (explicitArgs->size() > f->typeParams.size()) return false;
+        for (size_t i = 0; i < explicitArgs->size(); ++i) env[f->typeParams[i]] = (*explicitArgs)[i];
+    }
+    auto isBareParam = [&](TypeExpr* t) {
+        return t->kind == TypeExpr::Kind::Named && t->typeArgs.empty() &&
+               std::find(f->typeParams.begin(), f->typeParams.end(), t->name) != f->typeParams.end();
+    };
+    // Structured parameters (List<T>*, T*) carry the most reliable information, then
+    // plain `T` parameters with typed arguments, then untyped literals.
+    for (int pass = 0; pass < 3; ++pass) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            TypeExpr* p = f->params[i].typeExpr;
+            bool bare = isBareParam(p);
+            bool literal = isUntyped(args[i]);
+            if ((pass == 0 && (bare || literal)) || (pass == 1 && (!bare || literal)) || (pass == 2 && !literal))
+                continue;
+            if (!unify(p, args[i]->type, f->typeParams, env)) return false;
+        }
+    }
+    out.clear();
+    for (const std::string& name : f->typeParams) {
+        auto it = env.find(name);
+        if (it == env.end()) return false;
+        out.push_back(it->second);
+    }
+    return true;
 }
 
 void Sema::resolveEnum(EnumDecl* e) {
@@ -564,14 +724,18 @@ int Sema::conversionCost(Expr* e, Type* to) {
     if (from->isInt() && to->isInt()) {
         if (from->enumDecl) {
             // enums convert implicitly to integers wide enough for i32
-            return (to->isSigned && to->size >= 4) || to->size > 4 ? 2 : -1;
+            return (to->isSigned && to->size >= 4) || to->size > 4 ? 3 : -1;
         }
         if (to->enumDecl) return -1;
-        if (from->size < to->size && (from->isSigned == to->isSigned || (!from->isSigned && to->isSigned)))
-            return 2;
+        if (from->size < to->size && (from->isSigned == to->isSigned || (!from->isSigned && to->isSigned))) {
+            // The closest wider type wins (u8 prefers u16 over u64), same signedness first.
+            int steps = 0;
+            for (uint32_t s = from->size; s < to->size; s *= 2) ++steps;
+            return 2 + steps + (from->isSigned != to->isSigned ? 1 : 0);
+        }
         return -1;
     }
-    if (from->isInt() && to->isFloat()) return 3;
+    if (from->isInt() && to->isFloat()) return 8;
     if (from->isFloat() && to->isFloat()) return from->size < to->size ? 2 : -1;
     if (from->isPointer() && to->isPointer()) {
         if (to->isVoidPointer() || from->isVoidPointer()) return 2;
@@ -689,7 +853,7 @@ bool Sema::castAllowed(Type* from, Type* to) {
 // ───────────────────────────── Overloads ─────────────────────────────
 
 FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& args, SourceLoc loc,
-                                bool reportErrors, Expr* ufcsBase) {
+                                bool reportErrors, Expr* ufcsBase, const std::vector<Type*>* explicitTypeArgs) {
     auto it = funcs_.find(name);
     if (it == funcs_.end()) {
         if (reportErrors) diags_.error(loc, "unknown function '" + displayName(name) + "'");
@@ -706,24 +870,47 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
         addrOfBase = u;
     }
 
+    bool hasExplicit = explicitTypeArgs && !explicitTypeArgs->empty();
     FuncDecl* best = nullptr;
+    std::vector<Type*> bestTypeArgs;
     bool bestUsesAddr = false;
     int bestCost = std::numeric_limits<int>::max();
     int ties = 0;
     for (FuncDecl* f : it->second) {
-        if (f->paramTypes.size() != args.size()) continue;
+        if (f->params.size() != args.size()) continue;
+        bool isTemplate = !f->typeParams.empty();
+        if (hasExplicit && !isTemplate) continue;
         for (int variant = 0; variant < (addrOfBase ? 2 : 1); ++variant) {
+            std::vector<Expr*> actual = args;
+            if (variant == 1) actual[0] = addrOfBase;
+            std::vector<Type*> paramTypes = f->paramTypes;
+            std::vector<Type*> typeArgs;
+            if (isTemplate) {
+                if (!deduceTypeArgs(f, actual, explicitTypeArgs, typeArgs)) continue;
+                pushTypeEnv(f->typeParams, typeArgs);
+                paramTypes.clear();
+                bool resolved = true;
+                for (const Param& p : f->params) {
+                    Type* t = resolveType(p.typeExpr);
+                    resolved &= t != nullptr;
+                    paramTypes.push_back(t);
+                }
+                popTypeEnv();
+                if (!resolved) continue;
+            }
             int total = 0;
             bool ok = true;
-            for (size_t i = 0; i < args.size() && ok; ++i) {
-                Expr* a = (i == 0 && variant == 1) ? addrOfBase : args[i];
-                int c = conversionCost(a, f->paramTypes[i]);
+            for (size_t i = 0; i < actual.size() && ok; ++i) {
+                int c = conversionCost(actual[i], paramTypes[i]);
                 if (c < 0) ok = false;
                 total += c;
             }
             if (!ok) continue;
+            // A non-template wins over a template with equally good conversions.
+            total = total * 2 + (isTemplate ? 1 : 0);
             if (total < bestCost) {
                 best = f;
+                bestTypeArgs = typeArgs;
                 bestCost = total;
                 bestUsesAddr = variant == 1;
                 ties = 0;
@@ -740,9 +927,19 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
             sig += ")";
             diags_.error(loc, "no matching function for call to " + sig);
             for (FuncDecl* f : it->second) {
-                std::string cand = displayName(name) + "(";
-                for (size_t i = 0; i < f->paramTypes.size(); ++i)
-                    cand += (i ? ", " : "") + typeName(f->paramTypes[i]);
+                std::string cand = displayName(name);
+                if (!f->typeParams.empty()) {
+                    cand += "<";
+                    for (size_t i = 0; i < f->typeParams.size(); ++i) cand += (i ? ", " : "") + f->typeParams[i];
+                    cand += ">";
+                }
+                cand += "(";
+                for (size_t i = 0; i < f->params.size(); ++i) {
+                    TypeExpr* t = f->params[i].typeExpr;
+                    std::string tn = i < f->paramTypes.size() && f->paramTypes[i] ? typeName(f->paramTypes[i])
+                                                                                  : t->name + (t->kind == TypeExpr::Kind::Pointer ? "*" : "");
+                    cand += (i ? ", " : "") + tn;
+                }
                 diags_.note(f->loc, "candidate: " + cand + ")");
             }
         }
@@ -758,7 +955,11 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
         if (ufcsBase->kind == ExprKind::Ident && ufcsBase->as<IdentExpr>()->local)
             ufcsBase->as<IdentExpr>()->local->addressTaken = true;
     }
-    for (size_t i = 0; i < args.size(); ++i) args[i] = coerce(args[i], best->paramTypes[i], "argument");
+    if (!best->typeParams.empty()) best = instantiateFunction(best, bestTypeArgs, loc);
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (!best->paramTypes[i]) return nullptr;
+        args[i] = coerce(args[i], best->paramTypes[i], "argument");
+    }
     if (currentFunc_) currentFunc_->callees.push_back(best);
     return best;
 }
@@ -811,6 +1012,10 @@ Expr* Sema::check(Expr* e) {
 }
 
 Expr* Sema::checkIdent(IdentExpr* e) {
+    if (!e->typeArgs.empty()) {
+        diags_.error(e->loc, "type arguments (::<...>) are only allowed on function calls and struct literals");
+        return errorExpr(e);
+    }
     if (LocalVar* v = lookupLocal(e->name)) {
         double weight = 1;
         for (int i = 0; i < loopDepth_ && i < 6; ++i) weight *= 8;
@@ -1383,7 +1588,13 @@ Expr* Sema::checkCall(CallExpr* e) {
         return e;
     }
 
-    e->func = resolveOverload(name, e->args, e->loc, true);
+    std::vector<Type*> explicitArgs;
+    for (TypeExpr* t : e->callee->as<IdentExpr>()->typeArgs) {
+        Type* r = resolveType(t);
+        if (!r) return errorExpr(e);
+        explicitArgs.push_back(r);
+    }
+    e->func = resolveOverload(name, e->args, e->loc, true, nullptr, &explicitArgs);
     if (!e->func) return errorExpr(e);
     e->type = e->func->returnType;
     return e;
@@ -1473,6 +1684,22 @@ Expr* Sema::checkStructLit(StructLitExpr* e) {
         return errorExpr(e);
     }
     StructDecl* s = it->second;
+    if (!s->typeParams.empty()) {
+        if (e->typeArgs.size() != s->typeParams.size()) {
+            diags_.error(e->loc, "generic struct '" + s->name + "' needs type arguments: " + s->name + "::<...>{...}");
+            return errorExpr(e);
+        }
+        std::vector<Type*> args;
+        for (TypeExpr* t : e->typeArgs) {
+            Type* r = resolveType(t);
+            if (!r) return errorExpr(e);
+            args.push_back(r);
+        }
+        s = instantiateStruct(s, args)->structDecl;
+    } else if (!e->typeArgs.empty()) {
+        diags_.error(e->loc, "struct '" + s->name + "' is not generic");
+        return errorExpr(e);
+    }
     for (Expr*& f : e->fields) f = check(f);
     if (!e->fields.empty() && e->fields.size() != s->fields.size()) {
         diags_.error(e->loc, "struct '" + s->name + "' has " + std::to_string(s->fields.size()) + " fields, but " +

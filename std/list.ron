@@ -1,0 +1,87 @@
+// List<T>: a growable array (like std::vector).
+//
+//   List<Enemy> enemies;            // zero-initialized = empty, no allocation yet
+//   enemies.push(Enemy{...});
+//   for (int i = 0; i < enemies.len; i++) enemies.at(i).hp -= 1;
+//   enemies.free_list();
+
+import "std/mem.ron";
+
+struct List<T> {
+    T* data;
+    int len;
+    int cap;
+}
+
+fn reserve<T>(List<T>* l, int capacity) {
+    if (capacity <= l.cap) return;
+    l.data = realloc(l.data, (capacity as u64) * sizeof(T));
+    l.cap = capacity;
+}
+
+fn push<T>(List<T>* l, T value) {
+    if (l.len == l.cap) l.reserve(l.cap == 0 ? 8 : l.cap * 2);
+    l.data[l.len] = value;
+    l.len++;
+}
+
+fn pop<T>(List<T>* l) -> T {
+    l.len--;
+    return l.data[l.len];
+}
+
+fn get<T>(List<T>* l, int i) -> T { return l.data[i]; }
+fn at<T>(List<T>* l, int i) -> T* { return &l.data[i]; }
+fn set<T>(List<T>* l, int i, T value) { l.data[i] = value; }
+fn last<T>(List<T>* l) -> T* { return &l.data[l.len - 1]; }
+fn is_empty<T>(List<T>* l) -> bool { return l.len == 0; }
+
+fn insert<T>(List<T>* l, int index, T value) {
+    if (l.len == l.cap) l.reserve(l.cap == 0 ? 8 : l.cap * 2);
+    for (int i = l.len; i > index; i--) l.data[i] = l.data[i - 1];
+    l.data[index] = value;
+    l.len++;
+}
+
+// Removes element i, keeping the order (O(n)).
+fn remove_at<T>(List<T>* l, int index) {
+    for (int i = index; i < l.len - 1; i++) l.data[i] = l.data[i + 1];
+    l.len--;
+}
+
+// Removes element i by moving the last element into its place (O(1)).
+fn remove_swap<T>(List<T>* l, int index) {
+    l.len--;
+    if (index != l.len) l.data[index] = l.data[l.len];
+}
+
+fn clear<T>(List<T>* l) { l.len = 0; }
+
+fn free_list<T>(List<T>* l) {
+    free(l.data);
+    l.data = null;
+    l.len = 0;
+    l.cap = 0;
+}
+
+// Linear search; needs `==` for T (built in for numbers, overloadable for structs).
+fn index_of<T>(List<T>* l, T value) -> int {
+    for (int i = 0; i < l.len; i++)
+        if (l.data[i] == value) return i;
+    return -1;
+}
+
+fn contains<T>(List<T>* l, T value) -> bool { return l.index_of(value) >= 0; }
+
+// In-place insertion sort using `<` (fine for the small lists games sort every frame).
+fn sort<T>(List<T>* l) {
+    for (int i = 1; i < l.len; i++) {
+        T key = l.data[i];
+        int j = i - 1;
+        while (j >= 0 && key < l.data[j]) {
+            l.data[j + 1] = l.data[j];
+            j--;
+        }
+        l.data[j + 1] = key;
+    }
+}

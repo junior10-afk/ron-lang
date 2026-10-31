@@ -42,7 +42,11 @@ private:
 
     // Types
     TypeExpr* parseType(bool inExpression = false);
+    std::vector<TypeExpr*> parseTypeArgs();            // after '<', through the closing '>'
+    std::vector<std::string> parseTypeParams();        // after '<': <T, U>
+    void expectCloseAngle();                           // '>' (splits '>>' in List<List<int>>)
     bool looksLikeDecl() const;   // `Type name` at statement start?
+    size_t skipType(size_t i) const;                   // token index after a type, or 0
 
     // Statements
     Stmt* parseStmt();

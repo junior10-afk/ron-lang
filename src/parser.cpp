@@ -214,6 +214,7 @@ FuncDecl* Parser::parseFunc(const std::string& externDll) {
     } else {
         fail(peek(), "expected a function name");
     }
+    if (match(TokenKind::Less)) fn->typeParams = parseTypeParams();
 
     expect(TokenKind::LParen, "'(' after function name");
     if (!check(TokenKind::RParen)) {
@@ -241,6 +242,7 @@ StructDecl* Parser::parseStruct() {
     const Token& kw = advance();
     auto* s = arena_.make<StructDecl>(kw.loc);
     s->name = std::string(expect(TokenKind::Identifier, "a struct name").text);
+    if (match(TokenKind::Less)) s->typeParams = parseTypeParams();
     expect(TokenKind::LBrace, "'{' after struct name");
     while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfFile)) {
         TypeExpr* type = parseType();
@@ -305,6 +307,11 @@ TypeExpr* Parser::parseType(bool inExpression) {
             return false;
         }
     };
+    // Generic arguments (not after `as`, where `x as int < y` is a comparison).
+    if (!inExpression && check(TokenKind::Less)) {
+        advance();
+        t->typeArgs = parseTypeArgs();
+    }
     while (true) {
         if (check(TokenKind::Star) && !(inExpression && startsOperand(peek(1)))) {
             auto* p = arena_.make<TypeExpr>(advance().loc);
@@ -330,10 +337,56 @@ TypeExpr* Parser::parseType(bool inExpression) {
     }
 }
 
-bool Parser::looksLikeDecl() const {
-    // Identifier ('*' | '[' INT ']')* Identifier
-    if (!peek().is(TokenKind::Identifier)) return false;
-    size_t i = 1;
+std::vector<std::string> Parser::parseTypeParams() {
+    std::vector<std::string> params;
+    do {
+        params.push_back(std::string(expect(TokenKind::Identifier, "a type parameter name").text));
+    } while (match(TokenKind::Comma));
+    expectCloseAngle();
+    return params;
+}
+
+std::vector<TypeExpr*> Parser::parseTypeArgs() {
+    std::vector<TypeExpr*> args;
+    do {
+        args.push_back(parseType());
+    } while (match(TokenKind::Comma));
+    expectCloseAngle();
+    return args;
+}
+
+void Parser::expectCloseAngle() {
+    if (match(TokenKind::Greater)) return;
+    if (check(TokenKind::Shr)) {
+        // `List<List<int>>`: consume one '>' of the '>>' token.
+        Token& t = tokens_[pos_];
+        t.kind = TokenKind::Greater;
+        t.text = t.text.substr(1);
+        ++t.loc.column;
+        ++t.loc.offset;
+        return;
+    }
+    fail(peek(), "expected '>' to close the type arguments");
+}
+
+// Skips `Name<Args>* [N]...` starting at token i; returns the index after it, or 0.
+size_t Parser::skipType(size_t i) const {
+    if (!peek(i).is(TokenKind::Identifier)) return 0;
+    ++i;
+    if (peek(i).is(TokenKind::Less)) {
+        int depth = 0;
+        do {
+            TokenKind k = peek(i).kind;
+            if (k == TokenKind::Less) ++depth;
+            else if (k == TokenKind::Greater) --depth;
+            else if (k == TokenKind::Shr) depth -= 2;
+            else if (k != TokenKind::Identifier && k != TokenKind::Comma && k != TokenKind::Star &&
+                     k != TokenKind::LBracket && k != TokenKind::RBracket && k != TokenKind::IntLiteral)
+                return 0;
+            if (depth < 0) return 0;
+            ++i;
+        } while (depth > 0);
+    }
     while (true) {
         if (peek(i).is(TokenKind::Star)) {
             ++i;
@@ -342,10 +395,15 @@ bool Parser::looksLikeDecl() const {
                    peek(i + 2).is(TokenKind::RBracket)) {
             i += 3;
         } else {
-            break;
+            return i;
         }
     }
-    return peek(i).is(TokenKind::Identifier);
+}
+
+bool Parser::looksLikeDecl() const {
+    // Type Identifier
+    size_t i = skipType(0);
+    return i != 0 && peek(i).is(TokenKind::Identifier);
 }
 
 // ───────────────────────────── Statements ─────────────────────────────
@@ -634,7 +692,14 @@ Expr* Parser::parsePrimary() {
     }
     case TokenKind::Identifier: {
         advance();
-        if (check(TokenKind::ColonColon)) {
+        std::vector<TypeExpr*> typeArgs;
+        if (check(TokenKind::ColonColon) && peek(1).is(TokenKind::Less)) {
+            // Explicit generic arguments: make::<int>(), Pair::<int, float>{1, 2.0}
+            advance();
+            advance();
+            typeArgs = parseTypeArgs();
+        }
+        if (typeArgs.empty() && check(TokenKind::ColonColon)) {
             advance();
             auto* p = arena_.make<PathExpr>(t.loc);
             p->scope = std::string(t.text);
@@ -645,6 +710,7 @@ Expr* Parser::parsePrimary() {
             advance();
             auto* s = arena_.make<StructLitExpr>(t.loc);
             s->typeName = std::string(t.text);
+            s->typeArgs = typeArgs;
             if (!check(TokenKind::RBrace)) {
                 do {
                     if (check(TokenKind::RBrace)) break;   // trailing comma
@@ -656,6 +722,7 @@ Expr* Parser::parsePrimary() {
         }
         auto* id = arena_.make<IdentExpr>(t.loc);
         id->name = std::string(t.text);
+        id->typeArgs = typeArgs;
         return id;
     }
     default:
