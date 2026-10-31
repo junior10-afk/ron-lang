@@ -488,9 +488,11 @@ TEST(e2e_functions_slices_for_in) {
             println(s[4]);
             var fns = [twice, twice];
             println(fns[1](4));
+            // A temporary array must survive calls in the loop body (they reuse scratch slots).
+            for (var w in ["ab", "cd", "ef"]) println("{}{}", w, format("{}", w));
             return 0;
         }
-    )", "42\n7\ntrue\n10\n15\n5\n60\n54321\n50\n30\n5\n16\n8\n"));
+    )", "42\n7\ntrue\n10\n15\n5\n60\n54321\n50\n30\n5\n16\n8\nabab\ncdcd\nefef\n"));
 }
 
 TEST(e2e_sum_types_match_try) {

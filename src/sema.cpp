@@ -1301,6 +1301,13 @@ void Sema::lowerForIn(ForInStmt* f) {
                 popScope();
                 return;
             }
+            if (!it->isLvalue) {
+                // A temporary (e.g. an array literal) must outlive the whole loop: keep
+                // it in a hidden local instead of a scratch slot the body could reuse.
+                LocalVar* arr = hiddenLocal("$arr", t, loc);
+                block->stmts.push_back(mkVarDecl(arr, it, loc));
+                it = mkIdent(arr, loc);
+            }
             ptrInit = implicitCast(it, types_.pointerTo(elem));   // array decays to a pointer to its first element
             lenInit = mkInt(t->count, types_.i64(), loc);
         } else if (t->isSlice() || (dataField && lenField)) {

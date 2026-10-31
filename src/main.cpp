@@ -26,8 +26,10 @@ void printUsage() {
         "Usage:\n"
         "  ronc build <file.ron> [-o out.exe] [--gui] [--release] [--Werror]\n"
         "                                               compile to a native executable\n"
-        "  ronc run   <file.ron> [--gui] [--watch]      compile and run (--watch: rebuild and\n"
-        "                                               restart whenever a source file changes)\n"
+        "  ronc run   <file.ron> [--gui] [--watch] [-- args...]\n"
+        "                                               compile and run (--watch: rebuild and\n"
+        "                                               restart whenever a source file changes;\n"
+        "                                               arguments after -- go to the program)\n"
         "  ronc check <file.ron>                        type-check only\n"
         "  ronc tokens <file.ron>                       print the lexer's tokens\n"
         "  ronc test  <file.ron>                        run the file's test \"name\" { ... } blocks\n"
@@ -109,6 +111,7 @@ struct BuildOutcome {
 bool g_release = false;
 bool g_werror = false;
 bool g_test = false;
+std::vector<std::string> g_programArgs;   // after "--" on the ronc run command line
 
 BuildOutcome build(const std::string& input, const std::string& output, ron::Subsystem subsystem) {
     ron::SourceManager sources;
@@ -136,6 +139,13 @@ PROCESS_INFORMATION launch(const std::string& exe) {
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     std::string cmd = "\"" + exe + "\"";
+    // The program runs in its own directory, so arguments naming existing files
+    // are made absolute to keep meaning what the user typed.
+    for (const std::string& a : g_programArgs) {
+        std::error_code ec;
+        std::string arg = fs::exists(a, ec) ? fs::absolute(a, ec).string() : a;
+        cmd += " \"" + arg + "\"";
+    }
     std::string dir = fs::path(exe).parent_path().string();
     if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi))
         std::fprintf(stderr, "ronc: failed to start '%s' (error %lu)\n", exe.c_str(), GetLastError());
@@ -259,6 +269,10 @@ int main(int argc, char** argv) {
     std::string input, output;
     bool gui = false, watch = false;
     for (; i < args.size(); ++i) {
+        if (args[i] == "--") {
+            g_programArgs.assign(args.begin() + static_cast<std::ptrdiff_t>(i) + 1, args.end());
+            break;
+        }
         if (args[i] == "-o" && i + 1 < args.size()) output = args[++i];
         else if (args[i] == "--gui") gui = true;
         else if (args[i] == "--watch") watch = true;
