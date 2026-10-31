@@ -135,7 +135,11 @@ void Parser::parseProgram(Program& program) {
                 peek(2).is(TokenKind::LBrace)) {
                 parseExternBlock(program);
             } else {
-                program.decls.push_back(parseDecl());
+                bool isPrivate = match(TokenKind::KwPrivate);
+                Decl* d = parseDecl();
+                d->isPrivate = isPrivate;
+                if (isPrivate && d->declKind == Decl::Kind::Import) diags_.error(d->loc, "an import cannot be private");
+                program.decls.push_back(d);
             }
         } catch (const ParseError&) {
             synchronizeDecl();
@@ -166,6 +170,7 @@ Decl* Parser::parseDecl() {
         advance();
         auto* imp = arena_.make<ImportDecl>(t.loc);
         imp->path = expect(TokenKind::StringLiteral, "a file path string after 'import'").strValue;
+        if (match(TokenKind::KwAs)) imp->alias = std::string(expect(TokenKind::Identifier, "a module alias after 'as'").text);
         expect(TokenKind::Semicolon, "';' after import");
         return imp;
     }
@@ -330,6 +335,11 @@ TypeExpr* Parser::parseType(bool inExpression) {
     t = arena_.make<TypeExpr>(name.loc);
     t->kind = TypeExpr::Kind::Named;
     t->name = std::string(name.text);
+    if (check(TokenKind::ColonColon) && peek(1).is(TokenKind::Identifier)) {   // m::Vec3
+        advance();
+        t->module = t->name;
+        t->name = std::string(advance().text);
+    }
     // After `as`, `x as float * 2` is a multiplication, not a cast to float*.
     auto startsOperand = [&](const Token& tok) {
         switch (tok.kind) {
@@ -428,6 +438,7 @@ size_t Parser::skipType(size_t i) const {
     }
     if (!peek(i).is(TokenKind::Identifier)) return 0;
     ++i;
+    if (peek(i).is(TokenKind::ColonColon) && peek(i + 1).is(TokenKind::Identifier)) i += 2;   // m::Vec3
     if (peek(i).is(TokenKind::Less)) {
         int depth = 0;
         do {

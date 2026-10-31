@@ -130,6 +130,7 @@ Image CodeGen::generate() {
 void CodeGen::genEntryStub() {
     image_.entryOffset = static_cast<uint32_t>(as_.pos());
     as_.subImm(RSP, 40);   // shadow space + realign (entry rsp is 8 mod 16)
+    if (sema_.initFunction) as_.call(funcLabels_[sema_.initFunction]);   // globals with computed values
     as_.call(funcLabels_[sema_.mainFunc]);
     if (sema_.mainFunc->returnType->isVoid()) as_.movRI(RCX, 0);
     else as_.movRR32(RCX, RAX);

@@ -598,6 +598,63 @@ TEST(e2e_variadics_and_format) {
         "[1, 2, 3] [2, 3]\nSome\n{literal} 18446744073709551615\ni32[3]\n"));
 }
 
+void writeModule(const std::string& name, const std::string& source) {
+    fs::path dir = fs::temp_directory_path() / "ron_e2e";
+    fs::create_directories(dir);
+    std::ofstream(dir / name, std::ios::binary) << source;
+}
+
+TEST(e2e_modules_and_global_init) {
+    writeModule("geom.ron", R"(
+        struct Point { int x, y; }
+        private fn helper(int v) -> int { return v * 10; }
+        fn scaled(int v) -> int { return helper(v); }
+        fn init() -> int { return 1; }
+        var origin_x = scaled(4);
+    )");
+    writeModule("sound.ron", R"(
+        private fn helper(int v) -> int { return v + 1; }
+        fn bump(int v) -> int { return helper(v); }
+        fn init() -> int { return 2; }
+    )");
+    CHECK(prints("modules", R"(
+        import "std/io.ron";
+        import "geom.ron" as g;
+        import "sound.ron" as s;
+        struct Config { int w, h; }
+        var counter_start = g::scaled(2) + 1;
+        var config = Config{w: 640, h: 480};
+        fn(int) -> int handler = s::bump;
+        int[4] squares = [1, 4, 9, 16];
+        fn main() -> int {
+            println(g::init() + s::init());
+            g::Point p = Point{1, 2};
+            println(p.x + p.y);
+            println(origin_x);
+            println(counter_start);
+            println(config.w * config.h);
+            println(handler(5));
+            println(squares[3]);
+            println(g::origin_x);
+            return 0;
+        }
+    )", "3\n3\n40\n21\n307200\n6\n16\n40\n"));
+
+    RunResult priv = runProgram("modpriv", R"(
+        import "geom.ron";
+        fn main() -> int { return helper(1); }
+    )");
+    CHECK(!priv.compiled);
+    CHECK(priv.errors.find("is private to another file") != std::string::npos);
+    RunResult amb = runProgram("modamb", R"(
+        import "geom.ron";
+        import "sound.ron";
+        fn main() -> int { return init(); }
+    )");
+    CHECK(!amb.compiled);
+    CHECK(amb.errors.find("ambiguous") != std::string::npos);
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

@@ -79,22 +79,27 @@ Sema::Sema(Program& program, AstArena& arena, TypeContext& types, Diagnostics& d
 // ───────────────────────────── Driver ─────────────────────────────
 
 bool Sema::run() {
+    initFunc_ = arena_.make<FuncDecl>(SourceLoc{0, 1, 1, UINT32_MAX});
+    initFunc_->name = "__ron_init_globals";
+    initFunc_->body = arena_.make<BlockStmt>(initFunc_->loc);
+    initFunc_->returnType = types_.voidType();
     collect();
     for (auto& [name, s] : structs_)
         if (s->typeParams.empty()) layoutStruct(s);
     for (auto& [name, e] : enums_) resolveEnum(e);
-    for (Decl* d : program_.decls)
-        if (d->declKind == Decl::Kind::Global) resolveGlobal(static_cast<GlobalVar*>(d));
+    // Signatures first: global initializers may call functions.
     for (Decl* d : program_.decls)
         if (d->declKind == Decl::Kind::Func && static_cast<FuncDecl*>(d)->typeParams.empty())
             resolveSignature(static_cast<FuncDecl*>(d));
+    for (Decl* d : program_.decls)
+        if (d->declKind == Decl::Kind::Global) resolveGlobal(static_cast<GlobalVar*>(d));
 
     // Reject duplicate overloads (same parameter types).
     for (auto& [name, list] : funcs_) {
         for (size_t i = 0; i < list.size(); ++i)
             for (size_t j = i + 1; j < list.size(); ++j)
                 if (list[i]->typeParams.empty() && list[j]->typeParams.empty() &&
-                    list[i]->paramTypes == list[j]->paramTypes) {
+                    list[i]->loc.fileId == list[j]->loc.fileId && list[i]->paramTypes == list[j]->paramTypes) {
                     diags_.error(list[j]->loc, "function '" + displayName(name) +
                                                    "' is already defined with the same parameter types");
                     diags_.note(list[i]->loc, "previous definition is here");
@@ -135,11 +140,19 @@ bool Sema::run() {
             diags_.error(mainFunc->loc, "'main' must return 'int' or nothing");
     }
 
+    if (!initFunc_->body->stmts.empty()) {
+        bodies.push_back(initFunc_);
+        initFunction = initFunc_;
+    }
     // Dead-code elimination: only functions reachable from main are compiled,
     // so importing a library costs nothing for the parts you do not call.
     if (mainFunc) {
         std::vector<FuncDecl*> work{mainFunc};
         mainFunc->used = true;
+        if (initFunction) {
+            initFunction->used = true;
+            work.push_back(initFunction);
+        }
         for (FuncDecl* f : globalRefs_)
             if (!f->used) {
                 f->used = true;
@@ -205,8 +218,11 @@ void Sema::collect() {
             globalsByName_[g->name] = g;
             break;
         }
-        case Decl::Kind::Import:
-            break;   // handled by the driver before sema
+        case Decl::Kind::Import: {
+            auto* imp = static_cast<ImportDecl*>(d);
+            if (!imp->alias.empty()) aliases_[{imp->loc.fileId, imp->alias}] = imp->targetFile;
+            break;
+        }
         }
     }
 }
@@ -216,6 +232,24 @@ void Sema::collect() {
 Type* Sema::resolveType(TypeExpr* t) {
     switch (t->kind) {
     case TypeExpr::Kind::Named: {
+        if (!t->module.empty()) {
+            uint32_t module = moduleOf(t->module, t->loc);
+            bool found = false;
+            if (auto s = structs_.find(t->name); s != structs_.end() && s->second->loc.fileId == module) found = true;
+            if (auto en = enums_.find(t->name); en != enums_.end() && en->second->loc.fileId == module) found = true;
+            if (module == UINT32_MAX || !found) {
+                diags_.error(t->loc, "module '" + t->module + "' has no type '" + t->name + "'");
+                return nullptr;
+            }
+        }
+        if (auto s = structs_.find(t->name); s != structs_.end() && !visibleFrom(s->second, t->loc)) {
+            diags_.error(t->loc, "type '" + t->name + "' is private to another file");
+            return nullptr;
+        }
+        if (auto en = enums_.find(t->name); en != enums_.end() && !visibleFrom(en->second, t->loc)) {
+            diags_.error(t->loc, "type '" + t->name + "' is private to another file");
+            return nullptr;
+        }
         if (t->typeArgs.empty() && !typeEnv_.empty()) {
             auto& env = typeEnv_.back();
             if (auto it = env.find(t->name); it != env.end()) return it->second;
@@ -526,6 +560,16 @@ void Sema::resolveGlobal(GlobalVar* g) {
         return;
     }
     state = 1;
+    // Initializers are checked as part of __ron_init_globals, which runs before main.
+    FuncDecl* savedFunc = currentFunc_;
+    auto savedScopes = std::move(scopes_);
+    auto savedTargets = std::move(breakTargets_);
+    int savedLoop = loopDepth_, savedDefer = deferDepth_;
+    scopes_.clear();
+    breakTargets_.clear();
+    loopDepth_ = deferDepth_ = 0;
+    currentFunc_ = initFunc_;
+    pushScope();
     if (g->typeExpr) {
         g->type = resolveType(g->typeExpr);
     } else {
@@ -536,6 +580,7 @@ void Sema::resolveGlobal(GlobalVar* g) {
         diags_.error(g->loc, "a variable cannot have type void");
         g->type = nullptr;
     }
+    bool dynamic = false;
     if (g->type && g->init) {
         Expr* v = coerce(g->typeExpr ? check(g->init) : g->init, g->type, "initializer");
         g->init = v;
@@ -553,12 +598,32 @@ void Sema::resolveGlobal(GlobalVar* g) {
             } else if (v->kind == ExprKind::NullLit) {
                 g->hasValue = true;
                 g->intValue = 0;
+            } else if (g->isConst) {
+                diags_.error(g->init->loc, "a const value must be a compile-time constant");
             } else {
-                diags_.error(g->init->loc, g->isConst ? "a const value must be a compile-time constant"
-                                                      : "a global initializer must be a compile-time constant "
-                                                        "(initialize it in main instead)");
+                dynamic = true;   // computed at startup
             }
         }
+    }
+    popScope();
+    currentFunc_ = savedFunc;
+    scopes_ = std::move(savedScopes);
+    breakTargets_ = std::move(savedTargets);
+    loopDepth_ = savedLoop;
+    deferDepth_ = savedDefer;
+    if (dynamic && g->type) {
+        auto* target = arena_.make<IdentExpr>(g->loc);
+        target->name = g->name;
+        target->global = g;
+        target->type = g->type;
+        target->isLvalue = true;
+        auto* assign = arena_.make<AssignExpr>(g->loc);
+        assign->target = target;
+        assign->value = g->init;
+        assign->type = g->type;
+        auto* stmt = arena_.make<ExprStmt>(g->loc);
+        stmt->expr = assign;
+        initFunc_->body->stmts.push_back(stmt);
     }
     if (g->isConst && g->type && !g->type->isScalar() && !g->type->isFloat())
         diags_.error(g->loc, "a const must have a number, bool or pointer type");
@@ -607,6 +672,16 @@ void Sema::resolveSignature(FuncDecl* f) {
         for (Type* t : f->paramTypes) hasStruct |= t && t->isStruct();
         if (!hasStruct) diags_.error(f->loc, "operator overloads need at least one struct parameter");
     }
+}
+
+bool Sema::visibleFrom(const Decl* d, SourceLoc from) const {
+    return !d->isPrivate || d->loc.fileId == from.fileId;
+}
+
+// File id of a module alias visible from `from` (UINT32_MAX if `name` is not an alias).
+uint32_t Sema::moduleOf(const std::string& name, SourceLoc from) const {
+    auto it = aliases_.find({from.fileId, name});
+    return it == aliases_.end() ? UINT32_MAX : it->second;
 }
 
 bool Sema::isAnyType(Type* t) const {
@@ -1612,7 +1687,8 @@ bool Sema::castAllowed(Type* from, Type* to) {
 // ───────────────────────────── Overloads ─────────────────────────────
 
 FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& args, SourceLoc loc,
-                                bool reportErrors, Expr* ufcsBase, const std::vector<Type*>* explicitTypeArgs) {
+                                bool reportErrors, Expr* ufcsBase, const std::vector<Type*>* explicitTypeArgs,
+                                uint32_t onlyFile) {
     auto it = funcs_.find(name);
     if (it == funcs_.end()) {
         if (reportErrors) diags_.error(loc, "unknown function '" + displayName(name) + "'");
@@ -1630,6 +1706,7 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
     }
 
     bool hasExplicit = explicitTypeArgs && !explicitTypeArgs->empty();
+    bool skippedPrivate = false;
     FuncDecl* best = nullptr;
     std::vector<Type*> bestTypeArgs;
     bool bestUsesAddr = false;
@@ -1649,6 +1726,12 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
         if (!changed) break;
     }
     for (FuncDecl* f : it->second) {
+        if (!visibleFrom(f, loc)) {
+            skippedPrivate = true;
+            continue;
+        }
+        if (onlyFile != UINT32_MAX && f->loc.fileId != onlyFile) continue;
+        if (f->typeParams.empty() && f->paramTypes.size() != f->params.size()) continue;   // signature not resolved yet
         size_t fixed = f->variadic ? f->params.size() - 1 : f->params.size();
         if (f->variadic ? args.size() < fixed : args.size() != fixed) continue;
         bool isTemplate = !f->typeParams.empty();
@@ -1705,6 +1788,10 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
     }
 
     if (!best) {
+        if (reportErrors && skippedPrivate) {
+            diags_.error(loc, "'" + displayName(name) + "' is private to another file");
+            return nullptr;
+        }
         if (reportErrors) {
             std::string sig = displayName(name) + "(";
             for (size_t i = 0; i < args.size(); ++i) sig += (i ? ", " : "") + typeName(args[i]->type);
@@ -1730,7 +1817,10 @@ FuncDecl* Sema::resolveOverload(const std::string& name, std::vector<Expr*>& arg
         return nullptr;
     }
     if (ties > 0 && reportErrors) {
-        diags_.error(loc, "call to '" + displayName(name) + "' is ambiguous");
+        diags_.error(loc, "call to '" + displayName(name) + "' is ambiguous" +
+                              (onlyFile == UINT32_MAX ? " (functions with this signature exist in several modules; "
+                                                        "import one with `as` and write alias::" + name + ")"
+                                                      : ""));
         return nullptr;
     }
 
@@ -1871,6 +1961,10 @@ Expr* Sema::checkIdent(IdentExpr* e) {
     }
     if (auto it = globalsByName_.find(e->name); it != globalsByName_.end()) {
         GlobalVar* g = it->second;
+        if (!visibleFrom(g, e->loc)) {
+            diags_.error(e->loc, "'" + e->name + "' is private to another file");
+            return errorExpr(e);
+        }
         resolveGlobal(g);
         if (!g->type) return errorExpr(e);
         if (g->isConst) {
@@ -1912,6 +2006,29 @@ Expr* Sema::checkIdent(IdentExpr* e) {
 }
 
 Expr* Sema::checkPath(PathExpr* e) {
+    uint32_t module = moduleOf(e->scope, e->loc);
+    if (module != UINT32_MAX) {
+        auto g = globalsByName_.find(e->member);
+        if (g != globalsByName_.end() && g->second->loc.fileId == module) {
+            auto* id = arena_.make<IdentExpr>(e->loc);
+            id->name = e->member;
+            return checkIdent(id);
+        }
+        auto fs = funcs_.find(e->member);
+        if (fs != funcs_.end()) {
+            std::vector<FuncDecl*> inModule;
+            for (FuncDecl* f : fs->second)
+                if (f->loc.fileId == module && visibleFrom(f, e->loc)) inModule.push_back(f);
+            if (!inModule.empty()) {
+                auto* id = arena_.make<IdentExpr>(e->loc);
+                id->name = e->member;
+                id->typeArgs = e->typeArgs;
+                return functionValue(id, inModule);
+            }
+        }
+        diags_.error(e->loc, "module '" + e->scope + "' has no public '" + e->member + "'");
+        return errorExpr(e);
+    }
     auto it = enums_.find(e->scope);
     if (it == enums_.end()) {
         diags_.error(e->loc, "unknown enum '" + e->scope + "'");
@@ -2418,6 +2535,20 @@ Expr* Sema::checkCall(CallExpr* e) {
 
     if (e->callee->kind == ExprKind::Path) {
         auto* p = e->callee->as<PathExpr>();
+        uint32_t module = moduleOf(p->scope, p->loc);
+        if (module != UINT32_MAX) {
+            // alias::function(args): only that module's functions are candidates
+            std::vector<Type*> explicitArgs;
+            for (TypeExpr* t : p->typeArgs) {
+                Type* r = resolveType(t);
+                if (!r) return errorExpr(e);
+                explicitArgs.push_back(r);
+            }
+            e->func = resolveOverload(p->member, e->args, e->loc, true, nullptr, &explicitArgs, module);
+            if (!e->func) return errorExpr(e);
+            e->type = e->func->returnType;
+            return e;
+        }
         auto it = enums_.find(p->scope);
         if (it != enums_.end() && it->second->isSum) return makeVariant(it->second, p->member, p->typeArgs, e->args, e->loc, true);
     }
@@ -2519,7 +2650,7 @@ Expr* Sema::functionValue(IdentExpr* e, std::vector<FuncDecl*>& list) {
             if (cand->typeParams.size() == args.size()) f = instantiateFunction(cand, args, e->loc);
     } else {
         for (FuncDecl* cand : list)
-            if (cand->typeParams.empty()) {
+            if (cand->typeParams.empty() && visibleFrom(cand, e->loc)) {
                 f = cand;
                 break;   // overloads: coerce() picks the one matching the expected type
             }

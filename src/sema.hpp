@@ -25,6 +25,7 @@ public:
     std::vector<FuncDecl*> externs;     // imported functions that are called
     std::vector<GlobalVar*> globals;    // mutable globals (consts are folded away)
     FuncDecl* mainFunc = nullptr;
+    FuncDecl* initFunction = nullptr;   // __ron_init_globals (null when no global needs it)
     Type* typeInfoType() const {
         auto it = structs_.find("TypeInfo");
         return it == structs_.end() ? nullptr : it->second->type;
@@ -97,7 +98,9 @@ private:
     // Overloads
     FuncDecl* resolveOverload(const std::string& name, std::vector<Expr*>& args, SourceLoc loc,
                               bool reportErrors, Expr* ufcsBase = nullptr,
-                              const std::vector<Type*>* explicitTypeArgs = nullptr);
+                              const std::vector<Type*>* explicitTypeArgs = nullptr, uint32_t onlyFile = UINT32_MAX);
+    bool visibleFrom(const Decl* d, SourceLoc from) const;
+    uint32_t moduleOf(const std::string& name, SourceLoc from) const;
 
     // Generics (monomorphization)
     Type* instantiateStruct(StructDecl* g, const std::vector<Type*>& args);
@@ -139,6 +142,8 @@ private:
     std::map<std::pair<EnumDecl*, std::vector<Type*>>, EnumDecl*> enumInstances_;
     std::map<EnumDecl*, Type*> placeholders_;
     std::set<EnumDecl*> sumLayoutActive_;
+    std::map<std::pair<uint32_t, std::string>, uint32_t> aliases_;   // (file, alias) -> imported file
+    FuncDecl* initFunc_ = nullptr;
 
     std::vector<std::map<std::string, LocalVar*>> scopes_;
     FuncDecl* currentFunc_ = nullptr;

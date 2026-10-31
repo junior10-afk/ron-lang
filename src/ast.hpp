@@ -50,6 +50,7 @@ struct TypeExpr : AstNode {
     uint64_t arraySize = 0;      // Array: literal size...
     std::string sizeConst;       // ...or the name of an integer const: float[MAX] a;
     std::vector<TypeExpr*> typeArgs;   // Named generic instance: List<int>
+    std::string module;          // Named: `m::Vec3` (module alias)
 };
 
 // ───────────────────────────── Expressions ─────────────────────────────
@@ -401,6 +402,7 @@ struct Param {
 
 struct Decl : AstNode {
     enum class Kind { Func, Struct, Enum, Global, Import } declKind;
+    bool isPrivate = false;   // `private`: visible only inside its own file
     explicit Decl(Kind k) : declKind(k) {}
 };
 
@@ -488,6 +490,8 @@ struct GlobalVar : Decl {
 
 struct ImportDecl : Decl {
     std::string path;
+    std::string alias;              // `import "std/math.ron" as m;` → m::name
+    uint32_t targetFile = UINT32_MAX;   // set by the driver once the file is loaded
     ImportDecl() : Decl(Kind::Import) {}
 };
 

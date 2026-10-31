@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -52,6 +53,8 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
 
     std::deque<std::pair<std::string, SourceLoc>> queue;
     std::set<std::string> seen;
+    std::map<std::string, uint32_t> fileIds;
+    std::vector<std::pair<ImportDecl*, std::string>> pendingImports;
     std::string root = canonicalPath(options.input);
     queue.push_back({root, SourceLoc{0, 0, 0, UINT32_MAX}});
     seen.insert(root);
@@ -83,8 +86,15 @@ CompileResult compile(const CompileOptions& options, SourceManager& sources, Dia
                 diags.error(imp->loc, "cannot find imported file '" + imp->path + "'");
                 continue;
             }
+            pendingImports.push_back({imp, resolved});
             if (seen.insert(resolved).second) queue.push_back({resolved, imp->loc});
         }
+        fileIds[path] = id;
+    }
+    // Now that every file has an id, point each import at its file (for `alias::name`).
+    for (auto& [imp, resolved] : pendingImports) {
+        auto it = fileIds.find(resolved);
+        if (it != fileIds.end()) imp->targetFile = it->second;
     }
     if (diags.hasErrors()) return result;
 
