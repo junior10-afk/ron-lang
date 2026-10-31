@@ -140,6 +140,11 @@ bool Sema::run() {
     if (mainFunc) {
         std::vector<FuncDecl*> work{mainFunc};
         mainFunc->used = true;
+        for (FuncDecl* f : globalRefs_)
+            if (!f->used) {
+                f->used = true;
+                work.push_back(f);
+            }
         while (!work.empty()) {
             FuncDecl* f = work.back();
             work.pop_back();
@@ -247,6 +252,24 @@ Type* Sema::resolveType(TypeExpr* t) {
     case TypeExpr::Kind::Pointer: {
         Type* inner = resolveType(t->inner);
         return inner ? types_.pointerTo(inner) : nullptr;
+    }
+    case TypeExpr::Kind::Slice: {
+        Type* inner = resolveType(t->inner);
+        if (inner && inner->isVoid()) {
+            diags_.error(t->loc, "cannot make a slice of void");
+            return nullptr;
+        }
+        return inner ? types_.sliceOf(inner) : nullptr;
+    }
+    case TypeExpr::Kind::Function: {
+        std::vector<Type*> params;
+        for (TypeExpr* p : t->params) {
+            Type* pt = resolveType(p);
+            if (!pt) return nullptr;
+            params.push_back(pt);
+        }
+        Type* ret = t->inner ? resolveType(t->inner) : types_.voidType();
+        return ret ? types_.functionType(params, ret) : nullptr;
     }
     case TypeExpr::Kind::Array: {
         Type* inner = resolveType(t->inner);
@@ -664,6 +687,194 @@ int Sema::findBreakTarget(const std::string& label, bool isContinue, SourceLoc l
     return -1;
 }
 
+// ───────────── for-in lowering (builds already-typed nodes) ─────────────
+
+LocalVar* Sema::hiddenLocal(const char* name, Type* t, SourceLoc loc) {
+    LocalVar* v = declareLocal(name, t, loc, false);
+    currentFunc_->locals.push_back(v);
+    return v;
+}
+
+Expr* Sema::mkIdent(LocalVar* v, SourceLoc loc) {
+    auto* id = arena_.make<IdentExpr>(loc);
+    id->name = v->name;
+    id->local = v;
+    id->type = v->type;
+    id->isLvalue = true;
+    return id;
+}
+
+Expr* Sema::mkInt(uint64_t value, Type* t, SourceLoc loc) {
+    auto* lit = arena_.make<IntLitExpr>(loc);
+    lit->value = value;
+    lit->untyped = false;
+    lit->type = t;
+    return lit;
+}
+
+Stmt* Sema::mkVarDecl(LocalVar* v, Expr* init, SourceLoc loc) {
+    auto* d = arena_.make<VarDeclStmt>(loc);
+    d->name = v->name;
+    d->var = v;
+    d->init = init;
+    return d;
+}
+
+// for (var x in items) → { ptr = &items[0]; len = items.len; for (i64 i = 0; i < len; i++) { var x = ptr[i]; body } }
+// for (var i in a..b)  → { end = b; for (T i = a; i < end; i++) body }
+void Sema::lowerForIn(ForInStmt* f) {
+    SourceLoc loc = f->loc;
+    auto* block = arena_.make<BlockStmt>(loc);
+    auto* loop = arena_.make<ForStmt>(loc);
+    loop->label = f->label;
+    pushScope();
+
+    Type* declared = f->varType ? resolveType(f->varType) : nullptr;
+    if (f->varType && !declared) {
+        popScope();
+        return;
+    }
+
+    auto increment = [&](LocalVar* v) {
+        auto* u = arena_.make<UnaryExpr>(loc);
+        u->op = UnaryOp::PostInc;
+        u->operand = mkIdent(v, loc);
+        u->type = v->type;
+        return u;
+    };
+    auto less = [&](LocalVar* a, LocalVar* b) {
+        auto* bin = arena_.make<BinaryExpr>(loc);
+        bin->op = BinaryOp::Lt;
+        bin->lhs = mkIdent(a, loc);
+        bin->rhs = mkIdent(b, loc);
+        bin->type = types_.boolType();
+        return bin;
+    };
+
+    if (f->rangeEnd) {
+        Expr* lo = check(f->iterable);
+        Expr* hi = check(f->rangeEnd);
+        if (!lo->type || !hi->type) {
+            popScope();
+            return;
+        }
+        Type* t = declared;
+        if (!t) t = !isUntyped(lo) ? lo->type : (!isUntyped(hi) ? hi->type : (lo->type->size >= hi->type->size ? lo->type : hi->type));
+        if (!t->isInt()) {
+            diags_.error(loc, "a range a..b needs integers, not '" + typeName(t) + "'");
+            popScope();
+            return;
+        }
+        lo = coerce(lo, t, "range start");
+        hi = coerce(hi, t, "range end");
+        if (!lo->type || !hi->type) {
+            popScope();
+            return;
+        }
+        LocalVar* end = hiddenLocal("$end", t, loc);
+        block->stmts.push_back(mkVarDecl(end, hi, loc));
+        LocalVar* iv = hiddenLocal(f->name.c_str(), t, loc);
+        loop->init = mkVarDecl(iv, lo, loc);
+        loop->cond = less(iv, end);
+        loop->step = increment(iv);
+        checkLoopBody(f->body, f->label);
+        loop->body = f->body;
+    } else {
+        Expr* it = f->iterable;
+        bool byPointer = false;
+        if (it->kind == ExprKind::Unary && it->as<UnaryExpr>()->op == UnaryOp::AddrOf) {
+            byPointer = true;   // for (var p in &items): p points into the collection
+            it = it->as<UnaryExpr>()->operand;
+        }
+        it = check(it);
+        Type* t = it->type;
+        if (!t) {
+            popScope();
+            return;
+        }
+        Type* elem = nullptr;
+        Expr* ptrInit = nullptr;
+        Expr* lenInit = nullptr;
+        // A struct with `T* data` and an integer `len` (e.g. List<T>) iterates like a slice.
+        const FieldDecl* dataField = nullptr;
+        const FieldDecl* lenField = nullptr;
+        if (t->isStruct())
+            for (const FieldDecl& fd : t->structDecl->fields) {
+                if (fd.name == "data" && fd.type && fd.type->isPointer()) dataField = &fd;
+                if (fd.name == "len" && fd.type && fd.type->isInt()) lenField = &fd;
+            }
+        if (t->isArray()) {
+            elem = t->elem;
+            if (byPointer && !it->isLvalue) {
+                diags_.error(it->loc, "cannot iterate by pointer over a temporary array");
+                popScope();
+                return;
+            }
+            ptrInit = implicitCast(it, types_.pointerTo(elem));   // array decays to a pointer to its first element
+            lenInit = mkInt(t->count, types_.i64(), loc);
+        } else if (t->isSlice() || (dataField && lenField)) {
+            LocalVar* seq = hiddenLocal("$seq", t, loc);
+            block->stmts.push_back(mkVarDecl(seq, it, loc));
+            elem = t->isSlice() ? t->elem : dataField->type->elem;
+            auto field = [&](uint32_t offset, Type* type) {
+                auto* m = arena_.make<MemberExpr>(loc);
+                m->base = mkIdent(seq, loc);
+                m->offset = offset;
+                m->type = type;
+                m->isLvalue = true;
+                return m;
+            };
+            ptrInit = field(t->isSlice() ? 0 : dataField->offset, types_.pointerTo(elem));
+            lenInit = t->isSlice() ? field(8, types_.i64()) : implicitCast(field(lenField->offset, lenField->type), types_.i64());
+            if (!t->isSlice() && lenField->type == types_.i64()) lenInit = field(lenField->offset, types_.i64());
+        } else {
+            diags_.error(it->loc, "cannot iterate over '" + typeName(t) + "' (arrays, slices, ranges a..b and List<T> are iterable)");
+            popScope();
+            return;
+        }
+        LocalVar* ptr = hiddenLocal("$ptr", types_.pointerTo(elem), loc);
+        LocalVar* len = hiddenLocal("$len", types_.i64(), loc);
+        block->stmts.push_back(mkVarDecl(ptr, ptrInit, loc));
+        block->stmts.push_back(mkVarDecl(len, lenInit, loc));
+        LocalVar* idx = hiddenLocal("$i", types_.i64(), loc);
+        loop->init = mkVarDecl(idx, mkInt(0, types_.i64(), loc), loc);
+        loop->cond = less(idx, len);
+        loop->step = increment(idx);
+
+        // Element access ptr[i] (or &ptr[i])
+        auto* index = arena_.make<IndexExpr>(loc);
+        index->base = mkIdent(ptr, loc);
+        index->index = mkIdent(idx, loc);
+        index->type = elem;
+        index->isLvalue = true;
+        Expr* value = index;
+        if (byPointer) {
+            auto* addr = arena_.make<UnaryExpr>(loc);
+            addr->op = UnaryOp::AddrOf;
+            addr->operand = index;
+            addr->type = types_.pointerTo(elem);
+            value = addr;
+        }
+        Type* varType = declared ? declared : value->type;
+        if (declared) value = coerce(value, declared, "loop variable");
+        if (!value->type) {
+            popScope();
+            return;
+        }
+        auto* inner = arena_.make<BlockStmt>(loc);
+        pushScope();
+        LocalVar* x = hiddenLocal(f->name.c_str(), varType, loc);
+        inner->stmts.push_back(mkVarDecl(x, value, loc));
+        checkLoopBody(f->body, f->label);
+        popScope();
+        inner->stmts.push_back(f->body);
+        loop->body = inner;
+    }
+    popScope();
+    block->stmts.push_back(loop);
+    f->lowered = block;
+}
+
 void Sema::checkLoopBody(Stmt* body, const std::string& label) {
     if (body->kind == StmtKind::Defer) diags_.error(body->loc, "defer must be inside a block { ... }");
     breakTargets_.push_back({label, BreakTarget::Loop});
@@ -804,6 +1015,9 @@ void Sema::checkStmt(Stmt* s) {
         }
         break;
     }
+    case StmtKind::ForIn:
+        lowerForIn(s->as<ForInStmt>());
+        break;
     case StmtKind::Defer: {
         auto* d = s->as<DeferStmt>();
         breakTargets_.push_back({"", BreakTarget::Barrier});
@@ -861,6 +1075,18 @@ int Sema::conversionCost(Expr* e, Type* to) {
         }
         return worst;
     }
+    if (to->isSlice() && from != to) {
+        if (e->kind == ExprKind::ArrayLit) {
+            int worst = 0;
+            for (Expr* x : e->as<ArrayLitExpr>()->elems) {
+                int c = conversionCost(x, to->elem);
+                if (c < 0) return -1;
+                worst = std::max(worst, c);
+            }
+            return worst + 2;
+        }
+        return from->isArray() && from->elem == to->elem ? 2 : -1;
+    }
     if (e->kind == ExprKind::Ternary && isUntyped(e)) {
         int a = conversionCost(e->as<TernaryExpr>()->thenExpr, to);
         int b = conversionCost(e->as<TernaryExpr>()->elseExpr, to);
@@ -874,7 +1100,7 @@ int Sema::conversionCost(Expr* e, Type* to) {
         return -1;
     }
     if (isUntypedFloat(e)) return to->isFloat() ? 1 : -1;
-    if (from->isNull()) return to->isPointer() ? 1 : -1;
+    if (from->isNull()) return to->isPointer() || to->isFunction() ? 1 : -1;
     if (from->isInt() && to->isInt()) {
         if (from->enumDecl) {
             // enums convert implicitly to integers wide enough for i32
@@ -959,7 +1185,7 @@ Expr* Sema::foldCast(Expr* e, Type* to, bool explicitCast) {
             return i;
         }
     }
-    if (e->kind == ExprKind::NullLit && to->isPointer()) {
+    if (e->kind == ExprKind::NullLit && (to->isPointer() || to->isFunction())) {
         e->type = to;
         return e;
     }
@@ -968,6 +1194,25 @@ Expr* Sema::foldCast(Expr* e, Type* to, bool explicitCast) {
 
 Expr* Sema::coerce(Expr* e, Type* to, const char* context) {
     if (!e || !e->type || !to) return e;
+    if (e->kind == ExprKind::ArrayLit && to->isSlice()) {
+        // [1, 2, 3] as a slice: a temporary array viewed as T[]
+        Expr* arr = coerce(e, types_.arrayOf(to->elem, e->as<ArrayLitExpr>()->elems.size()), context);
+        return arr->type ? implicitCast(arr, to) : arr;
+    }
+    if (e->kind == ExprKind::Ident && e->as<IdentExpr>()->func && to->isFunction() && e->type != to) {
+        // Pick the overload whose signature matches the expected function type.
+        auto* id = e->as<IdentExpr>();
+        for (FuncDecl* f : funcs_[id->name]) {
+            if (!f->typeParams.empty() || !f->returnType) continue;
+            if (types_.functionType(f->paramTypes, f->returnType) == to) {
+                id->func = f;
+                id->type = to;
+                if (currentFunc_) currentFunc_->callees.push_back(f);
+                else globalRefs_.push_back(f);
+                return id;
+            }
+        }
+    }
     if (e->kind == ExprKind::ArrayLit && to->isArray()) {
         auto* a = e->as<ArrayLitExpr>();
         if (a->elems.size() > to->count) {
@@ -1008,6 +1253,9 @@ Expr* Sema::toOffset(Expr* e) {
 
 bool Sema::castAllowed(Type* from, Type* to) {
     if (from == to) return true;
+    // Function values convert to/from raw pointers and 64-bit integers (FFI, callbacks).
+    if (from->isFunction() && (to->isPointer() || (to->isInt() && to->size == 8))) return true;
+    if (to->isFunction() && (from->isPointer() || from->isNull() || (from->isInt() && from->size == 8))) return true;
     if ((from->isNumeric() || from->isBool()) && to->isNumeric()) return true;
     if (from->isNumeric() && to->isBool()) return true;
     if (from->isPointer() && to->isPointer()) return true;
@@ -1176,6 +1424,7 @@ Expr* Sema::check(Expr* e) {
     }
     case ExprKind::StructLit: return checkStructLit(e->as<StructLitExpr>());
     case ExprKind::ArrayLit: return checkArrayLit(e->as<ArrayLitExpr>());
+    case ExprKind::Slice: return checkSlice(e->as<SliceExpr>());
     }
     return errorExpr(e);
 }
@@ -1214,8 +1463,8 @@ Expr* Sema::checkArrayLit(ArrayLitExpr* e) {
 }
 
 Expr* Sema::checkIdent(IdentExpr* e) {
-    if (!e->typeArgs.empty()) {
-        diags_.error(e->loc, "type arguments (::<...>) are only allowed on function calls and struct literals");
+    if (!e->typeArgs.empty() && !funcs_.count(e->name)) {
+        diags_.error(e->loc, "type arguments (::<...>) are only allowed on functions and struct literals");
         return errorExpr(e);
     }
     if (LocalVar* v = lookupLocal(e->name)) {
@@ -1264,10 +1513,7 @@ Expr* Sema::checkIdent(IdentExpr* e) {
         e->isLvalue = true;
         return e;
     }
-    if (funcs_.count(e->name)) {
-        diags_.error(e->loc, "'" + e->name + "' is a function; call it with ()");
-        return errorExpr(e);
-    }
+    if (auto it = funcs_.find(e->name); it != funcs_.end()) return functionValue(e, it->second);
     diags_.error(e->loc, "unknown name '" + e->name + "'");
     return errorExpr(e);
 }
@@ -1504,11 +1750,17 @@ Expr* Sema::checkBinary(BinaryExpr* e) {
     bool isCompare = op == BinaryOp::Eq || op == BinaryOp::Ne || op == BinaryOp::Lt || op == BinaryOp::Le ||
                      op == BinaryOp::Gt || op == BinaryOp::Ge;
 
-    // Pointers
-    if (lt->isPointer() || rt->isPointer() || lt->isNull() || rt->isNull()) {
+    // Pointers (and function values, which compare like pointers)
+    if (lt->isPointer() || rt->isPointer() || lt->isNull() || rt->isNull() || lt->isFunction() || rt->isFunction()) {
         if (isCompare) {
-            if (lt->isNull() && rt->isPointer()) e->lhs = coerce(e->lhs, rt, "comparison");
-            else if (rt->isNull() && lt->isPointer()) e->rhs = coerce(e->rhs, lt, "comparison");
+            if (lt->isNull() && (rt->isPointer() || rt->isFunction())) e->lhs = coerce(e->lhs, rt, "comparison");
+            else if (rt->isNull() && (lt->isPointer() || lt->isFunction())) e->rhs = coerce(e->rhs, lt, "comparison");
+            else if (lt->isFunction() || rt->isFunction()) {
+                if (lt != rt) {
+                    diags_.error(e->loc, "cannot compare '" + typeName(lt) + "' with '" + typeName(rt) + "'");
+                    return errorExpr(e);
+                }
+            }
             else if (lt != rt && !(lt->isNull() && rt->isNull()) && !lt->isVoidPointer() && !rt->isVoidPointer()) {
                 diags_.error(e->loc, "cannot compare '" + typeName(lt) + "' with '" + typeName(rt) + "'");
                 return errorExpr(e);
@@ -1742,7 +1994,8 @@ Expr* Sema::checkCall(CallExpr* e) {
     for (Expr* a : e->args)
         if (!a->type) return errorExpr(e);
 
-    // Method-call syntax: base.name(args) → name(base, args)
+    // Method-call syntax: base.name(args) → name(base, args), unless `name` is a
+    // field holding a function value (then it is an indirect call).
     if (e->callee->kind == ExprKind::Member) {
         auto* m = e->callee->as<MemberExpr>();
         m->base = check(m->base);
@@ -1751,6 +2004,7 @@ Expr* Sema::checkCall(CallExpr* e) {
         if (st->isStruct()) {
             for (const FieldDecl& f : st->structDecl->fields)
                 if (f.name == m->name) {
+                    if (f.type && f.type->isFunction()) return indirectCall(e, finishMember(m));
                     diags_.error(e->loc, "'" + m->name + "' is a field, not a method");
                     return errorExpr(e);
                 }
@@ -1766,13 +2020,23 @@ Expr* Sema::checkCall(CallExpr* e) {
     }
 
     if (e->callee->kind != ExprKind::Ident) {
-        diags_.error(e->loc, "only named functions can be called");
-        return errorExpr(e);
+        // Any expression of function type can be called: handlers[i](x), make_op()(1, 2)
+        Expr* callee = check(e->callee);
+        if (!callee->type) return errorExpr(e);
+        return indirectCall(e, callee);
     }
     const std::string& name = e->callee->as<IdentExpr>()->name;
-    if (lookupLocal(name)) {
-        diags_.error(e->loc, "'" + name + "' is a variable, not a function");
+    if (LocalVar* v = lookupLocal(name)) {
+        if (v->type && v->type->isFunction()) return indirectCall(e, check(e->callee));
+        diags_.error(e->loc, "'" + name + "' is a variable of type '" + typeName(v->type) + "', not a function");
         return errorExpr(e);
+    }
+    if (!funcs_.count(name)) {
+        auto g = globalsByName_.find(name);
+        if (g != globalsByName_.end()) {
+            resolveGlobal(g->second);
+            if (g->second->type && g->second->type->isFunction()) return indirectCall(e, check(e->callee));
+        }
     }
 
     // Built-in intrinsics
@@ -1804,12 +2068,68 @@ Expr* Sema::checkCall(CallExpr* e) {
     return e;
 }
 
+// Call through a function value (Win64 ABI, same as direct calls).
+Expr* Sema::indirectCall(CallExpr* e, Expr* callee) {
+    Type* ft = callee->type;
+    if (!ft) return errorExpr(e);
+    if (!ft->isFunction()) {
+        diags_.error(e->loc, "a value of type '" + typeName(ft) + "' cannot be called");
+        return errorExpr(e);
+    }
+    if (e->args.size() != ft->params.size()) {
+        diags_.error(e->loc, "'" + typeName(ft) + "' takes " + std::to_string(ft->params.size()) +
+                                 " argument(s), but " + std::to_string(e->args.size()) + " were given");
+        return errorExpr(e);
+    }
+    for (size_t i = 0; i < e->args.size(); ++i) {
+        e->args[i] = coerce(e->args[i], ft->params[i], "argument");
+        if (!e->args[i]->type) return errorExpr(e);
+    }
+    e->calleeValue = callee;
+    e->type = ft->ret;
+    return e;
+}
+
+// A function name used as a value: its address, typed fn(...) -> R.
+Expr* Sema::functionValue(IdentExpr* e, std::vector<FuncDecl*>& list) {
+    FuncDecl* f = nullptr;
+    if (!e->typeArgs.empty()) {
+        std::vector<Type*> args;
+        for (TypeExpr* t : e->typeArgs) {
+            Type* r = resolveType(t);
+            if (!r) return errorExpr(e);
+            args.push_back(r);
+        }
+        for (FuncDecl* cand : list)
+            if (cand->typeParams.size() == args.size()) f = instantiateFunction(cand, args, e->loc);
+    } else {
+        for (FuncDecl* cand : list)
+            if (cand->typeParams.empty()) {
+                f = cand;
+                break;   // overloads: coerce() picks the one matching the expected type
+            }
+    }
+    if (!f) {
+        diags_.error(e->loc, "generic function '" + e->name + "' needs type arguments to be used as a value (" +
+                                 e->name + "::<int>)");
+        return errorExpr(e);
+    }
+    for (Type* t : f->paramTypes)
+        if (!t) return errorExpr(e);
+    if (!f->returnType) return errorExpr(e);
+    e->func = f;
+    e->type = types_.functionType(f->paramTypes, f->returnType);
+    if (currentFunc_) currentFunc_->callees.push_back(f);
+    else globalRefs_.push_back(f);
+    return e;
+}
+
 Expr* Sema::checkIndex(IndexExpr* e) {
     e->base = check(e->base);
     e->index = check(e->index);
     if (!e->base->type || !e->index->type) return errorExpr(e);
     Type* bt = e->base->type;
-    if (!bt->isArray() && !(bt->isPointer() && !bt->isVoidPointer())) {
+    if (!bt->isArray() && !bt->isSlice() && !(bt->isPointer() && !bt->isVoidPointer())) {
         diags_.error(e->loc, "cannot index a value of type '" + typeName(bt) + "'");
         return errorExpr(e);
     }
@@ -1829,8 +2149,47 @@ Expr* Sema::checkIndex(IndexExpr* e) {
     return e;
 }
 
+Expr* Sema::checkSlice(SliceExpr* e) {
+    e->base = check(e->base);
+    if (!e->base->type) return errorExpr(e);
+    Type* bt = e->base->type;
+    if (!bt->isArray() && !bt->isSlice() && !(bt->isPointer() && !bt->isVoidPointer())) {
+        diags_.error(e->loc, "cannot slice a value of type '" + typeName(bt) + "'");
+        return errorExpr(e);
+    }
+    if (bt->isPointer() && !e->hi) {
+        diags_.error(e->loc, "slicing a pointer needs an end index: p[start..end]");
+        return errorExpr(e);
+    }
+    for (Expr** bound : {&e->lo, &e->hi}) {
+        if (!*bound) continue;
+        *bound = check(*bound);
+        if (!(*bound)->type) return errorExpr(e);
+        if (!(*bound)->type->isInt()) {
+            diags_.error((*bound)->loc, "slice bounds must be integers");
+            return errorExpr(e);
+        }
+        *bound = toOffset(*bound);
+    }
+    if (bt->isArray()) {
+        int64_t lo = e->lo && e->lo->kind == ExprKind::IntLit ? static_cast<int64_t>(e->lo->as<IntLitExpr>()->value) : 0;
+        int64_t hi = e->hi && e->hi->kind == ExprKind::IntLit ? static_cast<int64_t>(e->hi->as<IntLitExpr>()->value)
+                                                              : static_cast<int64_t>(bt->count);
+        if (lo < 0 || hi > static_cast<int64_t>(bt->count) || lo > hi)
+            diags_.error(e->loc, "slice [" + std::to_string(lo) + ".." + std::to_string(hi) + "] is out of bounds for '" +
+                                     typeName(bt) + "'");
+    }
+    e->type = types_.sliceOf(bt->elem);
+    return e;
+}
+
 Expr* Sema::checkMember(MemberExpr* e) {
     e->base = check(e->base);
+    return finishMember(e);
+}
+
+// Resolves `base.name` once `base` has been checked.
+Expr* Sema::finishMember(MemberExpr* e) {
     Type* bt = e->base->type;
     if (!bt) return errorExpr(e);
     if (bt->isArray() && (e->name == "len" || e->name == "count")) {
@@ -1843,6 +2202,18 @@ Expr* Sema::checkMember(MemberExpr* e) {
     if (bt->isPointer()) {
         st = bt->elem;
         e->throughPointer = true;
+    }
+    if (st->isSlice()) {
+        // slice = { T* ptr; i64 len; }
+        if (e->name == "len" || e->name == "ptr") {
+            bool isLen = e->name == "len";
+            e->offset = isLen ? 8 : 0;
+            e->type = isLen ? types_.i64() : types_.pointerTo(st->elem);
+            e->isLvalue = e->throughPointer || e->base->isLvalue;
+            return e;
+        }
+        diags_.error(e->loc, "a slice has only 'len' and 'ptr' fields");
+        return errorExpr(e);
     }
     if (!st->isStruct()) {
         diags_.error(e->loc, "type '" + typeName(bt) + "' has no field '" + e->name + "'");
@@ -1860,7 +2231,6 @@ Expr* Sema::checkMember(MemberExpr* e) {
     diags_.error(e->loc, "struct '" + st->name + "' has no field '" + e->name + "'");
     return errorExpr(e);
 }
-
 Expr* Sema::checkCast(CastExpr* e) {
     e->operand = check(e->operand);
     Type* to = resolveType(e->target);

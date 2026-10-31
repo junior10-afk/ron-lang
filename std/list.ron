@@ -30,6 +30,9 @@ fn pop<T>(List<T>* l) -> T {
     return l.data[l.len];
 }
 
+// A view of the elements (valid until the list grows or is freed).
+fn slice<T>(List<T>* l) -> T[] { return l.data[0..l.len]; }
+
 fn get<T>(List<T>* l, int i) -> T { return l.data[i]; }
 fn at<T>(List<T>* l, int i) -> T* { return &l.data[i]; }
 fn set<T>(List<T>* l, int i, T value) { l.data[i] = value; }

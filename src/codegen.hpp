@@ -70,6 +70,12 @@ private:
     void genUnary(UnaryExpr* e);
     void genAssign(AssignExpr* e);
     void genCallTo(FuncDecl* f, const std::vector<Expr*>& args);
+    // Shared by direct and indirect calls (exactly one of `direct` / `calleeValue` is set).
+    void genCall(const std::vector<Type*>& paramTypes, Type* rt, const std::vector<Expr*>& args, FuncDecl* direct,
+                 Expr* calleeValue);
+    void genSlice(SliceExpr* e);
+    void genFunctionAddress(FuncDecl* f);
+    std::vector<std::pair<size_t, FuncDecl*>> funcRefs_;   // fixup index -> function whose address is taken
     void genCast(CastExpr* e);
     void genStructLit(StructLitExpr* e);
     void genIncDec(UnaryExpr* e);

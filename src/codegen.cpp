@@ -121,6 +121,7 @@ Image CodeGen::generate() {
     layoutGlobals();
     genEntryStub();
     for (FuncDecl* f : sema_.functions) genFunction(f);
+    for (auto& [index, f] : funcRefs_) as_.fixups[index].target = as_.labelPos(funcLabels_[f]);
     image_.text = std::move(as_.code);
     image_.fixups = std::move(as_.fixups);
     return std::move(image_);
@@ -291,6 +292,9 @@ void CodeGen::genStmt(Stmt* s) {
     switch (s->kind) {
     case StmtKind::Block:
         genScope(s->as<BlockStmt>()->stmts);
+        break;
+    case StmtKind::ForIn:
+        genStmt(s->as<ForInStmt>()->lowered);
         break;
     case StmtKind::Defer:
         // Nothing runs now: the statement is replayed on every exit of the enclosing block.
@@ -879,6 +883,7 @@ bool CodeGen::stableMem(Expr* e, Mem& out) {
             out = localMem(id->local);
             return true;
         }
+        if (!id->global) return false;
         out = Mem::ripRel(Section::Data, id->global->dataOffset);
         return true;
     }
@@ -935,7 +940,12 @@ Mem CodeGen::genIndexMem(IndexExpr* e) {
     uint32_t s = bt->elem->size;
     Mem base;
     bool baseInRax = false;
-    if (bt->isArray()) {
+    if (bt->isSlice()) {
+        Mem sm = genMem(e->base);
+        as_.load(RAX, sm, 8, false);   // slice.ptr
+        base = Mem::at(RAX, 0);
+        baseInRax = true;
+    } else if (bt->isArray()) {
         if (stableMem(e->base, base) && !base.hasIndex() && !base.rip) {
             // [rbp + offset] or [reg + offset]: no code needed
         } else {
@@ -1050,6 +1060,10 @@ void CodeGen::genExpr(Expr* e) {
         break;
     case ExprKind::Ident: {
         LocalVar* v = e->as<IdentExpr>()->local;
+        if (FuncDecl* fn = e->as<IdentExpr>()->func) {
+            genFunctionAddress(fn);
+            break;
+        }
         if (v && v->reg >= 0) {
             if (v->type->isFloat()) as_.movaps(XMM0, static_cast<Xmm>(v->reg));
             else as_.movRR(RAX, static_cast<Reg>(v->reg));
@@ -1092,11 +1106,17 @@ void CodeGen::genExpr(Expr* e) {
                 genExpr(c->args[0]);
                 as_.sqrtS(XMM0, XMM0, f32);
             }
+        } else if (c->calleeValue) {
+            Type* ft = c->calleeValue->type;
+            genCall(ft->params, ft->ret, c->args, nullptr, c->calleeValue);
         } else {
             genCallTo(c->func, c->args);
         }
         break;
     }
+    case ExprKind::Slice:
+        genSlice(e->as<SliceExpr>());
+        break;
     case ExprKind::Index:
     case ExprKind::Member:
         loadValue(e->type, genMem(e));
@@ -1434,12 +1454,33 @@ void CodeGen::genAssign(AssignExpr* e) {
 }
 
 void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
-    Type* rt = f->returnType;
+    genCall(f->paramTypes, f->returnType, args, f, nullptr);
+}
+
+void CodeGen::genFunctionAddress(FuncDecl* f) {
+    if (!f->externDll.empty()) {
+        // Imported function: its address is the IAT entry filled in by the loader.
+        as_.load(RAX, Mem::ripRel(Section::Import, importSlot(f->externDll, f->name)), 8, false);
+        return;
+    }
+    as_.lea(RAX, Mem::ripRel(Section::Text, 0));
+    funcRefs_.push_back({as_.fixups.size() - 1, f});
+}
+
+void CodeGen::genCall(const std::vector<Type*>& paramTypes, Type* rt, const std::vector<Expr*>& args, FuncDecl* direct,
+                      Expr* calleeValue) {
     bool hidden = passedByRef(rt);
     size_t n = args.size() + (hidden ? 1 : 0);
     maxOutgoing_ = std::max<int32_t>(maxOutgoing_, static_cast<int32_t>(8 * std::max<size_t>(4, n)));
 
     int32_t retSlot = hidden ? allocSlot(rt->size, std::max<uint32_t>(rt->align, 8)) : 0;
+    int32_t calleeSlot = 0;
+    if (calleeValue) {
+        // The function value is evaluated first, before the arguments.
+        genExpr(calleeValue);
+        calleeSlot = allocTemp8();
+        as_.store(Mem::at(RBP, calleeSlot), RAX, 8);
+    }
 
     // Arguments that can be re-read for free (literals, variables) are loaded
     // straight into their argument register later; others are evaluated into
@@ -1447,7 +1488,7 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
     std::vector<int32_t> slots(args.size(), 0);
     std::vector<bool> deferred(args.size(), false);
     for (size_t i = 0; i < args.size(); ++i) {
-        Type* pt = f->paramTypes[i];
+        Type* pt = paramTypes[i];
         if (pt->isFloat() ? isSimpleFloat(args[i]) : (pt->isScalar() && isSimple(args[i]))) {
             deferred[i] = true;
             continue;
@@ -1482,7 +1523,7 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
             continue;
         }
         size_t i = k - (hidden ? 1 : 0);
-        Type* pt = f->paramTypes[i];
+        Type* pt = paramTypes[i];
         bool f32 = pt->size == 4;
         if (deferred[i]) {
             if (k < 4) {
@@ -1507,8 +1548,14 @@ void CodeGen::genCallTo(FuncDecl* f, const std::vector<Expr*>& args) {
         }
     }
 
-    if (!f->externDll.empty()) as_.callMem(Mem::ripRel(Section::Import, importSlot(f->externDll, f->name)));
-    else as_.call(funcLabels_[f]);
+    if (calleeValue) {
+        as_.load(RAX, Mem::at(RBP, calleeSlot), 8, false);
+        as_.callR(RAX);
+    } else if (!direct->externDll.empty()) {
+        as_.callMem(Mem::ripRel(Section::Import, importSlot(direct->externDll, direct->name)));
+    } else {
+        as_.call(funcLabels_[direct]);
+    }
 
     if (rt->isVoid() || rt->isFloat()) return;
     if (hidden) {
@@ -1531,6 +1578,15 @@ void CodeGen::genCast(CastExpr* e) {
         else genExpr(e->operand);
         if (from->size == 4 && to->size == 8) as_.cvtss2sd(XMM0, XMM0);
         else if (from->size == 8 && to->size == 4) as_.cvtsd2ss(XMM0, XMM0);
+        return;
+    }
+    if (to->isSlice() && from->isArray()) {
+        genExpr(e->operand);   // address of the array
+        int32_t slot = allocSlot(16, 8);
+        as_.store(Mem::at(RBP, slot), RAX, 8);
+        as_.movRI(RCX, from->count);
+        as_.store(Mem::at(RBP, slot + 8), RCX, 8);
+        as_.lea(RAX, Mem::at(RBP, slot));
         return;
     }
     if (to->isFloat()) {
@@ -1565,6 +1621,46 @@ void CodeGen::genCast(CastExpr* e) {
     }
     if (to->isInt()) normalize(to);
     // pointer <-> pointer, array -> pointer, null -> pointer: the bits are unchanged
+}
+
+// base[lo..hi] → { base.ptr + lo, hi - lo } built in a 16-byte temporary
+void CodeGen::genSlice(SliceExpr* e) {
+    Type* bt = e->base->type;
+    uint32_t elemSize = bt->elem->size;
+    int32_t slot = allocSlot(16, 8);
+    Mem ptrField = Mem::at(RBP, slot);
+    Mem lenField = Mem::at(RBP, slot + 8);
+    if (bt->isSlice()) {
+        Mem m = genMem(e->base);
+        Mem lenMem = m;
+        addDisp(lenMem, 8);
+        as_.load(RCX, lenMem, 8, false);
+        as_.load(RAX, m, 8, false);
+        as_.store(lenField, RCX, 8);
+    } else {
+        if (bt->isArray()) genAddr(e->base);
+        else genExpr(e->base);
+        if (bt->isArray()) {
+            as_.movRI(RCX, bt->count);
+            as_.store(lenField, RCX, 8);
+        }
+    }
+    as_.store(ptrField, RAX, 8);
+    if (e->hi) {
+        genExpr(e->hi);
+        as_.store(lenField, RAX, 8);
+    }
+    if (e->lo) {
+        genExpr(e->lo);
+        as_.load(R10, ptrField, 8, false);
+        as_.imulImm(RCX, RAX, static_cast<int32_t>(elemSize));
+        as_.add(R10, RCX);
+        as_.store(ptrField, R10, 8);
+        as_.load(R11, lenField, 8, false);
+        as_.sub(R11, RAX);
+        as_.store(lenField, R11, 8);
+    }
+    as_.lea(RAX, ptrField);
 }
 
 void CodeGen::genArrayLit(ArrayLitExpr* e) {

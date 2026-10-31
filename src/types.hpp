@@ -11,7 +11,7 @@ namespace ron {
 struct StructDecl;
 struct EnumDecl;
 
-enum class TypeKind { Void, Bool, Int, Float, Pointer, Array, Struct, Null };
+enum class TypeKind { Void, Bool, Int, Float, Pointer, Array, Struct, Null, Function, Slice };
 
 struct Type {
     TypeKind kind = TypeKind::Void;
@@ -24,6 +24,8 @@ struct Type {
     EnumDecl* enumDecl = nullptr; // Int types that come from an enum
     bool complete = true;         // false while a struct layout is being computed
     std::string name;
+    std::vector<Type*> params;    // Function
+    Type* ret = nullptr;          // Function
 
     bool isVoid() const { return kind == TypeKind::Void; }
     bool isBool() const { return kind == TypeKind::Bool; }
@@ -34,10 +36,12 @@ struct Type {
     bool isArray() const { return kind == TypeKind::Array; }
     bool isStruct() const { return kind == TypeKind::Struct; }
     bool isNull() const { return kind == TypeKind::Null; }
+    bool isFunction() const { return kind == TypeKind::Function; }
+    bool isSlice() const { return kind == TypeKind::Slice; }
     // Values that live in memory and are handled by address in codegen.
-    bool isAggregate() const { return isStruct() || isArray(); }
+    bool isAggregate() const { return isStruct() || isArray() || isSlice(); }
     // Fits in a general-purpose register.
-    bool isScalar() const { return isBool() || isInt() || isPointer() || isNull(); }
+    bool isScalar() const { return isBool() || isInt() || isPointer() || isNull() || isFunction(); }
     bool isVoidPointer() const { return isPointer() && elem->isVoid(); }
 };
 
@@ -62,6 +66,8 @@ public:
 
     Type* pointerTo(Type* elem);
     Type* arrayOf(Type* elem, uint64_t count);
+    Type* sliceOf(Type* elem);                                    // { T* ptr; i64 len; }
+    Type* functionType(const std::vector<Type*>& params, Type* ret);
     Type* newStruct(const std::string& name, StructDecl* decl);
     Type* newEnum(const std::string& name, EnumDecl* decl);
 
@@ -75,6 +81,8 @@ private:
     std::map<std::string, Type*> builtins_;
     std::map<Type*, Type*> pointers_;
     std::map<std::pair<Type*, uint64_t>, Type*> arrays_;
+    std::map<Type*, Type*> slices_;
+    std::map<std::pair<std::vector<Type*>, Type*>, Type*> functions_;
     Type *void_, *bool_, *null_, *i8_, *i16_, *i32_, *i64_, *u8_, *u16_, *u32_, *u64_, *f32_, *f64_;
 };
 

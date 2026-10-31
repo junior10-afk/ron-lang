@@ -44,6 +44,15 @@ private:
     int findBreakTarget(const std::string& label, bool isContinue, SourceLoc loc);
     void checkLoopBody(Stmt* body, const std::string& label);
     Expr* checkArrayLit(ArrayLitExpr* e);
+    Expr* checkSlice(SliceExpr* e);
+    Expr* finishMember(MemberExpr* e);
+    Expr* indirectCall(CallExpr* e, Expr* callee);
+    Expr* functionValue(IdentExpr* e, std::vector<FuncDecl*>& overloads);
+    void lowerForIn(ForInStmt* f);
+    LocalVar* hiddenLocal(const char* name, Type* t, SourceLoc loc);
+    Expr* mkIdent(LocalVar* v, SourceLoc loc);
+    Expr* mkInt(uint64_t value, Type* t, SourceLoc loc);
+    Stmt* mkVarDecl(LocalVar* v, Expr* init, SourceLoc loc);
 
     // Expressions
     Expr* check(Expr* e);
@@ -110,6 +119,7 @@ private:
     std::map<std::pair<FuncDecl*, std::vector<Type*>>, FuncDecl*> funcInstances_;
     std::vector<FuncDecl*> pendingInstances_;   // instantiated, body not yet checked
     std::map<FuncDecl*, SourceLoc> instantiatedAt_;
+    std::vector<FuncDecl*> globalRefs_;   // functions referenced outside any function (DCE roots)
 
     std::vector<std::map<std::string, LocalVar*>> scopes_;
     FuncDecl* currentFunc_ = nullptr;

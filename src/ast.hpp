@@ -43,9 +43,10 @@ private:
 // ───────────────────────────── Type syntax ─────────────────────────────
 
 struct TypeExpr : AstNode {
-    enum class Kind { Named, Pointer, Array } kind = Kind::Named;
+    enum class Kind { Named, Pointer, Array, Slice, Function } kind = Kind::Named;
     std::string name;            // Named
-    TypeExpr* inner = nullptr;   // Pointer, Array
+    TypeExpr* inner = nullptr;   // Pointer, Array, Slice; Function: return type (null = void)
+    std::vector<TypeExpr*> params;     // Function parameter types
     uint64_t arraySize = 0;      // Array: literal size...
     std::string sizeConst;       // ...or the name of an integer const: float[MAX] a;
     std::vector<TypeExpr*> typeArgs;   // Named generic instance: List<int>
@@ -56,7 +57,7 @@ struct TypeExpr : AstNode {
 enum class ExprKind {
     IntLit, FloatLit, StringLit, BoolLit, NullLit,
     Ident, Path, Unary, Binary, Assign, Ternary,
-    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit,
+    Call, Index, Member, Cast, Sizeof, StructLit, ArrayLit, Slice,
 };
 
 enum class UnaryOp { Neg, Not, BitNot, AddrOf, Deref, PreInc, PreDec, PostInc, PostDec };
@@ -113,6 +114,7 @@ struct IdentExpr : Expr {
     std::vector<TypeExpr*> typeArgs;   // explicit generic arguments: make::<int>()
     LocalVar* local = nullptr;   // resolved by sema (one of these)
     GlobalVar* global = nullptr;
+    FuncDecl* func = nullptr;    // a function used as a value (its address)
     IdentExpr() : Expr(ExprKind::Ident) {}
 };
 
@@ -159,9 +161,18 @@ enum class Intrinsic { None, SqrtF32, SqrtF64 };
 struct CallExpr : Expr {
     Expr* callee = nullptr;
     std::vector<Expr*> args;
-    FuncDecl* func = nullptr;       // resolved target
+    FuncDecl* func = nullptr;       // resolved target (direct call)
+    Expr* calleeValue = nullptr;    // indirect call through a function value
     Intrinsic intrinsic = Intrinsic::None;
     CallExpr() : Expr(ExprKind::Call) {}
+};
+
+// `base[lo..hi]`, `base[..]`, `base[lo..]`, `base[..hi]` → a slice
+struct SliceExpr : Expr {
+    Expr* base = nullptr;
+    Expr* lo = nullptr;             // null = 0
+    Expr* hi = nullptr;             // null = length
+    SliceExpr() : Expr(ExprKind::Slice) {}
 };
 
 struct IndexExpr : Expr {
@@ -208,7 +219,7 @@ struct ArrayLitExpr : Expr {
 
 // ───────────────────────────── Statements ─────────────────────────────
 
-enum class StmtKind { Block, VarDecl, Expr, If, While, For, Return, Break, Continue, Switch, Defer, DoWhile };
+enum class StmtKind { Block, VarDecl, Expr, If, While, For, Return, Break, Continue, Switch, Defer, DoWhile, ForIn };
 
 struct Stmt : AstNode {
     StmtKind kind;
@@ -292,6 +303,19 @@ struct SwitchStmt : Stmt {
     Expr* subject = nullptr;
     std::vector<SwitchCase> cases;
     SwitchStmt() : Stmt(StmtKind::Switch) {}
+};
+
+// `for (var x in items)`, `for (var p in &items)`, `for (int i in 0..n)`.
+// Sema lowers it to an ordinary indexed loop stored in `lowered`.
+struct ForInStmt : Stmt {
+    TypeExpr* varType = nullptr;    // null = inferred
+    std::string name;
+    Expr* iterable = nullptr;       // range start when rangeEnd is set
+    Expr* rangeEnd = nullptr;
+    Stmt* body = nullptr;
+    std::string label;
+    Stmt* lowered = nullptr;
+    ForInStmt() : Stmt(StmtKind::ForIn) {}
 };
 
 // Runs `body` when the enclosing block exits (normally, or via return/break/continue).

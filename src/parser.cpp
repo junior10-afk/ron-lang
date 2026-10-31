@@ -170,6 +170,7 @@ Decl* Parser::parseDecl() {
         return imp;
     }
     case TokenKind::KwFn:
+        if (peek(1).is(TokenKind::LParen)) return parseGlobal(false, false);   // fn(int) -> int callback = f;
         return parseFunc("");
     case TokenKind::KwExtern: {
         advance();
@@ -295,8 +296,23 @@ GlobalVar* Parser::parseGlobal(bool isConst, bool inferred) {
 // ───────────────────────────── Types ─────────────────────────────
 
 TypeExpr* Parser::parseType(bool inExpression) {
+    TypeExpr* t;
+    if (check(TokenKind::KwFn)) {
+        // Function type: fn(int, float) -> bool
+        t = arena_.make<TypeExpr>(advance().loc);
+        t->kind = TypeExpr::Kind::Function;
+        expect(TokenKind::LParen, "'(' after 'fn' in a function type");
+        if (!check(TokenKind::RParen)) {
+            do {
+                t->params.push_back(parseType());
+            } while (match(TokenKind::Comma));
+        }
+        expect(TokenKind::RParen, "')' to close the parameter types");
+        if (match(TokenKind::Arrow)) t->inner = parseType(inExpression);
+        return t;
+    }
     const Token& name = expect(TokenKind::Identifier, "a type name");
-    auto* t = arena_.make<TypeExpr>(name.loc);
+    t = arena_.make<TypeExpr>(name.loc);
     t->kind = TypeExpr::Kind::Named;
     t->name = std::string(name.text);
     // After `as`, `x as float * 2` is a multiplication, not a cast to float*.
@@ -322,6 +338,12 @@ TypeExpr* Parser::parseType(bool inExpression) {
             p->kind = TypeExpr::Kind::Pointer;
             p->inner = t;
             t = p;
+        } else if (check(TokenKind::LBracket) && peek(1).is(TokenKind::RBracket)) {
+            auto* s = arena_.make<TypeExpr>(advance().loc);   // slice: T[]
+            advance();
+            s->kind = TypeExpr::Kind::Slice;
+            s->inner = t;
+            t = s;
         } else if (check(TokenKind::LBracket)) {
             auto* a = arena_.make<TypeExpr>(advance().loc);
             a->kind = TypeExpr::Kind::Array;
@@ -375,6 +397,20 @@ void Parser::expectCloseAngle() {
 
 // Skips `Name<Args>* [N]...` starting at token i; returns the index after it, or 0.
 size_t Parser::skipType(size_t i) const {
+    if (peek(i).is(TokenKind::KwFn) && peek(i + 1).is(TokenKind::LParen)) {
+        // fn( ... ) [-> Type]
+        int depth = 0;
+        i += 1;
+        do {
+            TokenKind k = peek(i).kind;
+            if (k == TokenKind::LParen) ++depth;
+            else if (k == TokenKind::RParen) --depth;
+            else if (k == TokenKind::EndOfFile || k == TokenKind::Semicolon || k == TokenKind::LBrace) return 0;
+            ++i;
+        } while (depth > 0);
+        if (peek(i).is(TokenKind::Arrow)) return skipType(i + 1);
+        return i;
+    }
     if (!peek(i).is(TokenKind::Identifier)) return 0;
     ++i;
     if (peek(i).is(TokenKind::Less)) {
@@ -394,6 +430,8 @@ size_t Parser::skipType(size_t i) const {
     while (true) {
         if (peek(i).is(TokenKind::Star)) {
             ++i;
+        } else if (peek(i).is(TokenKind::LBracket) && peek(i + 1).is(TokenKind::RBracket)) {
+            i += 2;
         } else if (peek(i).is(TokenKind::LBracket) &&
                    (peek(i + 1).is(TokenKind::IntLiteral) || peek(i + 1).is(TokenKind::Identifier)) &&
                    peek(i + 2).is(TokenKind::RBracket)) {
@@ -478,6 +516,7 @@ Stmt* Parser::parseStmt() {
         if (loop->kind == StmtKind::While) loop->as<WhileStmt>()->label = label;
         else if (loop->kind == StmtKind::For) loop->as<ForStmt>()->label = label;
         else if (loop->kind == StmtKind::DoWhile) loop->as<DoWhileStmt>()->label = label;
+        else if (loop->kind == StmtKind::ForIn) loop->as<ForInStmt>()->label = label;
         return loop;
     }
     const Token& t = peek();
@@ -554,8 +593,23 @@ Stmt* Parser::parseStmt() {
     }
     case TokenKind::KwFor: {
         advance();
-        auto* s = arena_.make<ForStmt>(t.loc);
         expect(TokenKind::LParen, "'(' after 'for'");
+        // for (var x in items) / for (Type x in a..b)
+        bool forIn = check(TokenKind::KwVar) && peek(1).is(TokenKind::Identifier) && peek(2).is(TokenKind::KwIn);
+        size_t typeEnd = forIn ? 0 : skipType(0);
+        forIn = forIn || (typeEnd && peek(typeEnd).is(TokenKind::Identifier) && peek(typeEnd + 1).is(TokenKind::KwIn));
+        if (forIn) {
+            auto* fi = arena_.make<ForInStmt>(t.loc);
+            if (!match(TokenKind::KwVar)) fi->varType = parseType();
+            fi->name = std::string(expect(TokenKind::Identifier, "a loop variable name").text);
+            expect(TokenKind::KwIn, "'in'");
+            fi->iterable = parseExpression();
+            if (match(TokenKind::DotDot)) fi->rangeEnd = parseExpression();
+            expect(TokenKind::RParen, "')' after the for-in header");
+            fi->body = parseStmt();
+            return fi;
+        }
+        auto* s = arena_.make<ForStmt>(t.loc);
         if (!check(TokenKind::Semicolon)) s->init = parseSimpleStmt();
         expect(TokenKind::Semicolon, "';' after for-loop initializer");
         if (!check(TokenKind::Semicolon)) s->cond = parseExpression();
@@ -693,9 +747,20 @@ Expr* Parser::parsePostfix(Expr* e) {
             e = c;
         } else if (t.is(TokenKind::LBracket)) {
             advance();
+            Expr* first = check(TokenKind::DotDot) ? nullptr : parseExpression();
+            if (match(TokenKind::DotDot)) {
+                // Slicing: base[lo..hi], with either bound optional
+                auto* sl = arena_.make<SliceExpr>(t.loc);
+                sl->base = e;
+                sl->lo = first;
+                if (!check(TokenKind::RBracket)) sl->hi = parseExpression();
+                expect(TokenKind::RBracket, "']'");
+                e = sl;
+                continue;
+            }
             auto* ix = arena_.make<IndexExpr>(t.loc);
             ix->base = e;
-            ix->index = parseExpression();
+            ix->index = first;
             expect(TokenKind::RBracket, "']'");
             e = ix;
         } else if (t.is(TokenKind::Dot)) {

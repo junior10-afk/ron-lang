@@ -147,6 +147,19 @@ TEST(sema_syntax_v01) {
     CHECK(valid("fn main() -> int { var x = 1; switch (x) { case 1: break; default: } return 0; }"));
 }
 
+TEST(sema_functions_and_slices) {
+    CHECK(fails("fn main() -> int { int x = 1; return x(2); }", "not a function"));
+    CHECK(fails("fn f(int a) -> int { return a; } fn main() -> int { fn(int) -> int g = f; return g(1, 2); }",
+                "takes 1 argument"));
+    CHECK(fails("fn f(int a) -> int { return a; } fn main() -> int { fn(float) -> int g = f; return 0; }",
+                "cannot convert"));
+    CHECK(fails("fn main() -> int { int* p = null; int[] s = p[2..]; return 0; }", "needs an end index"));
+    CHECK(fails("fn main() -> int { int x = 3; for (var i in x) { } return 0; }", "cannot iterate"));
+    CHECK(fails("fn id<T>(T v) -> T { return v; } fn main() -> int { var f = id; return 0; }", "needs type arguments"));
+    CHECK(fails("fn main() -> int { int[3] a; int[] s = a[1..5]; return 0; }", "out of bounds"));
+    CHECK(valid("fn id<T>(T v) -> T { return v; } fn main() -> int { var f = id::<int>; return f(3) - 3; }"));
+}
+
 TEST(sema_requires_main) {
     CHECK(fails("fn notmain() {}", "no 'main' function"));
 }

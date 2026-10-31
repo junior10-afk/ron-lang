@@ -65,6 +65,27 @@ Type* TypeContext::arrayOf(Type* elem, uint64_t count) {
     return t;
 }
 
+Type* TypeContext::sliceOf(Type* elem) {
+    auto it = slices_.find(elem);
+    if (it != slices_.end()) return it->second;
+    Type* t = make(TypeKind::Slice, 16, "");
+    t->elem = elem;
+    t->align = 8;
+    slices_[elem] = t;
+    return t;
+}
+
+Type* TypeContext::functionType(const std::vector<Type*>& params, Type* ret) {
+    auto key = std::make_pair(params, ret);
+    auto it = functions_.find(key);
+    if (it != functions_.end()) return it->second;
+    Type* t = make(TypeKind::Function, 8, "");
+    t->params = params;
+    t->ret = ret;
+    functions_[key] = t;
+    return t;
+}
+
 Type* TypeContext::newStruct(const std::string& name, StructDecl* decl) {
     Type* t = make(TypeKind::Struct, 0, name);
     t->structDecl = decl;
@@ -83,6 +104,14 @@ std::string typeName(const Type* t) {
     switch (t->kind) {
     case TypeKind::Pointer: return typeName(t->elem) + "*";
     case TypeKind::Array: return typeName(t->elem) + "[" + std::to_string(t->count) + "]";
+    case TypeKind::Slice: return typeName(t->elem) + "[]";
+    case TypeKind::Function: {
+        std::string s = "fn(";
+        for (size_t i = 0; i < t->params.size(); ++i) s += (i ? ", " : "") + typeName(t->params[i]);
+        s += ")";
+        if (t->ret && !t->ret->isVoid()) s += " -> " + typeName(t->ret);
+        return s;
+    }
     default: return t->name;
     }
 }

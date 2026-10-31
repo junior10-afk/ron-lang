@@ -433,6 +433,64 @@ TEST(e2e_syntax_v01) {
     )", "8\n5.0\nSW\nfive\n16\n2.0\nddleave work\n100\nddd\nleave work\n-1\n23\n12\n11\n"));
 }
 
+TEST(e2e_functions_slices_for_in) {
+    CHECK(prints("fnslices", R"(
+        import "std/io.ron";
+        import "std/list.ron";
+        fn twice(int x) -> int { return x * 2; }
+        fn add(int a, int b) -> int { return a + b; }
+        fn add(float a, float b) -> float { return a + b; }
+        fn apply(fn(int) -> int f, int v) -> int { return f(v); }
+        fn sum(int[] xs) -> int {
+            int s = 0;
+            for (var x in xs) s += x;
+            return s;
+        }
+        struct Button { u8* label; fn(int) -> int on_click; }
+        fn sort_by(int[] xs, fn(int, int) -> bool less) {
+            for (var i in 1..xs.len) {
+                int key = xs[i];
+                var j = i - 1;
+                while (j >= 0 && less(key, xs[j])) {
+                    xs[j + 1] = xs[j];
+                    j--;
+                }
+                xs[j + 1] = key;
+            }
+        }
+        fn desc(int a, int b) -> bool { return a > b; }
+        fn main() -> int {
+            println(apply(twice, 21));
+            fn(int, int) -> int op = add;
+            println(op(3, 4));
+            fn(int) -> int none = null;
+            println(none == null);
+            Button b = Button{"ok", twice};
+            println(b.on_click(5));
+            int[5] arr = [5, 1, 4, 2, 3];
+            println(sum(arr));
+            println(sum(arr[1..3]));
+            println(sum([10, 20, 30]));
+            sort_by(arr, desc);
+            for (var x in arr) print(x);
+            println();
+            for (var p in &arr) *p = *p * 10;
+            println(arr[0]);
+            List<int> l;
+            for (var i in 0..5) l.push(i * i);
+            int total = 0;
+            for (var v in l) total += v;
+            println(total);
+            int[] s = l.slice();
+            println(s.len);
+            println(s[4]);
+            var fns = [twice, twice];
+            println(fns[1](4));
+            return 0;
+        }
+    )", "42\n7\ntrue\n10\n15\n5\n60\n54321\n50\n30\n5\n16\n8\n"));
+}
+
 TEST(e2e_std_math) {
     CHECK(prints("math", R"(
         import "std/io.ron";

@@ -161,6 +161,14 @@ Expr* cloneExpr(AstArena& a, Expr* e) {
         for (Expr* x : e->as<ArrayLitExpr>()->elems) c->elems.push_back(cloneExpr(a, x));
         return c;
     }
+    case ExprKind::Slice: {
+        auto* src = e->as<SliceExpr>();
+        auto* c = a.make<SliceExpr>(e->loc);
+        c->base = cloneExpr(a, src->base);
+        c->lo = cloneExpr(a, src->lo);
+        c->hi = cloneExpr(a, src->hi);
+        return c;
+    }
     }
     return nullptr;
 }
@@ -221,6 +229,17 @@ Stmt* cloneStmt(AstArena& a, Stmt* s) {
             for (Stmt* st : sc.body) copy.body.push_back(cloneStmt(a, st));
             c->cases.push_back(std::move(copy));
         }
+        return c;
+    }
+    case StmtKind::ForIn: {
+        auto* src = s->as<ForInStmt>();
+        auto* c = a.make<ForInStmt>(s->loc);
+        c->varType = src->varType;
+        c->name = src->name;
+        c->iterable = cloneExpr(a, src->iterable);
+        c->rangeEnd = cloneExpr(a, src->rangeEnd);
+        c->body = cloneStmt(a, src->body);
+        c->label = src->label;
         return c;
     }
     case StmtKind::Defer: {
