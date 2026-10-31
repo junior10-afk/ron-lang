@@ -14,16 +14,26 @@ source.ron ─► Lexer ─► Parser ─► AST ─► Sema (types) ─► x86-
 
 ## Milestones
 
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 1 | Lexer | Tokens, diagnostics with source excerpts |
-| 2 | Parser + AST | Recursive descent, precedence climbing, error recovery |
-| 3 | Semantic analysis | Type checking, overloads, implicit conversions, UFCS method calls |
-| 4 | x86-64 code generator | Hand-written instruction encoder, Win64 calling convention, SSE floats |
-| 5 | PE writer | `.text` / `.rdata` / `.data` sections, import tables, runnable `.exe` |
-| 6 | Runtime & standard library | Written in Ron: I/O, memory, strings, math (sin/cos/sqrt), vectors/matrices |
-| 7 | Vulkan engine | `ron_engine.dll`: window, swapchain, depth, lit meshes, camera, input |
-| 8 | Game features | ECS, physics (gravity, AABB/sphere collisions), audio, `ronc --watch` hot reload |
+| # | Milestone | Deliverable | Status |
+|---|-----------|-------------|--------|
+| 1 | Lexer | Tokens, diagnostics with source excerpts | done |
+| 2 | Parser + AST | Recursive descent, precedence climbing, error recovery | done |
+| 3 | Semantic analysis | Type checking, overloads, implicit conversions, UFCS method calls | done |
+| 4 | x86-64 code generator | Hand-written instruction encoder, Win64 calling convention, SSE floats | done |
+| 5 | PE writer | `.text` / `.rdata` / `.data` sections, import tables, runnable `.exe` | done |
+| 6 | Runtime & standard library | Written in Ron: I/O, memory, strings, math (sin/cos/sqrt), vectors/matrices | done |
+| 7 | Vulkan engine | `ron_engine.dll`: window, swapchain, depth, MSAA, shadows, lit meshes, camera, input | done |
+| 8 | Game features | ECS, physics (gravity, AABB/sphere collisions), audio, `ronc run --watch` live reload | done |
+
+## Next steps
+
+- **Performance**: register allocation, keeping locals in registers, SIMD for vector math.
+- **Language**: generics (for containers), slices and dynamic strings, `defer`, closures,
+  namespaces per module.
+- **Engine**: textures and materials (PBR), glTF model loading, skeletal animation,
+  instanced rendering, post-processing (bloom, SSAO), a UI layer.
+- **Tooling**: debug info (PDB) for stepping through Ron code, a language server for editors,
+  state-preserving hot reload.
 
 ## Key design decisions
 
